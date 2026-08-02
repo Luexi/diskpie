@@ -1,0 +1,64 @@
+name: Bug report
+description: Report reproducible incorrect or unsafe DiskPie behavior
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve DiskPie. Remove sensitive path names and do not attach private diagnostics.
+  - type: input
+    id: version
+    attributes:
+      label: DiskPie version
+      description: Release tag or commit hash.
+    validations:
+      required: true
+  - type: dropdown
+    id: windows
+    attributes:
+      label: Operating system
+      options:
+        - Windows 11
+        - Windows 10
+        - Linux (unsupported preview)
+        - macOS (unsupported preview)
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Use a synthetic example if real paths or file names are sensitive.
+      placeholder: |
+        1. Start DiskPie with...
+        2. Select...
+        3. Observe...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Include filesystem type and size mode when relevant. Redact sensitive paths.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed passwords, tokens, personal paths, and private file names.
+          required: true
