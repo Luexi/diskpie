@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows quality gate
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Record pinned toolchain
+        shell: pwsh
+        run: |
+          rustup show active-toolchain
+          rustc -vV
+          cargo -vV
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint all targets
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Reject documentation warnings
+        shell: pwsh
+        run: |
+          $env:RUSTDOCFLAGS = "-D warnings"
+          cargo doc --workspace --no-deps --locked
+
+  portable-core:
+    name: Portable core on Linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Record pinned toolchain
+        run: |
+          rustup show active-toolchain
+          rustc -vV
+          cargo -vV
+
+      - name: Lint portable crates
+        run: >-
+          cargo clippy
+          -p diskpie-core
+          -p diskpie-scan
+          -p diskpie-app
+          --all-targets
+          --locked
+          -- -D warnings
+
+      - name: Test portable crates
+        run: >-
+          cargo test
+          -p diskpie-core
+          -p diskpie-scan
+          -p diskpie-app
+          --all-targets
+          --locked
+
+  msrv:
+    name: Rust 1.92 compatibility
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install declared MSRV
+        shell: pwsh
+        run: rustup toolchain install 1.92.0 --profile minimal
+
+      - name: Check the complete workspace on the MSRV
+        run: cargo +1.92.0 check --workspace --all-targets --locked
+
+      - name: Test portable crates on the MSRV
+        run: >-
+          cargo +1.92.0 test
+          -p diskpie-core
+          -p diskpie-scan
+          -p diskpie-app
+          --all-targets
+          --locked
