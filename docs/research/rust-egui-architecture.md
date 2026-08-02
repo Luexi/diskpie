@@ -207,7 +207,7 @@ permissively licensed fallback font for arbitrary path display.
 | `log` 0.4.33 plus `flexi_logger` 0.31.9 | Both are current and permissive; flexi_logger has useful rotation and retention. It loses structured scan/span fields or requires a bridge, duplicating the logging stack. Build cost is similar enough that the local benefit favors tracing. | Reject for the product baseline. |
 | [`lexopt` 0.3.2](https://docs.rs/lexopt/latest/src/lexopt/lib.rs.html) | MIT; released 2026-02-28; source forbids unsafe. It is portable, preserves `OsString`/`PathBuf`, has minimal compile/binary cost, and a short parser loop is cheaper than local edge-case handling. Low lock-in because the parsed application options are owned locally. | Adopt. |
 | `clap` 4.6.5 / `pico-args` 0.5.0 | Clap is active, MIT/Apache, and robust but derive/default help, suggestions, and styling are excessive for a handful of options; compile/binary cost is materially higher. Pico-args is MIT but last released in 2022. | Reject initially; revisit clap for nested commands, completions, or generated documentation. |
-| [`fluent-bundle` 0.16.0](https://docs.rs/fluent-bundle/latest/fluent_bundle/bundle/struct.FluentBundle.html), `fluent-langneg` 0.14.2, `unic-langid` 0.9.6 | MIT OR Apache-2.0; releases in 2025 and a mature localization standard. Pure Rust with moderate parser/plural compile and binary cost. Plurals, selectors, arguments, negotiation, and fallback exceed a small map's correctness. Typed local message IDs and embedded FTL resources limit lock-in and permit backend replacement. | Adopt directly for embedded `en-US` and `es-MX`. |
+| [`fluent-bundle` 0.16.0](https://docs.rs/fluent-bundle/latest/fluent_bundle/bundle/struct.FluentBundle.html), `unic-langid` 0.9.6 | MIT OR Apache-2.0; releases in 2025 and a mature localization standard. Pure Rust with moderate parser/plural compile and binary cost. Plurals, selectors, arguments, and fallback exceed a small map's correctness. Typed local message IDs and embedded FTL resources limit lock-in and permit backend replacement. Add direct `fluent-langneg` only when automatic locale negotiation is implemented; `fluent-bundle` already resolves its own compatible version. | Adopt directly for embedded `en-US` and `es-MX`. |
 | `i18n-embed` 0.16.0 / `rust-i18n` 4.2.1 | Permissive and maintained through 2025/2026. i18n-embed adds rust-embed, arc-swap, parking_lot, and macro/asset machinery; rust-i18n adds global macro/custom mapping lock-in. Both are portable, but neither provides enough additional product value over the direct Fluent facade to justify footprint. | Reject initially. |
 | [`rfd` 0.17.2](https://docs.rs/rfd/latest/rfd/) | MIT; released 2026-01-12. Windows folder/save selection uses windows-sys/COM, so unsafe native FFI is significant but isolated in the executable/platform edge. With defaults disabled for a Windows build, compile/binary cost is low-medium and no external runtime is required. Native dialog behavior saves substantial platform code. API stability is marked provisional, creating medium lock-in/abandonment risk; a tiny `DialogPort` is the fallback seam. | Adopt for explicit folder/save actions only. |
 | `native-dialog` 0.9.7 / C dialog wrappers | MIT and released 2026-05-30, but cross-platform behavior relies on external Linux dialog programs and its broad message-dialog surface is unnecessary. C wrappers add avoidable FFI/security/packaging exposure. | Reject. |
@@ -257,7 +257,6 @@ serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.19"
 lexopt = "0.3.2"
 fluent-bundle = "0.16.0"
-fluent-langneg = "0.14.2"
 unic-langid = "0.9.6"
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false,
@@ -284,7 +283,7 @@ eframe re-export.
   invariant, converts raw handles immediately into RAII ownership, and
   preserves the original OS error code.
 - The `diskpie` executable should contain no project-authored unsafe. Native
-  unsafe from winit/glutin/rfd/windows-sys remains a reviewed dependency edge,
+  unsafe from winit/glutin/rfd/`windows` and transitive windows-sys remains a reviewed dependency edge,
   not part of domain code.
 - Run `cargo deny`, `cargo audit`, the compatible-license allow-list, and
   `cargo tree -e features` in CI. Audit development dependencies as well.

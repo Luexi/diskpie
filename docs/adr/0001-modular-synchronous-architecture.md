@@ -113,7 +113,7 @@ ADR. The responsibilities are:
 
 Portable consumers own their narrow traits; the outward platform crate depends
 inward to implement them. `diskpie-core`, `diskpie-scan`, and `diskpie-app` do
-not name egui, eframe, rfd, windows-sys, Win32, or COM types.
+not name egui, eframe, rfd, `windows`, `windows-sys`, Win32, or COM types.
 
 ### 2. Use fixed blocking workers and bounded std channels
 
@@ -197,8 +197,7 @@ Use the exact researched baselines documented in the supporting research:
 - Serde 1.0.229 plus eframe Storage behind `SettingsStore`;
 - tracing 0.1.44, tracing-subscriber 0.3.23, and tracing-appender 0.2.5;
 - lexopt 0.3.2 for path-preserving startup arguments;
-- fluent-bundle 0.16.0, fluent-langneg 0.14.2, and unic-langid 0.9.6 behind
-  typed localization IDs;
+- fluent-bundle 0.16.0 and unic-langid 0.9.6 behind typed localization IDs;
 - rfd 0.17.2 behind `DialogPort`; and
 - thiserror 2.0.19 for typed errors carrying stable codes and sources.
 
@@ -215,9 +214,9 @@ must be minimal, state a `// SAFETY:` invariant, acquire raw handles directly
 into RAII ownership, and preserve the original OS error.
 
 The `diskpie` executable contains no project-authored unsafe. Native unsafe from
-winit, glutin, rfd, windows-sys, and transitive support crates is accepted only
-at the reviewed platform/UI dependency edge. CI audits licenses, advisories,
-resolved features, and runtime and development dependency graphs.
+winit, glutin, rfd, `windows`, transitive `windows-sys`, and support crates is
+accepted only at the reviewed platform/UI dependency edge. CI audits licenses,
+advisories, resolved features, and runtime and development dependency graphs.
 
 ## Consequences
 
