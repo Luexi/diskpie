@@ -1,0 +1,24 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local application state and diagnostics
+/.diskpie/
+*.log
+diskpie-diagnostics-*.zip
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Protected legacy reference material must never enter this repository.
+**/Scanner.exe
+**/Scanner.lang
+**/Scanner.en.txt
+**/Scanner.de.txt
+**/Add Scanner to Context Menu.reg
+**/Delete Scanner from Context Menu.reg
+
