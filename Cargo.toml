@@ -18,6 +18,16 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/Luexi/diskpie"
 homepage = "https://github.com/Luexi/diskpie"
 
+[workspace.dependencies]
+eframe = { version = "=0.35.0", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "persistence",
+    "wayland",
+    "x11",
+] }
+
 [workspace.lints.rust]
 rust_2018_idioms = { level = "deny", priority = -1 }
 unsafe_op_in_unsafe_fn = "deny"
