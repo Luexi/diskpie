@@ -4,7 +4,7 @@
 #![forbid(unsafe_code)]
 
 mod shell;
-mod sunburst_view;
+pub mod sunburst_view;
 mod theme;
 
 use std::sync::Arc;
