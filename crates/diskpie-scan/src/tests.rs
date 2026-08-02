@@ -188,6 +188,37 @@ fn wait_until(timeout: Duration, predicate: impl Fn() -> bool) {
 }
 
 #[test]
+fn exposes_nonblocking_coordinator_completion_for_ui_polling() {
+    let fake = Arc::new(FakeFs::default());
+    fake.insert(
+        "root",
+        FakeDirectory::items(vec![file("slow")]).with_item_delay(Duration::from_millis(25)),
+    );
+    let session = start_scan(
+        Arc::clone(&fake) as Arc<dyn ScanFs>,
+        request(0, vec![root("root", 0, StorageClass::Unknown)], options(1)),
+    )
+    .expect("start scan");
+
+    wait_until(Duration::from_secs(2), || fake.active() == 1);
+    assert!(!session.is_finished());
+
+    loop {
+        if matches!(
+            session.recv_timeout(Duration::from_secs(2)).expect("scan event"),
+            ScanEvent::Terminal(_)
+        ) {
+            break;
+        }
+    }
+    wait_until(Duration::from_secs(2), || session.is_finished());
+    let terminal = session.join().expect("coordinator join");
+
+    assert_eq!(terminal.state, TerminalState::Complete);
+    assert_eq!(fake.active(), 0);
+}
+
+#[test]
 fn emits_bounded_partial_batches_and_directory_completion() {
     let fake = Arc::new(FakeFs::default());
     fake.insert(

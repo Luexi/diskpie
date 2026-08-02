@@ -68,6 +68,13 @@ impl ScanSession {
         self.cancel.cancel();
     }
 
+    /// Returns whether the coordinator has exited and [`Self::join`] cannot
+    /// block on filesystem work.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.coordinator.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
     /// Receives only events for this session's generation.
     pub fn try_recv(&self) -> Result<ScanEvent, ScanReceiveError> {
         loop {
