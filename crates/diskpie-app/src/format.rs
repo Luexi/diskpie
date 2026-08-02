@@ -1,6 +1,7 @@
 //! Deterministic, allocation-light presentation helpers.
 
 use crate::i18n::Locale;
+use std::path::Path;
 
 const IEC_UNITS: [&str; 9] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB"];
 
@@ -41,6 +42,24 @@ pub fn format_iec_bytes(bytes: u128, locale: Locale) -> String {
     }
 }
 
+/// Produces a readable path label while leaving the native action path intact.
+///
+/// Windows verbatim prefixes are an implementation detail required for long
+/// path I/O; presenting the familiar DOS or UNC spelling avoids leaking that
+/// detail into tooltips and confirmations. Unrepresentable native code units
+/// are replaced only in this display copy.
+#[must_use]
+pub fn format_path_for_display(path: &Path) -> String {
+    let rendered = path.to_string_lossy();
+    if let Some(rest) = rendered.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = rendered.strip_prefix(r"\\?\") {
+        rest.to_owned()
+    } else {
+        rendered.into_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +82,18 @@ mod tests {
     fn supports_the_full_aggregate_range_without_overflow() {
         let formatted = format_iec_bytes(u128::MAX, Locale::EnglishUnitedStates);
         assert_eq!(formatted, "281474976710655 YiB");
+    }
+
+    #[test]
+    fn hides_only_windows_verbatim_display_prefixes() {
+        assert_eq!(
+            format_path_for_display(Path::new(r"\\?\C:\Users\Luis\📁")),
+            r"C:\Users\Luis\📁"
+        );
+        assert_eq!(
+            format_path_for_display(Path::new(r"\\?\UNC\server\share\folder")),
+            r"\\server\share\folder"
+        );
+        assert_eq!(format_path_for_display(Path::new(r"C:\plain")), r"C:\plain");
     }
 }
