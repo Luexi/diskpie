@@ -7,3 +7,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub use diskpie_core::PRODUCT_NAME;
+
+#[cfg(windows)]
+pub mod windows {
+    pub mod filesystem;
+}
+
+#[cfg(windows)]
+pub use windows::filesystem::WindowsFileSystem;
