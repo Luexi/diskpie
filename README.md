@@ -1,5 +1,9 @@
 # DiskPie
 
+<p align="center">
+  <img src="assets/brand/diskpie-icon.png" width="144" height="144" alt="DiskPie radial disk icon">
+</p>
+
 **A fast visual disk usage scanner.**
 
 DiskPie is a clean-room, Windows-first disk space analyzer built with stable
