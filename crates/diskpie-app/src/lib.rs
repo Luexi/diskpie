@@ -4,6 +4,7 @@
 
 pub mod format;
 pub mod i18n;
+pub mod layout_service;
 pub mod navigation;
 pub mod session;
 
