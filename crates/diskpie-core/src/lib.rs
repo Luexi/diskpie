@@ -7,8 +7,9 @@ pub mod sunburst;
 
 pub use model::{
     Aggregate, AggregateField, AggregateSize, Children, EntryKind, FileIdentity, GenerationId,
-    LinkField, MetricSource, ModelError, NodeId, NodeRecord, NodeSpec, OwnMetrics, ReparseKind,
-    ScanState, SizeMetric, StructureError, TreeBuilder, TreeSnapshot, UnknownReason, VolumeKey,
+    HardLinkStatus, LinkField, MetricSource, ModelError, NodeId, NodeRecord, NodeSpec, OwnMetrics,
+    ReparseKind, ScanState, SizeMetric, StructureError, TreeBuilder, TreeSnapshot, UnknownReason,
+    VolumeKey,
 };
 
 /// Human-readable product name shared by every crate.

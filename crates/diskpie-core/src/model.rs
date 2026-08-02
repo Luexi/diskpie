@@ -4,6 +4,8 @@
 //! stable `u32` indices, exact native names, and precomputed bottom-up totals.
 
 use std::{
+    cmp::Ordering,
+    collections::{HashMap, hash_map::Entry},
     error::Error,
     ffi::{OsStr, OsString},
     fmt,
@@ -101,6 +103,46 @@ impl FileIdentity {
     #[must_use]
     pub const fn file_id(self) -> u128 {
         self.file_id
+    }
+}
+
+/// How one path participates in identity-based allocated-size accounting.
+///
+/// Identified entries always name their deterministic allocation owner. An
+/// entry without a stable identity is deliberately counted per path, which is
+/// represented separately from an unknown allocation measurement.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum HardLinkStatus {
+    /// This node kind does not participate in allocated-size deduplication.
+    NotApplicable,
+    /// Allocation is counted per path because no stable identity was supplied.
+    IdentityUnavailable,
+    /// This path owns the identity's one allocated-size contribution.
+    Owner { owner: NodeId },
+    /// This path is an alias whose allocated contribution belongs elsewhere.
+    Alias { owner: NodeId },
+}
+
+impl HardLinkStatus {
+    /// Returns the deterministic owner for an identified entry.
+    #[must_use]
+    pub const fn owner(self) -> Option<NodeId> {
+        match self {
+            Self::Owner { owner } | Self::Alias { owner } => Some(owner),
+            Self::NotApplicable | Self::IdentityUnavailable => None,
+        }
+    }
+
+    /// Whether this path is a non-owning alias.
+    #[must_use]
+    pub const fn is_alias(self) -> bool {
+        matches!(self, Self::Alias { .. })
+    }
+
+    /// Whether allocation for this path is backed by a stable identity.
+    #[must_use]
+    pub const fn has_stable_identity(self) -> bool {
+        matches!(self, Self::Owner { .. } | Self::Alias { .. })
     }
 }
 
@@ -327,6 +369,7 @@ impl AggregateSize {
 pub struct Aggregate {
     logical: AggregateSize,
     allocated: AggregateSize,
+    allocation_deduplication_unavailable_entries: u64,
     file_count: u64,
     directory_count: u64,
     omission_count: u64,
@@ -342,6 +385,21 @@ impl Aggregate {
     #[must_use]
     pub const fn allocated(self) -> AggregateSize {
         self.allocated
+    }
+
+    /// Number of allocated-size entries counted per path due to a missing ID.
+    ///
+    /// A nonzero value means the known allocated bytes remain useful, but must
+    /// not be presented as a fully deduplicated unique-allocation total.
+    #[must_use]
+    pub const fn allocation_deduplication_unavailable_entries(self) -> u64 {
+        self.allocation_deduplication_unavailable_entries
+    }
+
+    /// Whether every allocation-bearing path in the subtree had a stable ID.
+    #[must_use]
+    pub const fn has_unique_allocation_precision(self) -> bool {
+        self.allocation_deduplication_unavailable_entries == 0
     }
 
     #[must_use]
@@ -370,6 +428,10 @@ impl Aggregate {
         Self {
             logical: AggregateSize::from_metric(node.own.logical),
             allocated: AggregateSize::from_metric(node.own.allocated),
+            allocation_deduplication_unavailable_entries: u64::from(matches!(
+                node.hard_link_status,
+                HardLinkStatus::IdentityUnavailable
+            )),
             file_count: node.kind.own_file_count(),
             directory_count: node.kind.own_directory_count(),
             omission_count: node.own_omissions,
@@ -378,33 +440,45 @@ impl Aggregate {
     }
 
     fn checked_add(&mut self, other: Self, node: NodeId) -> Result<(), ModelError> {
-        self.logical.checked_add(
+        let mut updated = *self;
+        updated.logical.checked_add(
             other.logical,
             node,
             AggregateField::LogicalBytes,
             AggregateField::LogicalUnknownEntries,
         )?;
-        self.allocated.checked_add(
+        updated.allocated.checked_add(
             other.allocated,
             node,
             AggregateField::AllocatedBytes,
             AggregateField::AllocatedUnknownEntries,
         )?;
-        self.file_count =
-            checked_count_add(self.file_count, other.file_count, node, AggregateField::FileCount)?;
-        self.directory_count = checked_count_add(
-            self.directory_count,
+        updated.allocation_deduplication_unavailable_entries = checked_count_add(
+            updated.allocation_deduplication_unavailable_entries,
+            other.allocation_deduplication_unavailable_entries,
+            node,
+            AggregateField::AllocationDeduplicationUnavailableEntries,
+        )?;
+        updated.file_count = checked_count_add(
+            updated.file_count,
+            other.file_count,
+            node,
+            AggregateField::FileCount,
+        )?;
+        updated.directory_count = checked_count_add(
+            updated.directory_count,
             other.directory_count,
             node,
             AggregateField::DirectoryCount,
         )?;
-        self.omission_count = checked_count_add(
-            self.omission_count,
+        updated.omission_count = checked_count_add(
+            updated.omission_count,
             other.omission_count,
             node,
             AggregateField::OmissionCount,
         )?;
-        self.state = self.state.combine(other.state);
+        updated.state = updated.state.combine(other.state);
+        *self = updated;
         Ok(())
     }
 }
@@ -500,6 +574,7 @@ pub struct NodeRecord {
     own: OwnMetrics,
     aggregate: Aggregate,
     file_identity: Option<FileIdentity>,
+    hard_link_status: HardLinkStatus,
     own_omissions: u64,
     local_state: ScanState,
 }
@@ -545,6 +620,24 @@ impl NodeRecord {
         self.file_identity
     }
 
+    /// Returns this path's identity-based allocated-size status.
+    #[must_use]
+    pub const fn hard_link_status(&self) -> HardLinkStatus {
+        self.hard_link_status
+    }
+
+    /// Returns the deterministic allocated-size owner for an identified path.
+    #[must_use]
+    pub const fn hard_link_owner(&self) -> Option<NodeId> {
+        self.hard_link_status.owner()
+    }
+
+    /// Whether this path contributes logical size and count but no allocation.
+    #[must_use]
+    pub const fn is_hard_link_alias(&self) -> bool {
+        self.hard_link_status.is_alias()
+    }
+
     #[must_use]
     pub const fn own_omissions(&self) -> u64 {
         self.own_omissions
@@ -560,6 +653,21 @@ impl NodeRecord {
 struct BuildNode {
     record: NodeRecord,
     last_child: Option<NodeId>,
+}
+
+#[derive(Debug)]
+struct IdentityOwner {
+    node: NodeId,
+    path: Option<NativePathKey>,
+    allocation: SizeMetric,
+    allocation_source: NodeId,
+    allocation_source_path: Option<NativePathKey>,
+}
+
+#[derive(Clone, Debug)]
+struct NativePathKey {
+    root: OsString,
+    relative: PathBuf,
 }
 
 /// Mutable append-only arena that freezes into an immutable snapshot.
@@ -641,6 +749,8 @@ impl TreeBuilder {
 
     /// Computes subtree totals iteratively and consumes the builder.
     pub fn freeze(mut self) -> Result<TreeSnapshot, ModelError> {
+        self.resolve_hard_link_owners()?;
+
         for node in &mut self.nodes {
             node.record.aggregate = Aggregate::from_node(&node.record);
         }
@@ -668,6 +778,95 @@ impl TreeBuilder {
         Ok(snapshot)
     }
 
+    fn resolve_hard_link_owners(&mut self) -> Result<(), ModelError> {
+        let mut owners = HashMap::<FileIdentity, IdentityOwner>::new();
+        let nodes = &self.nodes;
+
+        for (index, node) in nodes.iter().enumerate() {
+            if !node.record.kind.contributes_own_bytes() {
+                continue;
+            }
+            let Some(identity) = node.record.file_identity else {
+                continue;
+            };
+            let candidate = NodeId::from_index(index)?;
+            match owners.entry(identity) {
+                Entry::Vacant(entry) => {
+                    entry.insert(IdentityOwner {
+                        node: candidate,
+                        path: None,
+                        allocation: node.record.own.allocated,
+                        allocation_source: candidate,
+                        allocation_source_path: None,
+                    });
+                }
+                Entry::Occupied(mut entry) => {
+                    let candidate_path = native_path_key(nodes, candidate);
+                    let current_owner = entry.get().node;
+                    let candidate_is_owner = {
+                        let current_path = entry
+                            .get_mut()
+                            .path
+                            .get_or_insert_with(|| native_path_key(nodes, current_owner));
+                        compare_native_path_keys(&candidate_path, current_path) == Ordering::Less
+                    };
+                    if candidate_is_owner {
+                        let owner = entry.get_mut();
+                        owner.node = candidate;
+                        owner.path = Some(candidate_path.clone());
+                    }
+
+                    let candidate_allocation = node.record.own.allocated;
+                    let candidate_is_better_measurement =
+                        match (entry.get().allocation, candidate_allocation) {
+                            (SizeMetric::Unknown { .. }, SizeMetric::Known { .. }) => true,
+                            (SizeMetric::Known { .. }, SizeMetric::Unknown { .. }) => false,
+                            (SizeMetric::Known { .. }, SizeMetric::Known { .. })
+                            | (SizeMetric::Unknown { .. }, SizeMetric::Unknown { .. }) => {
+                                let current_source = entry.get().allocation_source;
+                                let current_path = entry
+                                    .get_mut()
+                                    .allocation_source_path
+                                    .get_or_insert_with(|| native_path_key(nodes, current_source));
+                                compare_native_path_keys(&candidate_path, current_path)
+                                    == Ordering::Less
+                            }
+                        };
+                    if candidate_is_better_measurement {
+                        let owner = entry.get_mut();
+                        owner.allocation = candidate_allocation;
+                        owner.allocation_source = candidate;
+                        owner.allocation_source_path = Some(candidate_path);
+                    }
+                }
+            }
+        }
+
+        for (index, node) in self.nodes.iter_mut().enumerate() {
+            let record = &mut node.record;
+            if !record.kind.contributes_own_bytes() {
+                record.hard_link_status = HardLinkStatus::NotApplicable;
+                continue;
+            }
+            let Some(identity) = record.file_identity else {
+                record.hard_link_status = HardLinkStatus::IdentityUnavailable;
+                continue;
+            };
+            let node_id = NodeId::from_index(index)?;
+            let identity_state =
+                owners.get(&identity).expect("every contributing identified node has an owner");
+            let owner = identity_state.node;
+            if node_id == owner {
+                record.hard_link_status = HardLinkStatus::Owner { owner };
+                record.own.allocated = identity_state.allocation;
+            } else {
+                record.hard_link_status = HardLinkStatus::Alias { owner };
+                record.own.allocated = SizeMetric::known(0, MetricSource::HardLinkAlias);
+            }
+        }
+        Ok(())
+    }
+
     fn push_node(&mut self, parent: Option<NodeId>, spec: NodeSpec) -> Result<NodeId, ModelError> {
         let id = NodeId::from_index(self.nodes.len())?;
         self.nodes.push(BuildNode {
@@ -680,6 +879,7 @@ impl TreeBuilder {
                 own: spec.own,
                 aggregate: Aggregate::default(),
                 file_identity: spec.file_identity,
+                hard_link_status: HardLinkStatus::NotApplicable,
                 own_omissions: spec.omissions,
                 local_state: spec.state,
             },
@@ -692,6 +892,43 @@ impl TreeBuilder {
         let index = id.index();
         if index < self.nodes.len() { Ok(index) } else { Err(ModelError::InvalidNodeId { id }) }
     }
+}
+
+fn native_path_key(nodes: &[BuildNode], node: NodeId) -> NativePathKey {
+    let mut relative_components = Vec::new();
+    let mut cursor = node;
+    let root = loop {
+        let record = &nodes[cursor.index()].record;
+        if record.kind == EntryKind::Root || record.parent.is_none() {
+            break record.name.clone();
+        }
+        relative_components.push(record.name.as_os_str());
+        cursor = record.parent.expect("a non-root path component has a parent");
+    };
+
+    let mut relative = PathBuf::new();
+    for component in relative_components.into_iter().rev() {
+        relative.push(component);
+    }
+    NativePathKey { root, relative }
+}
+
+fn compare_native_path_keys(left: &NativePathKey, right: &NativePathKey) -> Ordering {
+    compare_native_os_strings(left.root.as_os_str(), right.root.as_os_str()).then_with(|| {
+        compare_native_os_strings(left.relative.as_os_str(), right.relative.as_os_str())
+    })
+}
+
+#[cfg(windows)]
+fn compare_native_os_strings(left: &OsStr, right: &OsStr) -> Ordering {
+    use std::os::windows::ffi::OsStrExt;
+
+    left.encode_wide().cmp(right.encode_wide())
+}
+
+#[cfg(not(windows))]
+fn compare_native_os_strings(left: &OsStr, right: &OsStr) -> Ordering {
+    left.cmp(right)
 }
 
 /// Immutable tree revision shared by application and renderer.
@@ -731,6 +968,16 @@ impl TreeSnapshot {
     #[must_use]
     pub fn node(&self, id: NodeId) -> Option<&NodeRecord> {
         self.nodes.get(id.index())
+    }
+
+    /// Returns one node's identity-based allocation status.
+    pub fn hard_link_status(&self, id: NodeId) -> Result<HardLinkStatus, ModelError> {
+        self.node(id).map(NodeRecord::hard_link_status).ok_or(ModelError::InvalidNodeId { id })
+    }
+
+    /// Returns the deterministic allocated-size owner for an identified path.
+    pub fn hard_link_owner(&self, id: NodeId) -> Result<Option<NodeId>, ModelError> {
+        self.node(id).map(NodeRecord::hard_link_owner).ok_or(ModelError::InvalidNodeId { id })
     }
 
     /// Iterates top-level roots and synthetic groups in insertion order.
@@ -908,6 +1155,7 @@ pub enum AggregateField {
     LogicalUnknownEntries,
     AllocatedBytes,
     AllocatedUnknownEntries,
+    AllocationDeduplicationUnavailableEntries,
     FileCount,
     DirectoryCount,
     OmissionCount,
@@ -1034,6 +1282,19 @@ mod tests {
         NodeSpec::file(name, metrics(bytes, bytes))
     }
 
+    fn identity(volume: u128, file_id: u128) -> FileIdentity {
+        FileIdentity::new(VolumeKey::new(volume), file_id)
+    }
+
+    fn identified_file(
+        name: impl Into<OsString>,
+        logical: u64,
+        allocated: u64,
+        identity: FileIdentity,
+    ) -> NodeSpec {
+        NodeSpec::file(name, metrics(logical, allocated)).with_file_identity(identity)
+    }
+
     #[test]
     fn preserves_unicode_emoji_names_and_reconstructs_paths_lazily() {
         let mut builder = TreeBuilder::new(GenerationId::new(41));
@@ -1063,13 +1324,24 @@ mod tests {
         for _ in 0..DEPTH {
             current = builder.add_child(current, NodeSpec::directory("d")).expect("directory");
         }
-        let file = builder.add_child(current, complete_file("leaf", 1)).expect("file");
+        let shared = identity(1, 1);
+        let alias = builder
+            .add_child(current, identified_file("z-leaf", 1, 1, shared))
+            .expect("provisional owner");
+        let owner = builder
+            .add_child(current, identified_file("a-leaf", 1, 1, shared))
+            .expect("final owner");
 
         let snapshot = builder.freeze().expect("deep tree");
-        let path = snapshot.path(file).expect("deep path");
+        let path = snapshot.path(owner).expect("deep path");
         assert_eq!(path.components().count(), DEPTH + 2);
+        assert_eq!(snapshot.hard_link_owner(alias).expect("owner"), Some(owner));
         assert_eq!(
             snapshot.node(NodeId::from_raw(0)).expect("root").aggregate().logical().known_bytes(),
+            2
+        );
+        assert_eq!(
+            snapshot.node(NodeId::from_raw(0)).expect("root").aggregate().allocated().known_bytes(),
             1
         );
     }
@@ -1078,15 +1350,30 @@ mod tests {
     fn u128_totals_preserve_values_beyond_u64_and_four_gibibytes() {
         let mut builder = TreeBuilder::new(GenerationId::new(2));
         let root = builder.add_root(NodeSpec::root("root")).expect("root");
-        builder.add_child(root, complete_file("huge-a", u64::MAX)).expect("first file");
-        builder.add_child(root, complete_file("huge-b", u64::MAX)).expect("second file");
         builder
-            .add_child(root, complete_file("over-4-gib", 5 * 1024 * 1024 * 1024))
+            .add_child(root, identified_file("huge-a", u64::MAX, u64::MAX, identity(1, 1)))
+            .expect("first file");
+        builder
+            .add_child(root, identified_file("huge-b", u64::MAX, u64::MAX, identity(1, 2)))
+            .expect("second file");
+        builder
+            .add_child(
+                root,
+                identified_file(
+                    "over-4-gib",
+                    5 * 1024 * 1024 * 1024,
+                    5 * 1024 * 1024 * 1024,
+                    identity(1, 3),
+                ),
+            )
             .expect("third file");
 
         let snapshot = builder.freeze().expect("snapshot");
-        let total = snapshot.node(root).expect("root").aggregate().logical().known_bytes();
+        let aggregate = snapshot.node(root).expect("root").aggregate();
+        let total = aggregate.logical().known_bytes();
         assert_eq!(total, u128::from(u64::MAX) * 2 + 5_u128 * 1024 * 1024 * 1024);
+        assert_eq!(aggregate.allocated().known_bytes(), total);
+        assert!(aggregate.has_unique_allocation_precision());
         assert!(total > u128::from(u64::MAX));
     }
 
@@ -1198,6 +1485,13 @@ mod tests {
         let partial = partial_builder
             .add_child(root, NodeSpec::directory("partial").with_omissions(2))
             .expect("partial directory");
+        let partial_identity = identity(6, 1);
+        let partial_alias = partial_builder
+            .add_child(partial, identified_file("alias", 3, 5, partial_identity))
+            .expect("partial alias");
+        let complete_owner = partial_builder
+            .add_child(complete, identified_file("owner", 3, 5, partial_identity))
+            .expect("complete owner");
         let partial_snapshot = partial_builder.freeze().expect("partial snapshot");
         assert_eq!(partial_snapshot.state(), ScanState::Partial);
         assert_eq!(
@@ -1213,12 +1507,31 @@ mod tests {
             ScanState::Partial
         );
         assert_eq!(partial_snapshot.node(root).expect("root").aggregate().omission_count(), 2);
+        assert_eq!(
+            partial_snapshot.hard_link_owner(partial_alias).expect("owner"),
+            Some(complete_owner)
+        );
+        assert_eq!(
+            partial_snapshot.node(root).expect("root").aggregate().logical().known_bytes(),
+            6
+        );
+        assert_eq!(
+            partial_snapshot.node(root).expect("root").aggregate().allocated().known_bytes(),
+            5
+        );
 
         let mut cancelled_builder = TreeBuilder::new(GenerationId::new(7));
         let cancelled_root = cancelled_builder.add_root(NodeSpec::root("root")).expect("root");
         let complete_child = cancelled_builder
             .add_child(cancelled_root, NodeSpec::directory("finished"))
             .expect("finished");
+        let cancelled_identity = identity(7, 1);
+        let cancelled_alias = cancelled_builder
+            .add_child(complete_child, identified_file("z-alias", 7, 11, cancelled_identity))
+            .expect("cancelled alias");
+        let cancelled_owner = cancelled_builder
+            .add_child(complete_child, identified_file("a-owner", 7, 11, cancelled_identity))
+            .expect("cancelled owner");
         cancelled_builder.set_scan_state(ScanState::Cancelled);
         let cancelled = cancelled_builder.freeze().expect("cancelled snapshot");
         assert_eq!(cancelled.state(), ScanState::Cancelled);
@@ -1229,6 +1542,18 @@ mod tests {
         assert_eq!(
             cancelled.node(complete_child).expect("child").aggregate().state(),
             ScanState::Complete
+        );
+        assert_eq!(
+            cancelled.hard_link_owner(cancelled_alias).expect("owner"),
+            Some(cancelled_owner)
+        );
+        assert_eq!(
+            cancelled.node(cancelled_root).expect("root").aggregate().logical().known_bytes(),
+            14
+        );
+        assert_eq!(
+            cancelled.node(cancelled_root).expect("root").aggregate().allocated().known_bytes(),
+            11
         );
     }
 
@@ -1286,6 +1611,380 @@ mod tests {
     }
 
     #[test]
+    fn same_directory_hard_links_are_order_independent_and_keep_path_metrics() {
+        const PATH_COUNT: usize = 8;
+        let shared = identity(7, 77);
+
+        for seed in 0_u64..24 {
+            let mut order = (0..PATH_COUNT).collect::<Vec<_>>();
+            let mut state = seed.wrapping_add(1);
+            for upper in (1..PATH_COUNT).rev() {
+                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                order.swap(upper, (state as usize) % (upper + 1));
+            }
+            if seed == 0 {
+                order.reverse();
+            }
+
+            let mut builder = TreeBuilder::new(GenerationId::new(seed));
+            let root = builder.add_root(NodeSpec::root("root")).expect("root");
+            let mut paths = [None; PATH_COUNT];
+            for path_index in order {
+                let name = format!("path-{path_index:02}");
+                let node = builder
+                    .add_child(root, identified_file(name, 13, 4_096, shared))
+                    .expect("hard-link path");
+                paths[path_index] = Some(node);
+            }
+
+            let snapshot = builder.freeze().expect("snapshot");
+            let owner = paths[0].expect("lexicographically first path");
+            let aggregate = snapshot.node(root).expect("root").aggregate();
+            assert_eq!(aggregate.logical().known_bytes(), 13 * PATH_COUNT as u128);
+            assert_eq!(aggregate.allocated().known_bytes(), 4_096);
+            assert_eq!(aggregate.allocated().unknown_entries(), 0);
+            assert_eq!(aggregate.file_count(), PATH_COUNT as u64);
+            assert!(aggregate.has_unique_allocation_precision());
+
+            for (path_index, node) in paths.into_iter().enumerate() {
+                let node = node.expect("path was inserted");
+                let record = snapshot.node(node).expect("path");
+                assert_eq!(record.kind(), EntryKind::File);
+                assert_eq!(record.own_metrics().logical().known_bytes(), Some(13));
+                assert_eq!(snapshot.hard_link_owner(node).expect("owner query"), Some(owner));
+                if path_index == 0 {
+                    assert_eq!(record.hard_link_status(), HardLinkStatus::Owner { owner });
+                    assert_eq!(record.own_metrics().allocated().known_bytes(), Some(4_096));
+                } else {
+                    assert_eq!(record.hard_link_status(), HardLinkStatus::Alias { owner });
+                    assert!(record.is_hard_link_alias());
+                    assert_eq!(record.own_metrics().allocated().known_bytes(), Some(0));
+                    assert_eq!(
+                        record.own_metrics().allocated().source(),
+                        MetricSource::HardLinkAlias
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hard_link_ownership_crosses_directories_and_sorted_roots() {
+        let cross_root = identity(8, 1);
+        let cross_directory = identity(8, 2);
+        let mut builder = TreeBuilder::new(GenerationId::new(50));
+        let group = builder.add_root(NodeSpec::synthetic_group("All roots")).expect("group");
+        let root_z = builder.add_child(group, NodeSpec::root("Z:\\")).expect("root Z");
+        let root_a = builder.add_child(group, NodeSpec::root("A:\\")).expect("root A");
+        let z_directory =
+            builder.add_child(root_z, NodeSpec::directory("earlier batch")).expect("Z directory");
+        let a_directory =
+            builder.add_child(root_a, NodeSpec::directory("later batch")).expect("A directory");
+        let provisional = builder
+            .add_child(z_directory, identified_file("alias.bin", 17, 8_192, cross_root))
+            .expect("provisional cross-root owner");
+        let root_owner = builder
+            .add_child(a_directory, identified_file("owner.bin", 17, 8_192, cross_root))
+            .expect("final cross-root owner");
+
+        let z_subdirectory =
+            builder.add_child(root_a, NodeSpec::directory("z-directory")).expect("late directory");
+        let a_subdirectory =
+            builder.add_child(root_a, NodeSpec::directory("a-directory")).expect("early directory");
+        let directory_alias = builder
+            .add_child(z_subdirectory, identified_file("same.bin", 19, 16_384, cross_directory))
+            .expect("provisional cross-directory owner");
+        let directory_owner = builder
+            .add_child(a_subdirectory, identified_file("same.bin", 19, 16_384, cross_directory))
+            .expect("final cross-directory owner");
+
+        let snapshot = builder.freeze().expect("snapshot");
+        assert_eq!(snapshot.hard_link_owner(provisional).expect("owner"), Some(root_owner));
+        assert_eq!(
+            snapshot.hard_link_owner(directory_alias).expect("owner"),
+            Some(directory_owner)
+        );
+        assert_eq!(snapshot.node(root_z).expect("root Z").aggregate().allocated().known_bytes(), 0);
+        assert_eq!(
+            snapshot.node(root_a).expect("root A").aggregate().allocated().known_bytes(),
+            8_192 + 16_384
+        );
+        let aggregate = snapshot.node(group).expect("group").aggregate();
+        assert_eq!(aggregate.logical().known_bytes(), 2 * 17 + 2 * 19);
+        assert_eq!(aggregate.allocated().known_bytes(), 8_192 + 16_384);
+        assert_eq!(aggregate.file_count(), 4);
+        assert_eq!(snapshot.node(provisional).expect("alias").kind(), EntryKind::File);
+        assert_eq!(snapshot.node(directory_alias).expect("alias").kind(), EntryKind::File);
+    }
+
+    #[test]
+    fn owner_order_uses_the_raw_relative_path_not_component_order() {
+        let shared = identity(9, 1);
+        let mut builder = TreeBuilder::new(GenerationId::new(51));
+        let root = builder.add_root(NodeSpec::root("root")).expect("root");
+        let directory = builder.add_child(root, NodeSpec::directory("a")).expect("directory");
+        let component_first = builder
+            .add_child(directory, identified_file("z", 1, 512, shared))
+            .expect("component-first path");
+        let raw_path_first = builder
+            .add_child(root, identified_file("a-b", 1, 512, shared))
+            .expect("raw-path-first path");
+
+        let snapshot = builder.freeze().expect("snapshot");
+        assert_eq!(
+            snapshot.hard_link_owner(component_first).expect("owner"),
+            Some(raw_path_first),
+            "`a-b` sorts before the native relative path `a\\z`"
+        );
+    }
+
+    #[test]
+    fn missing_identities_count_allocation_per_path_and_expose_precision_loss() {
+        let unknown_allocation = SizeMetric::unknown(
+            UnknownReason::IdentityUnavailable,
+            MetricSource::FilesystemAllocation,
+        );
+        let mut builder = TreeBuilder::new(GenerationId::new(52));
+        let root = builder.add_root(NodeSpec::root("root")).expect("root");
+        let first = builder.add_child(root, complete_file("first", 11)).expect("first");
+        let second = builder.add_child(root, complete_file("second", 13)).expect("second");
+        let unknown = builder
+            .add_child(
+                root,
+                NodeSpec::file(
+                    "unknown",
+                    OwnMetrics::new(SizeMetric::known(17, LOGICAL_SOURCE), unknown_allocation),
+                ),
+            )
+            .expect("unknown allocation");
+
+        let snapshot = builder.freeze().expect("snapshot");
+        let aggregate = snapshot.node(root).expect("root").aggregate();
+        assert_eq!(aggregate.allocated().known_bytes(), 24);
+        assert_eq!(aggregate.allocated().unknown_entries(), 1);
+        assert_eq!(aggregate.allocation_deduplication_unavailable_entries(), 3);
+        assert!(!aggregate.has_unique_allocation_precision());
+        for node in [first, second, unknown] {
+            assert_eq!(
+                snapshot.hard_link_status(node).expect("status"),
+                HardLinkStatus::IdentityUnavailable
+            );
+            assert_eq!(snapshot.hard_link_owner(node).expect("owner"), None);
+        }
+    }
+
+    #[test]
+    fn unknown_allocation_is_contributed_once_for_an_identified_file() {
+        let shared = identity(10, 1);
+        let unknown =
+            SizeMetric::unknown(UnknownReason::NotSupported, MetricSource::FilesystemAllocation);
+        let file = |name| {
+            NodeSpec::file(name, OwnMetrics::new(SizeMetric::known(23, LOGICAL_SOURCE), unknown))
+                .with_file_identity(shared)
+        };
+        let mut builder = TreeBuilder::new(GenerationId::new(53));
+        let root = builder.add_root(NodeSpec::root("root")).expect("root");
+        let provisional = builder.add_child(root, file("z-alias")).expect("provisional owner");
+        let owner = builder.add_child(root, file("a-owner")).expect("final owner");
+
+        let snapshot = builder.freeze().expect("snapshot");
+        let aggregate = snapshot.node(root).expect("root").aggregate();
+        assert_eq!(aggregate.logical().known_bytes(), 46);
+        assert_eq!(aggregate.file_count(), 2);
+        assert_eq!(aggregate.allocated().known_bytes(), 0);
+        assert_eq!(aggregate.allocated().unknown_entries(), 1);
+        assert!(aggregate.has_unique_allocation_precision());
+        assert_eq!(
+            snapshot.node(owner).expect("owner").own_metrics().allocated().unknown_reason(),
+            Some(UnknownReason::NotSupported)
+        );
+        let alias_metric = snapshot.node(provisional).expect("alias").own_metrics().allocated();
+        assert_eq!(alias_metric.known_bytes(), Some(0));
+        assert_eq!(alias_metric.source(), MetricSource::HardLinkAlias);
+        assert_eq!(snapshot.hard_link_owner(provisional).expect("owner"), Some(owner));
+    }
+
+    #[test]
+    fn a_known_alias_measurement_supplies_the_identity_even_when_the_owner_is_unknown() {
+        let shared = identity(10, 2);
+        for order in [["z-known", "a-owner"], ["a-owner", "z-known"]] {
+            let mut builder = TreeBuilder::new(GenerationId::new(531));
+            let root = builder.add_root(NodeSpec::root("root")).expect("root");
+            let mut known = None;
+            let mut owner = None;
+            for name in order {
+                let allocated = if name == "z-known" {
+                    SizeMetric::known(1_024, ALLOCATED_SOURCE)
+                } else {
+                    SizeMetric::unknown(
+                        UnknownReason::AccessDenied,
+                        MetricSource::FilesystemAllocation,
+                    )
+                };
+                let node = builder
+                    .add_child(
+                        root,
+                        NodeSpec::file(
+                            name,
+                            OwnMetrics::new(SizeMetric::known(37, LOGICAL_SOURCE), allocated),
+                        )
+                        .with_file_identity(shared),
+                    )
+                    .expect("hard-link path");
+                if name == "z-known" {
+                    known = Some(node);
+                } else {
+                    owner = Some(node);
+                }
+            }
+
+            let snapshot = builder.freeze().expect("snapshot");
+            let known = known.expect("known alias");
+            let owner = owner.expect("owner");
+            let aggregate = snapshot.node(root).expect("root").aggregate();
+            assert_eq!(aggregate.logical().known_bytes(), 74);
+            assert_eq!(aggregate.allocated().known_bytes(), 1_024);
+            assert_eq!(aggregate.allocated().unknown_entries(), 0);
+            assert_eq!(snapshot.hard_link_owner(known).expect("owner"), Some(owner));
+            assert_eq!(
+                snapshot.node(owner).expect("owner").own_metrics().allocated(),
+                SizeMetric::known(1_024, ALLOCATED_SOURCE)
+            );
+            assert_eq!(
+                snapshot.node(known).expect("alias").own_metrics().allocated(),
+                SizeMetric::known(0, MetricSource::HardLinkAlias)
+            );
+        }
+    }
+
+    #[test]
+    fn equal_file_ids_on_different_volumes_are_not_deduplicated() {
+        let mut builder = TreeBuilder::new(GenerationId::new(54));
+        let root = builder.add_root(NodeSpec::root("root")).expect("root");
+        let first = builder
+            .add_child(root, identified_file("first", 5, 7, identity(1, 999)))
+            .expect("first volume");
+        let second = builder
+            .add_child(root, identified_file("second", 11, 13, identity(2, 999)))
+            .expect("second volume");
+
+        let snapshot = builder.freeze().expect("snapshot");
+        let aggregate = snapshot.node(root).expect("root").aggregate();
+        assert_eq!(aggregate.logical().known_bytes(), 16);
+        assert_eq!(aggregate.allocated().known_bytes(), 20);
+        assert_eq!(snapshot.hard_link_owner(first).expect("first owner"), Some(first));
+        assert_eq!(snapshot.hard_link_owner(second).expect("second owner"), Some(second));
+        assert!(!snapshot.node(first).expect("first").is_hard_link_alias());
+        assert!(!snapshot.node(second).expect("second").is_hard_link_alias());
+    }
+
+    #[test]
+    fn directories_keep_policy_zero_and_reparse_files_keep_their_kind_when_deduplicated() {
+        let shared = identity(11, 1);
+        let mut builder = TreeBuilder::new(GenerationId::new(55));
+        let root = builder.add_root(NodeSpec::root("root")).expect("root");
+        let directory = builder
+            .add_child(root, NodeSpec::directory("directory").with_file_identity(shared))
+            .expect("directory");
+        let directory_reparse = builder
+            .add_child(
+                root,
+                NodeSpec::new(
+                    "directory-link",
+                    EntryKind::ReparsePoint(ReparseKind::Directory),
+                    metrics(100, 100),
+                )
+                .with_file_identity(shared),
+            )
+            .expect("directory reparse point");
+        let regular_alias = builder
+            .add_child(root, identified_file("z-regular", 29, 31, shared))
+            .expect("regular alias");
+        let reparse_owner = builder
+            .add_child(
+                root,
+                NodeSpec::new(
+                    "a-reparse",
+                    EntryKind::ReparsePoint(ReparseKind::File),
+                    metrics(29, 31),
+                )
+                .with_file_identity(shared),
+            )
+            .expect("reparse owner");
+
+        let snapshot = builder.freeze().expect("snapshot");
+        for container in [directory, directory_reparse] {
+            let record = snapshot.node(container).expect("container");
+            assert_eq!(record.own_metrics(), OwnMetrics::ZERO_BY_POLICY);
+            assert_eq!(record.hard_link_status(), HardLinkStatus::NotApplicable);
+        }
+        assert_eq!(snapshot.hard_link_owner(regular_alias).expect("owner"), Some(reparse_owner));
+        assert_eq!(snapshot.node(regular_alias).expect("alias").kind(), EntryKind::File);
+        assert_eq!(
+            snapshot.node(reparse_owner).expect("owner").kind(),
+            EntryKind::ReparsePoint(ReparseKind::File)
+        );
+        let aggregate = snapshot.node(root).expect("root").aggregate();
+        assert_eq!(aggregate.logical().known_bytes(), 58);
+        assert_eq!(aggregate.allocated().known_bytes(), 31);
+        assert_eq!(aggregate.file_count(), 2);
+        assert_eq!(aggregate.directory_count(), 3);
+    }
+
+    #[test]
+    fn unicode_is_not_normalized_when_selecting_an_owner() {
+        let canonical_identity = identity(12, 1);
+        let emoji_identity = identity(12, 2);
+        let mut builder = TreeBuilder::new(GenerationId::new(56));
+        let root = builder.add_root(NodeSpec::root("root")).expect("root");
+        let composed = builder
+            .add_child(root, identified_file("\u{e9}.bin", 1, 1, canonical_identity))
+            .expect("composed path");
+        let decomposed = builder
+            .add_child(root, identified_file("e\u{301}.bin", 1, 1, canonical_identity))
+            .expect("decomposed path");
+        let private_use = builder
+            .add_child(root, identified_file("\u{e000}.bin", 1, 1, emoji_identity))
+            .expect("private-use path");
+        let emoji = builder
+            .add_child(root, identified_file("\u{1f600}.bin", 1, 1, emoji_identity))
+            .expect("emoji path");
+
+        let snapshot = builder.freeze().expect("snapshot");
+        assert_eq!(snapshot.hard_link_owner(composed).expect("owner"), Some(decomposed));
+        assert_eq!(snapshot.node(decomposed).expect("owner").name(), OsStr::new("e\u{301}.bin"));
+
+        #[cfg(windows)]
+        let native_owner = emoji;
+        #[cfg(not(windows))]
+        let native_owner = private_use;
+        assert_eq!(snapshot.hard_link_owner(private_use).expect("owner"), Some(native_owner));
+        assert_eq!(snapshot.hard_link_owner(emoji).expect("owner"), Some(native_owner));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_utf16_order_supports_names_that_cannot_be_unicode_strings() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let shared = identity(13, 1);
+        let higher = OsString::from_wide(&[0xe000, b'.' as u16]);
+        let lower_unpaired_surrogate = OsString::from_wide(&[0xd800, b'.' as u16]);
+        let mut builder = TreeBuilder::new(GenerationId::new(57));
+        let root = builder.add_root(NodeSpec::root("root")).expect("root");
+        let provisional = builder
+            .add_child(root, identified_file(higher, 1, 1, shared))
+            .expect("provisional owner");
+        let owner = builder
+            .add_child(root, identified_file(lower_unpaired_surrogate.clone(), 1, 1, shared))
+            .expect("raw UTF-16 owner");
+
+        let snapshot = builder.freeze().expect("snapshot");
+        assert_eq!(snapshot.hard_link_owner(provisional).expect("owner"), Some(owner));
+        assert_eq!(snapshot.node(owner).expect("owner").name(), lower_unpaired_surrogate);
+    }
+
+    #[test]
     fn aggregate_addition_checks_instead_of_wrapping() {
         let node = NodeId::from_raw(0);
         let mut size = AggregateSize { known_bytes: u128::MAX, unknown_entries: 0 };
@@ -1321,6 +2020,53 @@ mod tests {
             AggregateSize { known_bytes: 17, unknown_entries: u64::MAX },
             "a failed checked addition must not partially update the total"
         );
+
+        let mut aggregate = Aggregate {
+            logical: AggregateSize { known_bytes: 41, unknown_entries: 2 },
+            allocated: AggregateSize { known_bytes: u128::MAX, unknown_entries: 3 },
+            allocation_deduplication_unavailable_entries: 5,
+            file_count: 7,
+            directory_count: 11,
+            omission_count: 13,
+            state: ScanState::Partial,
+        };
+        let original = aggregate;
+        let increment = Aggregate {
+            logical: AggregateSize { known_bytes: 1, unknown_entries: 1 },
+            allocated: AggregateSize { known_bytes: 1, unknown_entries: 1 },
+            allocation_deduplication_unavailable_entries: 1,
+            file_count: 1,
+            directory_count: 1,
+            omission_count: 1,
+            state: ScanState::Cancelled,
+        };
+        assert_eq!(
+            aggregate.checked_add(increment, node),
+            Err(ModelError::AggregateOverflow { node, field: AggregateField::AllocatedBytes })
+        );
+        assert_eq!(
+            aggregate, original,
+            "failure after a successful logical addition must leave every field unchanged"
+        );
+
+        aggregate = Aggregate {
+            allocation_deduplication_unavailable_entries: u64::MAX,
+            ..Aggregate::default()
+        };
+        let original = aggregate;
+        let increment = Aggregate {
+            logical: AggregateSize { known_bytes: 1, unknown_entries: 0 },
+            allocation_deduplication_unavailable_entries: 1,
+            ..Aggregate::default()
+        };
+        assert_eq!(
+            aggregate.checked_add(increment, node),
+            Err(ModelError::AggregateOverflow {
+                node,
+                field: AggregateField::AllocationDeduplicationUnavailableEntries,
+            })
+        );
+        assert_eq!(aggregate, original, "precision-counter overflow must also be atomic");
     }
 
     #[test]
