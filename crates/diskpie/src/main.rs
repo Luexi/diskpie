@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 mod shell;
+pub mod storage;
 pub mod sunburst_view;
 mod theme;
 
