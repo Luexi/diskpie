@@ -8,5 +8,6 @@ pub mod layout_service;
 pub mod navigation;
 pub mod presentation;
 pub mod session;
+pub mod settings;
 
 pub use diskpie_core::PRODUCT_NAME;

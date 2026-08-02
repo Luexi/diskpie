@@ -13,6 +13,7 @@ homepage.workspace = true
 diskpie-core = { path = "../diskpie-core", version = "0.1.0" }
 diskpie-scan = { path = "../diskpie-scan", version = "0.1.0" }
 fluent-bundle.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 unic-langid.workspace = true
 

@@ -687,6 +687,7 @@ dependencies = [
  "diskpie-core",
  "diskpie-scan",
  "fluent-bundle",
+ "serde",
  "thiserror 2.0.19",
  "unic-langid",
 ]
