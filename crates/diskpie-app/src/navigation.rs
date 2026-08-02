@@ -1412,7 +1412,7 @@ mod tests {
         let CommandOutcome::RescanRequested(RescanRequest::Branch(target)) = branch else {
             panic!("expected branch rescan request");
         };
-        assert_eq!(target.path(), Path::new("C:\\Users"));
+        assert_eq!(target.path(), Path::new("C:\\").join("Users"));
     }
 
     #[test]
