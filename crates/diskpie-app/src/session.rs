@@ -25,6 +25,8 @@ use std::{
     time::Duration,
 };
 
+const MULTI_ROOT_SUMMARY_NAME: &str = "All volumes";
+
 /// Reducer lifecycle independent of any widget toolkit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionPhase {
@@ -315,6 +317,7 @@ pub struct SessionReducer {
     phase: SessionPhase,
     scan_to_core: HashMap<ScanNodeId, NodeId>,
     nodes: Vec<StagedNode>,
+    has_multi_root_summary: bool,
     completed_directories: HashSet<ScanNodeId>,
     directory_counters: HashMap<ScanNodeId, ScanCounters>,
     omissions: Vec<ScanOmission>,
@@ -337,6 +340,7 @@ impl SessionReducer {
             phase: SessionPhase::AwaitingStart,
             scan_to_core: HashMap::new(),
             nodes: Vec::new(),
+            has_multi_root_summary: false,
             completed_directories: HashSet::new(),
             directory_counters: HashMap::new(),
             omissions: Vec::new(),
@@ -610,6 +614,11 @@ impl SessionReducer {
             return Err(SessionError::MissingStarted);
         }
         let mut builder = TreeBuilder::new(GenerationId::from(self.generation));
+        let summary = if self.has_multi_root_summary {
+            Some(builder.add_root(NodeSpec::synthetic_group(MULTI_ROOT_SUMMARY_NAME))?)
+        } else {
+            None
+        };
         let mut materialized = HashMap::with_capacity(self.nodes.len());
         for node in &self.nodes {
             let mut spec = NodeSpec::new(node.name.clone(), node.kind, node.own_metrics)
@@ -618,15 +627,16 @@ impl SessionReducer {
             if let Some(identity) = node.identity {
                 spec = spec.with_file_identity(identity);
             }
-            let actual = match node.parent {
-                Some(parent) => {
+            let actual = match (node.parent, summary) {
+                (Some(parent), _) => {
                     let parent = materialized
                         .get(&parent)
                         .copied()
                         .ok_or(SessionError::UnknownScanNode { id: parent })?;
                     builder.add_child(parent, spec)?
                 }
-                None => builder.add_root(spec)?,
+                (None, Some(summary)) => builder.add_child(summary, spec)?,
+                (None, None) => builder.add_root(spec)?,
             };
             if actual != node.core_id {
                 return Err(SessionError::ContradictoryTerminal {
@@ -674,7 +684,12 @@ impl SessionReducer {
         if roots.is_empty() {
             return Err(SessionError::EmptyStartedRoots);
         }
-        self.ensure_capacity_for(roots.len())?;
+        let has_multi_root_summary = roots.len() >= 2;
+        ensure_node_id_capacity(
+            self.nodes.len(),
+            roots.len(),
+            usize::from(has_multi_root_summary),
+        )?;
         let mut seen = HashSet::with_capacity(roots.len());
         for root in &roots {
             if self.scan_to_core.contains_key(&root.id) || !seen.insert(root.id) {
@@ -685,6 +700,7 @@ impl SessionReducer {
         for _ in &roots {
             observe_entry(&mut counters, EntryKind::Root)?;
         }
+        self.has_multi_root_summary = has_multi_root_summary;
         for root in roots {
             self.insert_node(
                 root.id,
@@ -711,7 +727,9 @@ impl SessionReducer {
         if self.completed_directories.contains(&batch.parent) {
             return Err(SessionError::ParentAlreadyComplete { parent: batch.parent });
         }
-        let parent_index = parent_core.raw() as usize;
+        let parent_index = self
+            .staged_index(parent_core)
+            .ok_or(SessionError::UnknownScanNode { id: batch.parent })?;
         if !self.nodes[parent_index].kind.can_have_children() {
             return Err(SessionError::InvalidParent {
                 parent: batch.parent,
@@ -781,7 +799,9 @@ impl SessionReducer {
         if self.completed_directories.contains(&completion.directory) {
             return Err(SessionError::DuplicateDirectoryCompletion { id: completion.directory });
         }
-        let index = core_id.raw() as usize;
+        let index = self
+            .staged_index(core_id)
+            .ok_or(SessionError::UnknownScanNode { id: completion.directory })?;
         if !self.nodes[index].kind.can_have_children() {
             return Err(SessionError::InvalidParent {
                 parent: completion.directory,
@@ -905,7 +925,12 @@ impl SessionReducer {
         {
             return Err(SessionError::UnknownScanNode { id: parent });
         }
-        let raw = u32::try_from(self.nodes.len()).map_err(|_| SessionError::NodeIdExhausted)?;
+        let raw = self
+            .nodes
+            .len()
+            .checked_add(usize::from(self.has_multi_root_summary))
+            .and_then(|index| u32::try_from(index).ok())
+            .ok_or(SessionError::NodeIdExhausted)?;
         let core_id = NodeId::from_raw(raw);
         self.nodes.push(StagedNode {
             scan_id,
@@ -923,12 +948,11 @@ impl SessionReducer {
     }
 
     fn ensure_capacity_for(&self, additional: usize) -> Result<(), SessionError> {
-        let count =
-            self.nodes.len().checked_add(additional).ok_or(SessionError::NodeIdExhausted)?;
-        if let Some(last) = count.checked_sub(1) {
-            u32::try_from(last).map_err(|_| SessionError::NodeIdExhausted)?;
-        }
-        Ok(())
+        ensure_node_id_capacity(
+            self.nodes.len(),
+            additional,
+            usize::from(self.has_multi_root_summary),
+        )
     }
 
     fn require_started(&self) -> Result<(), SessionError> {
@@ -940,10 +964,7 @@ impl SessionReducer {
     }
 
     fn anchor_for(&self, id: NodeId) -> Result<SelectionAnchor, SessionError> {
-        let mut index = id.raw() as usize;
-        if self.nodes.get(index).is_none_or(|node| node.core_id != id) {
-            return Err(SessionError::InvalidSelection { id });
-        }
+        let mut index = self.staged_index(id).ok_or(SessionError::InvalidSelection { id })?;
         let mut lineage = Vec::new();
         loop {
             let node = &self.nodes[index];
@@ -952,15 +973,17 @@ impl SessionReducer {
                 kind: node.kind,
                 identity: node.identity,
             });
-            let Some(parent) = node.parent else {
+            let Some(parent_scan) = node.parent else {
                 break;
             };
             let parent = self
                 .scan_to_core
-                .get(&parent)
+                .get(&parent_scan)
                 .copied()
-                .ok_or(SessionError::UnknownScanNode { id: parent })?;
-            index = parent.raw() as usize;
+                .ok_or(SessionError::UnknownScanNode { id: parent_scan })?;
+            index = self
+                .staged_index(parent)
+                .ok_or(SessionError::UnknownScanNode { id: parent_scan })?;
         }
         lineage.reverse();
         Ok(SelectionAnchor { lineage })
@@ -996,7 +1019,9 @@ impl SessionReducer {
     }
 
     fn node_matches_lineage(&self, id: NodeId, expected: &[SelectionSegment]) -> bool {
-        let mut index = id.raw() as usize;
+        let Some(mut index) = self.staged_index(id) else {
+            return false;
+        };
         let mut actual = Vec::new();
         loop {
             let Some(node) = self.nodes.get(index) else {
@@ -1009,7 +1034,10 @@ impl SessionReducer {
             let Some(parent) = self.scan_to_core.get(&parent) else {
                 return false;
             };
-            index = parent.raw() as usize;
+            let Some(parent_index) = self.staged_index(*parent) else {
+                return false;
+            };
+            index = parent_index;
         }
         if actual.len() != expected.len() {
             return false;
@@ -1023,6 +1051,27 @@ impl SessionReducer {
             }
         })
     }
+
+    fn staged_index(&self, id: NodeId) -> Option<usize> {
+        let raw = id.raw().checked_sub(u32::from(self.has_multi_root_summary))?;
+        let index = raw as usize;
+        self.nodes.get(index).filter(|node| node.core_id == id).map(|_| index)
+    }
+}
+
+fn ensure_node_id_capacity(
+    existing: usize,
+    additional: usize,
+    reserved: usize,
+) -> Result<(), SessionError> {
+    let count = existing
+        .checked_add(additional)
+        .and_then(|count| count.checked_add(reserved))
+        .ok_or(SessionError::NodeIdExhausted)?;
+    if let Some(last) = count.checked_sub(1) {
+        u32::try_from(last).map_err(|_| SessionError::NodeIdExhausted)?;
+    }
+    Ok(())
 }
 
 fn observe_entry(counters: &mut ScanCounters, kind: EntryKind) -> Result<(), SessionError> {
@@ -1102,6 +1151,7 @@ fn counters_dominate(left: ScanCounters, right: ScanCounters) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::navigation::{NavigationAction, NavigationState};
     use diskpie_core::{MetricSource, SizeMetric, VolumeKey};
     use diskpie_scan::{FsError, FsErrorKind, FsOperation, StartedRoot, StorageClass};
     use std::{collections::VecDeque, path::PathBuf};
@@ -1216,6 +1266,13 @@ mod tests {
         assert_eq!(reducer.core_id(ScanNodeId::from_raw(12)), Some(NodeId::from_raw(2)));
         assert_eq!(reducer.phase(), &SessionPhase::Complete);
         let snapshot = reducer.materialize_snapshot().expect("snapshot");
+        assert_eq!(snapshot.len(), 3);
+        assert_eq!(
+            snapshot.roots().map(|(id, _)| id).collect::<Vec<_>>(),
+            vec![NodeId::from_raw(0)]
+        );
+        assert_eq!(snapshot.node(NodeId::from_raw(0)).expect("root").kind(), EntryKind::Root);
+        assert!(snapshot.nodes().iter().all(|node| node.kind() != EntryKind::SyntheticGroup));
         let names = snapshot
             .children(NodeId::from_raw(0))
             .expect("children")
@@ -1223,6 +1280,149 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(names, vec![OsString::from("a"), OsString::from("b")]);
         assert_eq!(snapshot.state(), ScanState::Complete);
+    }
+
+    #[test]
+    fn two_or_more_roots_have_exactly_one_uncounted_summary() {
+        let cases = [
+            (20, vec![(10, "A:\\"), (20, "B:\\")]),
+            (21, vec![(10, "A:\\"), (20, "B:\\"), (30, "C:\\")]),
+            (22, vec![(10, "A:\\"), (20, "B:\\"), (30, "C:\\"), (40, "D:\\")]),
+        ];
+
+        for (generation, roots) in cases {
+            let mut reducer = SessionReducer::new(self::generation(generation));
+            apply(&mut reducer, started(generation, &roots));
+            let snapshot = reducer.materialize_snapshot().expect("multi-root snapshot");
+            let summary = NodeId::from_raw(0);
+
+            assert_eq!(reducer.node_count(), roots.len());
+            assert_eq!(snapshot.len(), roots.len() + 1);
+            assert_eq!(snapshot.roots().map(|(id, _)| id).collect::<Vec<_>>(), vec![summary]);
+            assert_eq!(snapshot.node(summary).expect("summary").kind(), EntryKind::SyntheticGroup);
+            let summary_children = snapshot
+                .children(summary)
+                .expect("summary children")
+                .map(|(id, node)| (id, node.kind(), node.name().to_os_string()))
+                .collect::<Vec<_>>();
+            assert_eq!(summary_children.len(), roots.len());
+
+            for (index, (scan_id, root_path)) in roots.iter().enumerate() {
+                let expected = NodeId::from_raw(u32::try_from(index + 1).expect("small test ID"));
+                assert_eq!(reducer.core_id(ScanNodeId::from_raw(*scan_id)), Some(expected));
+                let root = snapshot.node(expected).expect("real root");
+                assert_eq!(root.kind(), EntryKind::Root);
+                assert_eq!(root.parent(), Some(summary));
+                assert_eq!(
+                    snapshot.path(expected).expect("real root path"),
+                    PathBuf::from(root_path)
+                );
+            }
+
+            let observed = reducer.progress().observed();
+            assert_eq!(observed.entries, roots.len() as u64);
+            assert_eq!(observed.directories, roots.len() as u64);
+            assert_eq!(observed.files, 0);
+            let aggregate = snapshot.node(summary).expect("summary").aggregate();
+            assert_eq!(aggregate.directory_count(), roots.len() as u64);
+            assert_eq!(aggregate.file_count(), 0);
+            assert_eq!(aggregate.omission_count(), 0);
+
+            let navigation = NavigationState::new(snapshot).expect("valid summary navigation");
+            assert_eq!(navigation.view_root(), summary);
+            assert!(navigation.is_summary_view());
+        }
+    }
+
+    #[test]
+    fn multi_root_progression_preserves_mapping_selection_paths_and_navigation_replacement() {
+        let identity = FileIdentity::new(VolumeKey::new(70), 700);
+        let mut reducer = SessionReducer::new(generation(70));
+        apply(&mut reducer, started(70, &[(10, "C:\\"), (20, "D:\\")]));
+
+        let initial = Arc::new(reducer.materialize_snapshot().expect("initial snapshot"));
+        let mut navigation = NavigationState::new(Arc::clone(&initial)).expect("navigation");
+        assert!(navigation.is_summary_view());
+        assert_eq!(navigation.view_root(), NodeId::from_raw(0));
+
+        let mut chosen = entry(21, 20, "chosen.bin", EntryKind::File);
+        chosen.file_identity = Some(identity);
+        let d_batch = batch_event(70, 20, vec![chosen], Vec::new());
+        let d_counters = match &d_batch {
+            ScanEvent::Batch(batch) => batch.counters,
+            _ => unreachable!(),
+        };
+        apply(&mut reducer, d_batch);
+        let chosen_id = reducer.core_id(ScanNodeId::from_raw(21)).expect("chosen mapping");
+        assert_eq!(chosen_id, NodeId::from_raw(3));
+        let anchor = reducer.select(chosen_id).expect("selection anchor");
+
+        let middle = Arc::new(reducer.materialize_snapshot().expect("middle snapshot"));
+        navigation.replace_snapshot(Arc::clone(&middle)).expect("progressive replacement");
+        let select = navigation.command(NavigationAction::Select(chosen_id));
+        navigation.execute(select).expect("select real node");
+        assert_eq!(navigation.selected(), Some(chosen_id));
+        assert_eq!(
+            middle.path(chosen_id).expect("chosen path"),
+            PathBuf::from("D:\\").join("chosen.bin")
+        );
+
+        let c_batch =
+            batch_event(70, 10, vec![entry(11, 10, "other.bin", EntryKind::File)], Vec::new());
+        let c_counters = match &c_batch {
+            ScanEvent::Batch(batch) => batch.counters,
+            _ => unreachable!(),
+        };
+        apply(&mut reducer, c_batch);
+        assert_eq!(reducer.core_id(ScanNodeId::from_raw(11)), Some(NodeId::from_raw(4)));
+        assert_eq!(reducer.selected_node(), Some(chosen_id));
+        apply(&mut reducer, completion_event(70, 10, c_counters, DirectoryState::Complete));
+        apply(&mut reducer, completion_event(70, 20, d_counters, DirectoryState::Complete));
+        let counters = reducer.progress().observed();
+        apply(&mut reducer, terminal_event(70, TerminalState::Complete, counters));
+
+        let complete = Arc::new(reducer.materialize_snapshot().expect("complete snapshot"));
+        navigation.replace_snapshot(Arc::clone(&complete)).expect("complete replacement");
+        assert!(navigation.is_summary_view());
+        assert_eq!(navigation.selected(), Some(chosen_id));
+        assert_eq!(complete.state(), ScanState::Complete);
+        assert_eq!(complete.len(), reducer.node_count() + 1);
+        let summary_aggregate = complete.node(NodeId::from_raw(0)).expect("summary").aggregate();
+        assert_eq!(summary_aggregate.file_count(), 2);
+        assert_eq!(summary_aggregate.directory_count(), 2);
+        assert_eq!(counters.entries, 4);
+        assert_eq!(counters.files, 2);
+        assert_eq!(counters.directories, 2);
+
+        let mut replacement = SessionReducer::new(generation(71));
+        assert_eq!(replacement.restore_selection(anchor), None);
+        apply(&mut replacement, started(71, &[(200, "D:\\"), (100, "C:\\")]));
+        assert_eq!(replacement.selected_node(), Some(NodeId::from_raw(1)));
+        let mut replacement_chosen = entry(202, 200, "chosen.bin", EntryKind::File);
+        replacement_chosen.file_identity = Some(identity);
+        apply(
+            &mut replacement,
+            batch_event(
+                71,
+                200,
+                vec![entry(201, 200, "inserted-first.bin", EntryKind::File), replacement_chosen],
+                Vec::new(),
+            ),
+        );
+        let replacement_id = NodeId::from_raw(4);
+        assert_eq!(replacement.core_id(ScanNodeId::from_raw(202)), Some(replacement_id));
+        assert_eq!(replacement.selected_node(), Some(replacement_id));
+        let replacement_snapshot =
+            Arc::new(replacement.materialize_snapshot().expect("replacement generation snapshot"));
+        navigation
+            .replace_snapshot(Arc::clone(&replacement_snapshot))
+            .expect("cross-generation replacement");
+        assert!(navigation.is_summary_view());
+        assert_eq!(navigation.selected(), Some(replacement_id));
+        assert_eq!(
+            replacement_snapshot.path(replacement_id).expect("replacement path"),
+            PathBuf::from("D:\\").join("chosen.bin")
+        );
     }
 
     #[test]
@@ -1425,5 +1625,22 @@ mod tests {
             DEPTH as usize + 1
         );
         assert_eq!(snapshot.state(), ScanState::Partial);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn node_id_capacity_accounts_for_the_reserved_multi_root_summary() {
+        let maximum_ids = u32::MAX as usize + 1;
+        assert_eq!(ensure_node_id_capacity(maximum_ids - 1, 1, 0), Ok(()));
+        assert_eq!(
+            ensure_node_id_capacity(maximum_ids - 2, 1, 1),
+            Ok(()),
+            "summary plus u32::MAX real nodes exactly fills the arena"
+        );
+        assert_eq!(
+            ensure_node_id_capacity(maximum_ids - 1, 1, 1),
+            Err(SessionError::NodeIdExhausted)
+        );
+        assert_eq!(ensure_node_id_capacity(usize::MAX, 1, 0), Err(SessionError::NodeIdExhausted));
     }
 }
