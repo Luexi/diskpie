@@ -27,6 +27,9 @@ eframe = { version = "=0.35.0", default-features = false, features = [
     "wayland",
     "x11",
 ] }
+fluent-bundle = "=0.16.0"
+thiserror = "=2.0.19"
+unic-langid = "=0.9.6"
 
 [workspace.lints.rust]
 rust_2018_idioms = { level = "deny", priority = -1 }

@@ -37,6 +37,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         diskpie_app::PRODUCT_NAME,
         options,
-        Box::new(|creation| Ok(Box::new(shell::DiskPieShell::new(creation)))),
+        Box::new(|creation| Ok(Box::new(shell::DiskPieShell::new(creation)?))),
     )
 }

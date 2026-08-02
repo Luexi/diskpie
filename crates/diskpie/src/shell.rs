@@ -7,12 +7,40 @@ use eframe::egui::{
     Vec2,
 };
 
+use diskpie_app::i18n::{I18n, I18nError, Locale, MessageId};
+
 use crate::theme;
 
+/// Preformatted static messages keep Fluent parsing and allocation off the frame loop.
+struct UiStrings {
+    values: Box<[String]>,
+}
+
+impl UiStrings {
+    fn new(i18n: &I18n) -> Self {
+        let values = MessageId::ALL
+            .into_iter()
+            .map(|id| {
+                i18n.text(id)
+                    .map(std::borrow::Cow::into_owned)
+                    .unwrap_or_else(|_| id.key().to_owned())
+            })
+            .collect();
+        Self { values }
+    }
+
+    fn get(&self, id: MessageId) -> &str {
+        self.values.get(id.index()).map_or_else(|| id.key(), String::as_str)
+    }
+}
+
 pub struct DiskPieShell {
+    i18n: I18n,
+    strings: UiStrings,
+    locale: Locale,
     theme_preference: ThemePreference,
     metric: SizeMetric,
-    notice: &'static str,
+    notice: MessageId,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -22,61 +50,106 @@ enum SizeMetric {
 }
 
 impl DiskPieShell {
-    pub fn new(creation: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(creation: &eframe::CreationContext<'_>) -> Result<Self, I18nError> {
         theme::install(&creation.egui_ctx);
         creation.egui_ctx.set_theme(ThemePreference::System);
-        Self {
+        let locale = Locale::EnglishUnitedStates;
+        let i18n = I18n::new(locale)?;
+        let strings = UiStrings::new(&i18n);
+        Ok(Self {
+            i18n,
+            strings,
+            locale,
             theme_preference: ThemePreference::System,
             metric: SizeMetric::Allocated,
-            notice: "Ready — choose a folder or drive to begin",
+            notice: MessageId::StatusReady,
+        })
+    }
+
+    fn select_locale(&mut self, locale: Locale) {
+        if locale == self.locale {
+            return;
+        }
+        if let Ok(i18n) = I18n::new(locale) {
+            self.strings = UiStrings::new(&i18n);
+            self.i18n = i18n;
+            self.locale = locale;
         }
     }
 
     fn command_rail(&mut self, ui: &mut egui::Ui) {
+        let strings = &self.strings;
+        let mut selected_locale = self.locale;
+        let theme_preference = &mut self.theme_preference;
+        let notice = &mut self.notice;
+
         egui::Panel::top("command-rail").exact_size(52.0).show_separator_line(true).show(
             ui,
             |ui| {
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
                     ui.label(
-                        RichText::new("DiskPie").strong().size(18.0).color(theme::SCAN_CURRENT),
+                        RichText::new(strings.get(MessageId::AppName))
+                            .strong()
+                            .size(18.0)
+                            .color(theme::SCAN_CURRENT),
                     );
                     ui.separator();
-                    ui.add_enabled(false, egui::Button::new("Back"))
-                        .on_disabled_hover_text("No navigation history yet");
-                    ui.add_enabled(false, egui::Button::new("Parent"))
-                        .on_disabled_hover_text("No parent folder yet");
-                    if ui.button("Choose folder…").clicked() {
-                        self.notice = "Folder picker is not connected yet";
+                    ui.add_enabled(false, egui::Button::new(strings.get(MessageId::Back)))
+                        .on_disabled_hover_text(strings.get(MessageId::NoBackHistory));
+                    ui.add_enabled(false, egui::Button::new(strings.get(MessageId::Parent)))
+                        .on_disabled_hover_text(strings.get(MessageId::NoParent));
+                    if ui.button(strings.get(MessageId::ChooseFolder)).clicked() {
+                        *notice = MessageId::StatusReady;
                     }
-                    ui.label(RichText::new("No location selected").weak());
+                    if ui.available_width() > 620.0 {
+                        ui.label(RichText::new(strings.get(MessageId::NoLocation)).weak());
+                    }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         egui::ComboBox::from_id_salt("theme-preference")
-                            .selected_text(theme_name(self.theme_preference))
+                            .selected_text(theme_name(*theme_preference, strings))
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(
-                                    &mut self.theme_preference,
+                                    theme_preference,
                                     ThemePreference::System,
-                                    "System theme",
+                                    strings.get(MessageId::ThemeSystem),
                                 );
                                 ui.selectable_value(
-                                    &mut self.theme_preference,
+                                    theme_preference,
                                     ThemePreference::Dark,
-                                    "Dark theme",
+                                    strings.get(MessageId::ThemeDark),
                                 );
                                 ui.selectable_value(
-                                    &mut self.theme_preference,
+                                    theme_preference,
                                     ThemePreference::Light,
-                                    "Light theme",
+                                    strings.get(MessageId::ThemeLight),
                                 );
                             });
-                        ui.label(RichText::new("Theme").weak());
+                        if ui.available_width() > 820.0 {
+                            ui.label(RichText::new(strings.get(MessageId::Theme)).weak());
+                        }
+                        egui::ComboBox::from_id_salt("language")
+                            .selected_text(selected_locale.native_name())
+                            .show_ui(ui, |ui| {
+                                for locale in Locale::ALL {
+                                    ui.selectable_value(
+                                        &mut selected_locale,
+                                        locale,
+                                        locale.native_name(),
+                                    );
+                                }
+                            });
+                        if ui.available_width() > 820.0 {
+                            ui.label(RichText::new(strings.get(MessageId::Language)).weak());
+                        }
                     });
                 });
             },
         );
-        ui.ctx().set_theme(self.theme_preference);
+
+        ui.ctx().set_theme(*theme_preference);
+        self.select_locale(selected_locale);
     }
 
     fn telemetry_rail(&mut self, ui: &mut egui::Ui) {
@@ -85,40 +158,46 @@ impl DiskPieShell {
             |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.add_space(8.0);
-                    status_pill(ui, "READY", theme::SCAN_CURRENT);
+                    status_pill(ui, self.strings.get(MessageId::Ready), theme::SCAN_CURRENT);
                     ui.separator();
-                    metric_value(ui, "Selected", "—");
-                    metric_value(ui, "Files", "0");
-                    metric_value(ui, "Folders", "0");
+                    metric_value(ui, self.strings.get(MessageId::Selected), "—");
+                    metric_value(ui, self.strings.get(MessageId::Files), "0");
+                    metric_value(ui, self.strings.get(MessageId::Folders), "0");
                     ui.separator();
-                    ui.selectable_value(&mut self.metric, SizeMetric::Logical, "Logical size");
-                    ui.selectable_value(&mut self.metric, SizeMetric::Allocated, "Allocated data");
+                    ui.selectable_value(
+                        &mut self.metric,
+                        SizeMetric::Logical,
+                        self.strings.get(MessageId::LogicalSize),
+                    );
+                    ui.selectable_value(
+                        &mut self.metric,
+                        SizeMetric::Allocated,
+                        self.strings.get(MessageId::AllocatedData),
+                    );
                 });
             },
         );
     }
 
-    fn inspector(&mut self, ui: &mut egui::Ui) {
+    fn inspector(&self, ui: &mut egui::Ui) {
+        let item_count = self.item_count(0);
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.heading("Largest items");
+            ui.heading(self.strings.get(MessageId::LargestItems));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new("0 items").weak().monospace());
+                ui.label(RichText::new(item_count).weak().monospace());
             });
         });
-        ui.label(
-            RichText::new("A synchronized keyboard-friendly list will appear as results arrive.")
-                .weak(),
-        );
+        ui.label(RichText::new(self.strings.get(MessageId::EmptyItemsHint)).weak());
         ui.add_space(12.0);
         ui.separator();
 
         for (label, value) in [
-            ("Current path", "No selection"),
-            ("Logical size", "—"),
-            ("Allocated data", "—"),
-            ("File count", "0"),
-            ("Scan state", "Not started"),
+            (self.strings.get(MessageId::CurrentPath), self.strings.get(MessageId::NoSelection)),
+            (self.strings.get(MessageId::LogicalSize), "—"),
+            (self.strings.get(MessageId::AllocatedData), "—"),
+            (self.strings.get(MessageId::FileCount), "0"),
+            (self.strings.get(MessageId::ScanState), self.strings.get(MessageId::NotStarted)),
         ] {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(label).weak());
@@ -130,16 +209,20 @@ impl DiskPieShell {
 
         ui.add_space(16.0);
         ui.separator();
-        ui.label(RichText::new("Safety").strong());
-        ui.label(
-            RichText::new("Filesystem actions stay unavailable until an exact path is selected.")
-                .weak(),
-        );
+        ui.label(RichText::new(self.strings.get(MessageId::Safety)).strong());
+        ui.label(RichText::new(self.strings.get(MessageId::ActionsUnavailable)).weak());
         ui.horizontal(|ui| {
-            ui.add_enabled(false, egui::Button::new("Open"));
-            ui.add_enabled(false, egui::Button::new("Recycle"));
-            ui.add_enabled(false, egui::Button::new("Delete permanently"));
+            ui.add_enabled(false, egui::Button::new(self.strings.get(MessageId::Open)));
+            ui.add_enabled(false, egui::Button::new(self.strings.get(MessageId::Recycle)));
+            ui.add_enabled(
+                false,
+                egui::Button::new(self.strings.get(MessageId::DeletePermanently)),
+            );
         });
+    }
+
+    fn item_count(&self, count: u64) -> String {
+        self.i18n.item_count(count).unwrap_or_else(|_| count.to_string())
     }
 
     fn radial_lens(&mut self, ui: &mut egui::Ui) {
@@ -147,7 +230,7 @@ impl DiskPieShell {
         let diameter = available.x.min(available.y - 56.0).clamp(220.0, 680.0);
         ui.vertical_centered(|ui| {
             let (response, painter) = ui.allocate_painter(Vec2::splat(diameter), Sense::click());
-            response.clone().on_hover_text("The disk map will grow here while scanning");
+            response.clone().on_hover_text(self.strings.get(MessageId::ChartEmptyTooltip));
 
             let center = response.rect.center();
             let radius = diameter * 0.43;
@@ -187,20 +270,20 @@ impl DiskPieShell {
             painter.text(
                 center + egui::vec2(0.0, -8.0),
                 egui::Align2::CENTER_CENTER,
-                "Choose a folder",
+                self.strings.get(MessageId::ChooseFolderCenter),
                 FontId::proportional(17.0),
                 ui.visuals().strong_text_color(),
             );
             painter.text(
                 center + egui::vec2(0.0, 15.0),
                 egui::Align2::CENTER_CENTER,
-                "or drive",
+                self.strings.get(MessageId::OrDrive),
                 FontId::proportional(13.0),
                 ui.visuals().weak_text_color(),
             );
 
             if response.clicked() {
-                self.notice = "Folder picker is not connected yet";
+                self.notice = MessageId::StatusReady;
             }
         });
     }
@@ -231,9 +314,11 @@ impl DiskPieShell {
             |ui| {
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
-                    ui.label(RichText::new(self.notice).weak());
+                    ui.label(RichText::new(self.strings.get(self.notice)).weak());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new("Standard user · No elevation").weak());
+                        ui.label(RichText::new(self.strings.get(MessageId::NoElevation)).weak());
+                        ui.label(RichText::new("·").weak());
+                        ui.label(RichText::new(self.strings.get(MessageId::StandardUser)).weak());
                     });
                 });
             },
@@ -266,11 +351,11 @@ fn metric_value(ui: &mut egui::Ui, label: &str, value: &str) {
     });
 }
 
-fn theme_name(preference: ThemePreference) -> &'static str {
+fn theme_name(preference: ThemePreference, strings: &UiStrings) -> &str {
     match preference {
-        ThemePreference::System => "System",
-        ThemePreference::Dark => "Dark",
-        ThemePreference::Light => "Light",
+        ThemePreference::System => strings.get(MessageId::ThemeSystem),
+        ThemePreference::Dark => strings.get(MessageId::ThemeDark),
+        ThemePreference::Light => strings.get(MessageId::ThemeLight),
     }
 }
 
@@ -297,5 +382,13 @@ mod tests {
         assert!((points[0].y + 10.0).abs() < 0.001);
         assert!((points[4].x - 10.0).abs() < 0.001);
         assert!((points[4].y - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn localized_cache_uses_the_typed_message_order() {
+        let i18n = I18n::new(Locale::SpanishMexico).expect("valid embedded locale");
+        let strings = UiStrings::new(&i18n);
+        assert_eq!(strings.get(MessageId::Theme), "Tema");
+        assert_eq!(strings.get(MessageId::Safety), "Seguridad");
     }
 }

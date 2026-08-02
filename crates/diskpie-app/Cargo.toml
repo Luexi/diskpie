@@ -12,6 +12,9 @@ homepage.workspace = true
 [dependencies]
 diskpie-core = { path = "../diskpie-core", version = "0.1.0" }
 diskpie-scan = { path = "../diskpie-scan", version = "0.1.0" }
+fluent-bundle.workspace = true
+thiserror.workspace = true
+unic-langid.workspace = true
 
 [lints]
 workspace = true
