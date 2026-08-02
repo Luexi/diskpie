@@ -14,5 +14,8 @@ diskpie-app = { path = "../diskpie-app", version = "0.1.0" }
 diskpie-core = { path = "../diskpie-core", version = "0.1.0" }
 diskpie-scan = { path = "../diskpie-scan", version = "0.1.0" }
 
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
 [lints]
 workspace = true

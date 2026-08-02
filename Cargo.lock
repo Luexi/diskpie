@@ -675,6 +675,7 @@ name = "diskpie"
 version = "0.1.0"
 dependencies = [
  "diskpie-app",
+ "diskpie-core",
  "diskpie-platform",
  "eframe",
 ]
@@ -701,6 +702,7 @@ dependencies = [
  "diskpie-app",
  "diskpie-core",
  "diskpie-scan",
+ "windows",
 ]
 
 [[package]]

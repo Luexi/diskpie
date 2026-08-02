@@ -30,6 +30,12 @@ eframe = { version = "=0.35.0", default-features = false, features = [
 fluent-bundle = "=0.16.0"
 thiserror = "=2.0.19"
 unic-langid = "=0.9.6"
+windows = { version = "=0.62.2", default-features = false, features = [
+    "std",
+    "Win32_Foundation",
+    "Win32_Storage_CloudFilters",
+    "Win32_Storage_FileSystem",
+] }
 
 [workspace.lints.rust]
 rust_2018_idioms = { level = "deny", priority = -1 }

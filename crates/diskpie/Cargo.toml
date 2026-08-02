@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 diskpie-app = { path = "../diskpie-app", version = "0.1.0" }
+diskpie-core = { path = "../diskpie-core", version = "0.1.0" }
 diskpie-platform = { path = "../diskpie-platform", version = "0.1.0" }
 eframe.workspace = true
 
