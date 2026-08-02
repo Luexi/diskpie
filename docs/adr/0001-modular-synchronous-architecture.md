@@ -198,7 +198,8 @@ Use the exact researched baselines documented in the supporting research:
 - tracing 0.1.44, tracing-subscriber 0.3.23, and tracing-appender 0.2.5;
 - lexopt 0.3.2 for path-preserving startup arguments;
 - fluent-bundle 0.16.0 and unic-langid 0.9.6 behind typed localization IDs;
-- rfd 0.17.2 behind `DialogPort`; and
+- direct Windows `IFileOpenDialog` behind `DialogPort`, as superseded by
+  [ADR 0015](0015-direct-windows-folder-dialog.md); and
 - thiserror 2.0.19 for typed errors carrying stable codes and sources.
 
 Use proptest 1.11.0, Criterion 0.8.2, and tempfile 3.27.0 only as development
@@ -214,7 +215,7 @@ must be minimal, state a `// SAFETY:` invariant, acquire raw handles directly
 into RAII ownership, and preserve the original OS error.
 
 The `diskpie` executable contains no project-authored unsafe. Native unsafe from
-winit, glutin, rfd, `windows`, transitive `windows-sys`, and support crates is
+winit, glutin, `windows`, transitive `windows-sys`, and support crates is
 accepted only at the reviewed platform/UI dependency edge. CI audits licenses,
 advisories, resolved features, and runtime and development dependency graphs.
 
