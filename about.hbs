@@ -1,0 +1,28 @@
+DiskPie Third-Party Notices
+===========================
+
+This notice is generated from Cargo.lock with cargo-about 0.9.1 for the
+x86_64-pc-windows-msvc target. The template deliberately omits timestamps,
+machine paths, and other host-specific data so identical inputs are repeatable.
+
+License overview
+----------------
+{{#each overview}}
+- {{name}} ({{count}})
+{{/each}}
+
+Full license texts
+------------------
+{{#each licenses}}
+===============================================================================
+{{name}} ({{id}})
+===============================================================================
+
+Used by:
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}
+{{/each}}
+
+{{text}}
+
+{{/each}}

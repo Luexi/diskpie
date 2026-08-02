@@ -1,0 +1,71 @@
+name: Dependency security
+
+on:
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "deny.toml"
+      - "deny.exceptions.toml"
+      - ".deny.exceptions.toml"
+      - "about.toml"
+      - "about.hbs"
+      - "audit.toml"
+      - ".cargo/**"
+      - ".github/dependabot.yml"
+      - ".github/workflows/security.yml"
+  schedule:
+    # Weekly at 07:23 UTC; the non-round minute avoids peak scheduler load.
+    - cron: "23 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  dependency-policy:
+    name: cargo-deny and RustSec audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record pinned Rust toolchain
+        run: |
+          rustup show active-toolchain
+          rustc -vV
+          cargo -vV
+
+      - name: Install pinned security tools
+        id: install_tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_root="${RUNNER_TEMP}/cargo-security-tools"
+          cargo install cargo-deny --version 0.20.2 --locked --root "${tool_root}"
+          cargo install cargo-audit --version 0.22.2 --locked --root "${tool_root}"
+          printf '%s\n' "${tool_root}/bin" >> "${GITHUB_PATH}"
+
+      - name: Verify security tool versions
+        run: |
+          cargo deny --version
+          cargo audit --version
+
+      - name: Enforce dependency policy
+        run: cargo deny --locked check
+
+      - name: Audit locked dependencies
+        if: ${{ always() && steps.install_tools.outcome == 'success' }}
+        run: cargo audit --deny warnings

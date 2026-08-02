@@ -1,0 +1,91 @@
+# DiskPie ships a Windows desktop binary, so policy evaluation follows the
+# production target and includes every workspace feature.
+[graph]
+targets = ["x86_64-pc-windows-msvc"]
+all-features = true
+
+[advisories]
+# cargo-deny 0.20.2 denies vulnerability and notice advisories by default.
+# Make the configurable advisory classes equally strict and keep exceptions
+# empty until a specific advisory has been reviewed and documented.
+db-urls = ["https://github.com/RustSec/advisory-db"]
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+maximum-db-staleness = "P30D"
+unused-ignored-advisory = "deny"
+ignore = []
+
+[licenses]
+# Build dependencies can influence shipped artifacts; dev dependencies are also
+# checked so every dependency accepted into the repository follows this policy.
+include-build = true
+include-dev = true
+confidence-threshold = 0.93
+unused-allowed-license = "warn"
+unused-license-exception = "deny"
+
+# MIT, 0BSD, BSD, ISC, and Zlib have short permissive notice obligations.
+# Apache-2.0 (including LLVM's exception) adds compatible patent terms.
+# Unicode-3.0 is the permissive license used by the Unicode data ecosystem.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+# epaint 0.35.0's default-font package embeds fonts under these two permissive
+# font licenses in addition to the globally accepted MIT/Apache code license.
+# The exception is exact-version scoped so an upgrade requires fresh review.
+exceptions = [
+    { crate = "epaint_default_fonts@0.35.0", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
+
+    # clipboard-win 5.4.1 and its error-code 3.3.2 dependency use the permissive
+    # Boost Software License. Both are present in the locked Windows graph.
+    { crate = "clipboard-win@5.4.1", allow = ["BSL-1.0"] },
+    { crate = "error-code@3.3.2", allow = ["BSL-1.0"] },
+]
+
+[licenses.private]
+ignore = false
+registries = []
+
+[bans]
+# Existing transitive duplication is visible but is not yet a merge blocker.
+multiple-versions = "warn"
+multiple-versions-include-dev = true
+wildcards = "deny"
+allow-wildcard-paths = false
+highlight = "all"
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[bans.workspace-dependencies]
+duplicates = "deny"
+# Internal path edges are intentionally declared by each consuming crate; the
+# centralization lint remains strict for registry dependencies.
+include-path-dependencies = false
+unused = "deny"
+
+[sources]
+# Only crates.io packages are accepted. Git dependencies and unknown/private
+# registries require an explicit policy change and review before they can land.
+unknown-registry = "deny"
+unknown-git = "deny"
+required-git-spec = "rev"
+unused-allowed-source = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+private = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

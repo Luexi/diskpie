@@ -1,0 +1,34 @@
+# cargo-about resolves `OR` expressions in this stable priority order. Prefer
+# the shortest permissive notice obligation while retaining every compatible
+# license family accepted by DiskPie's dependency policy.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "0BSD",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+# THIRD-PARTY-NOTICES describes the shipped Windows dependency graph. Build
+# dependencies remain included conservatively; test-only dependencies do not
+# contribute code or assets to the distributed application.
+targets = ["x86_64-pc-windows-msvc"]
+ignore-build-dependencies = false
+ignore-dev-dependencies = true
+ignore-transitive-dependencies = false
+private = { ignore = true }
+
+# These additions are limited to packages verified in the current Cargo.lock.
+# cargo-deny's exact-version exceptions ensure an upgrade cannot silently reuse
+# one of these approvals without review.
+[epaint_default_fonts]
+accepted = ["OFL-1.1", "Ubuntu-font-1.0"]
+
+[clipboard-win]
+accepted = ["BSL-1.0"]
+
+[error-code]
+accepted = ["BSL-1.0"]
