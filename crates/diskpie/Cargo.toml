@@ -1,0 +1,21 @@
+[package]
+name = "diskpie"
+description = "A fast visual disk usage scanner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[[bin]]
+name = "diskpie"
+path = "src/main.rs"
+
+[dependencies]
+diskpie-app = { path = "../diskpie-app", version = "0.1.0" }
+diskpie-platform = { path = "../diskpie-platform", version = "0.1.0" }
+
+[lints]
+workspace = true

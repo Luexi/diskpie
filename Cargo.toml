@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/diskpie",
+    "crates/diskpie-app",
+    "crates/diskpie-core",
+    "crates/diskpie-platform",
+    "crates/diskpie-scan",
+]
+default-members = ["crates/diskpie"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+authors = ["Luis"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Luexi/diskpie"
+homepage = "https://github.com/Luexi/diskpie"
+
+[workspace.lints.rust]
+rust_2018_idioms = { level = "deny", priority = -1 }
+unsafe_op_in_unsafe_fn = "deny"
+unused_lifetimes = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"

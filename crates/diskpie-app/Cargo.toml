@@ -1,0 +1,17 @@
+[package]
+name = "diskpie-app"
+description = "UI-independent DiskPie application state and ports"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+diskpie-core = { path = "../diskpie-core", version = "0.1.0" }
+diskpie-scan = { path = "../diskpie-scan", version = "0.1.0" }
+
+[lints]
+workspace = true

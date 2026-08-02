@@ -1,0 +1,16 @@
+[package]
+name = "diskpie-scan"
+description = "Bounded, cancellable filesystem scan coordinator for DiskPie"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+diskpie-core = { path = "../diskpie-core", version = "0.1.0" }
+
+[lints]
+workspace = true
