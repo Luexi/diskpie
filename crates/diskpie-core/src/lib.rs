@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod model;
+pub mod sunburst;
 
 pub use model::{
     Aggregate, AggregateField, AggregateSize, Children, EntryKind, FileIdentity, GenerationId,
