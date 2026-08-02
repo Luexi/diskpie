@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod format;
 pub mod i18n;
 pub mod navigation;
 pub mod session;
