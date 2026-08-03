@@ -204,11 +204,31 @@ impl fmt::Display for DialogError {
 impl Error for DialogError {}
 
 /// Terminal, owned result of a Shell request.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum DialogEvent {
     Selected { request_id: DialogRequestId, path: PathBuf },
     Cancelled { request_id: DialogRequestId },
     Failed { request_id: DialogRequestId, error: DialogError },
+}
+
+impl fmt::Debug for DialogEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Selected { request_id, .. } => formatter
+                .debug_struct("Selected")
+                .field("request_id", request_id)
+                .field("path_present", &true)
+                .finish(),
+            Self::Cancelled { request_id } => {
+                formatter.debug_struct("Cancelled").field("request_id", request_id).finish()
+            }
+            Self::Failed { request_id, error } => formatter
+                .debug_struct("Failed")
+                .field("request_id", request_id)
+                .field("error", error)
+                .finish(),
+        }
+    }
 }
 
 impl DialogEvent {
@@ -906,12 +926,50 @@ fn show_folder_dialog(owner: OwnerWindow) -> Result<DialogOutcome, DialogError> 
         DialogError::from_hresult(DialogErrorStage::SetClientGuid, error.code().0)
     })?;
 
-    let outcome = show_and_extract(&dialog, owner);
-    // SAFETY: cleanup occurs on the owning STA before releasing `dialog` and is
-    // attempted after every Show/result path once the client GUID was set.
-    let cleanup = unsafe { dialog.ClearClientData() };
+    let cleanup = CleanupGuard::new(|| {
+        // SAFETY: cleanup occurs on the owning STA before releasing `dialog`.
+        // The RAII guard also attempts it while unwinding from result handling.
+        unsafe { dialog.ClearClientData() }.map_err(|error| error.code().0)
+    });
+    cleanup.finish(show_and_extract(&dialog, owner))
+}
 
-    merge_dialog_cleanup(outcome, cleanup.map_err(|error| error.code().0))
+struct CleanupGuard<F>
+where
+    F: FnMut() -> Result<(), i32>,
+{
+    cleanup: F,
+    armed: bool,
+}
+
+impl<F> CleanupGuard<F>
+where
+    F: FnMut() -> Result<(), i32>,
+{
+    fn new(cleanup: F) -> Self {
+        Self { cleanup, armed: true }
+    }
+
+    fn finish(
+        mut self,
+        outcome: Result<DialogOutcome, DialogError>,
+    ) -> Result<DialogOutcome, DialogError> {
+        let cleanup = (self.cleanup)();
+        self.armed = false;
+        merge_dialog_cleanup(outcome, cleanup)
+    }
+}
+
+impl<F> Drop for CleanupGuard<F>
+where
+    F: FnMut() -> Result<(), i32>,
+{
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = catch_unwind(AssertUnwindSafe(|| (self.cleanup)()));
+            self.armed = false;
+        }
+    }
 }
 
 fn merge_dialog_cleanup(
@@ -1004,7 +1062,7 @@ impl Drop for CoTaskMemWide {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{os::windows::ffi::OsStrExt, sync::atomic::AtomicBool};
+    use std::{cell::Cell, os::windows::ffi::OsStrExt, sync::atomic::AtomicBool};
     use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, S_FALSE, S_OK};
 
     fn owner() -> OwnerWindow {
@@ -1215,6 +1273,42 @@ mod tests {
             merge_dialog_cleanup(Ok(DialogOutcome::Cancelled), Err(cleanup_hresult)),
             Err(DialogError::from_hresult(DialogErrorStage::ClearClientData, cleanup_hresult))
         );
+    }
+
+    #[test]
+    fn cleanup_guard_runs_once_on_finish_and_during_unwind() {
+        let normal_calls = Cell::new(0_u8);
+        let guard = CleanupGuard::new(|| {
+            normal_calls.set(normal_calls.get() + 1);
+            Ok(())
+        });
+        assert_eq!(guard.finish(Ok(DialogOutcome::Cancelled)), Ok(DialogOutcome::Cancelled));
+        assert_eq!(normal_calls.get(), 1);
+
+        let unwind_calls = Cell::new(0_u8);
+        let unwind = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = CleanupGuard::new(|| {
+                unwind_calls.set(unwind_calls.get() + 1);
+                Ok(())
+            });
+            panic!("injected result-extraction panic");
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(unwind_calls.get(), 1);
+    }
+
+    #[test]
+    fn selected_event_debug_output_redacts_the_native_path() {
+        let event = DialogEvent::Selected {
+            request_id: DialogRequestId(41),
+            path: PathBuf::from(r"C:\private\customer-name"),
+        };
+
+        let rendered = format!("{event:?}");
+        assert!(rendered.contains("request_id"));
+        assert!(rendered.contains("path_present: true"));
+        assert!(!rendered.contains("private"));
+        assert!(!rendered.contains("customer-name"));
     }
 
     #[test]
