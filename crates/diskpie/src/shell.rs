@@ -1,13 +1,19 @@
 //! Responsive native shell for the DiskPie application.
 
-use std::f32::consts::{FRAC_PI_2, TAU};
+use std::{
+    f32::consts::{FRAC_PI_2, TAU},
+    path::PathBuf,
+};
 
 use eframe::egui::{
     self, Align, Color32, FontId, Layout, Pos2, RichText, Sense, Shape, Stroke, ThemePreference,
     Vec2,
 };
 
-use diskpie_app::i18n::{I18n, I18nError, Locale, MessageId};
+use diskpie_app::{
+    format::format_path_for_display,
+    i18n::{I18n, I18nError, Locale, MessageId},
+};
 
 use crate::theme;
 
@@ -41,6 +47,7 @@ pub struct DiskPieShell {
     theme_preference: ThemePreference,
     metric: SizeMetric,
     notice: MessageId,
+    startup_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -50,7 +57,10 @@ enum SizeMetric {
 }
 
 impl DiskPieShell {
-    pub fn new(creation: &eframe::CreationContext<'_>) -> Result<Self, I18nError> {
+    pub fn new(
+        creation: &eframe::CreationContext<'_>,
+        startup_path: Option<PathBuf>,
+    ) -> Result<Self, I18nError> {
         theme::install(&creation.egui_ctx);
         creation.egui_ctx.set_theme(ThemePreference::System);
         let locale = Locale::EnglishUnitedStates;
@@ -63,6 +73,7 @@ impl DiskPieShell {
             theme_preference: ThemePreference::System,
             metric: SizeMetric::Allocated,
             notice: MessageId::StatusReady,
+            startup_path,
         })
     }
 
@@ -78,6 +89,7 @@ impl DiskPieShell {
     }
 
     fn command_rail(&mut self, ui: &mut egui::Ui) {
+        let location = self.startup_path.as_deref().map(format_path_for_display);
         let strings = &self.strings;
         let mut selected_locale = self.locale;
         let theme_preference = &mut self.theme_preference;
@@ -103,7 +115,14 @@ impl DiskPieShell {
                         *notice = MessageId::StatusReady;
                     }
                     if ui.available_width() > 620.0 {
-                        ui.label(RichText::new(strings.get(MessageId::NoLocation)).weak());
+                        ui.label(
+                            RichText::new(
+                                location
+                                    .as_deref()
+                                    .unwrap_or_else(|| strings.get(MessageId::NoLocation)),
+                            )
+                            .weak(),
+                        );
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -181,6 +200,11 @@ impl DiskPieShell {
 
     fn inspector(&self, ui: &mut egui::Ui) {
         let item_count = self.item_count(0);
+        let current_path = self
+            .startup_path
+            .as_deref()
+            .map(format_path_for_display)
+            .unwrap_or_else(|| self.strings.get(MessageId::NoSelection).to_owned());
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.heading(self.strings.get(MessageId::LargestItems));
@@ -193,7 +217,7 @@ impl DiskPieShell {
         ui.separator();
 
         for (label, value) in [
-            (self.strings.get(MessageId::CurrentPath), self.strings.get(MessageId::NoSelection)),
+            (self.strings.get(MessageId::CurrentPath), current_path.as_str()),
             (self.strings.get(MessageId::LogicalSize), "—"),
             (self.strings.get(MessageId::AllocatedData), "—"),
             (self.strings.get(MessageId::FileCount), "0"),
