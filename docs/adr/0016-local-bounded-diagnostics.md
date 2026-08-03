@@ -82,10 +82,13 @@ redacted diagnostic export.
    settings. Upstream targets default to WARN/ERROR and are scrubbed again on
    export.
 6. Write only beneath ADR 0018's dedicated Local AppData `logs` directory.
-   Use daily rotation, a unique `diskpie` prefix and `.log` suffix, and
-   `max_log_files(8)`. This is a ceiling of eight matching files and normally
-   represents the active file plus about seven historical days; the appender
-   documents that the retained count can temporarily dip below the ceiling.
+   Use daily rotation, a unique `diskpie` prefix and `.log` suffix, and a
+   DiskPie-owned retention pass capped at eight exact log names. Do not enable
+   tracing-appender 0.2.5's `max_log_files`: its pruning uses following
+   metadata and, when Windows creation time is available, admits any regular
+   entry that merely matches the prefix/suffix. The local pass accepts only
+   `diskpie.YYYY-MM-DD.log`, uses non-following metadata, rejects reparse
+   points, and never deletes directories, symlinks, or unrelated files.
 7. Configure the nonblocking writer with a 4,096-line queue and lossy mode.
    Queue pressure drops diagnostics rather than application work. Own its
    `WorkerGuard` until services stop, and expose the appender error/drop count
@@ -131,9 +134,9 @@ Accepted tradeoffs:
 
 - Lossy mode can omit the exact event near a saturated failure. The dropped
   count and bounded application behavior are preferred to blocking.
-- tracing-appender rotation is count- and time-based, not byte-based. Release
-  volume tests gate acceptance; excessive output triggers a byte-rotation
-  prototype.
+- tracing-appender rotation is time-based while DiskPie owns the narrow
+  count-retention policy. Release volume tests gate acceptance; excessive
+  output triggers a byte-rotation prototype.
 - A daily appender uses a background thread and transitive channel/time code,
   increasing supply-chain and binary surface over a synchronous writer.
 - Abrupt termination can lose queued log lines. The minimal synchronous panic
@@ -146,8 +149,9 @@ Accepted tradeoffs:
 - Saturation tests fill 4,096 lines and prove renderer/scanner progress plus a
   nonzero drop count. Shutdown tests prove the `WorkerGuard` is held until
   services stop and orderly data is flushed.
-- Synthetic-date rotation tests prove at most eight matching regular files
-  remain and unrelated files, directories, and symlinks are untouched.
+- Synthetic-date rotation tests prove at most eight exact matching regular
+  files remain and unrelated files, directories, symlinks, junctions, and
+  reparse points are untouched.
 - Read-only, missing, full, and permission-denied destinations disable the
   affected facility without stopping startup or scan.
 - Property and golden tests cover native path forms, URLs, assignments,

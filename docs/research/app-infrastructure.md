@@ -390,11 +390,21 @@ events are prohibited at normal levels.
 Use tracing-appender's
 [`rolling::Builder`](https://docs.rs/tracing-appender/0.2.5/tracing_appender/rolling/struct.Builder.html)
 with daily rotation in the dedicated log directory, a unique `diskpie` prefix
-and `.log` suffix, and `max_log_files(8)`. The builder documents that retaining
-`m` historical files requires a maximum of `m + 1`, so this yields the current
-file plus roughly seven historical days. Its retention is count-based, not
-byte-based; release tests must measure worst-case INFO volume. Excessive
-volume triggers a byte-bounded writer revisit, not silent unlimited growth.
+and `.log` suffix, but leave its internal maximum disabled. A source audit of
+[tracing-appender 0.2.5 retention](https://docs.rs/crate/tracing-appender/0.2.5/source/src/rolling.rs)
+found two mismatches with DiskPie's accepted deletion boundary: `DirEntry::metadata`
+follows links, and a Windows creation timestamp lets any regular entry with the
+configured prefix/suffix bypass exact date-name parsing. Enabling
+`max_log_files(8)` could therefore remove a symlink or an unrelated similarly
+named file.
+
+DiskPie instead runs a narrow retention pass in the logging worker. It accepts
+only ASCII names matching `diskpie.YYYY-MM-DD.log`, validates calendar fields,
+uses non-following metadata plus the Windows reparse attribute, and deletes
+only owned regular files until at most eight remain. Rotation remains
+time-based and retention count-based; release tests must measure worst-case
+INFO volume. Excessive volume triggers a byte-bounded writer revisit, not
+silent unlimited growth.
 
 Use
 [`NonBlockingBuilder`](https://docs.rs/tracing-appender/0.2.5/tracing_appender/non_blocking/struct.NonBlockingBuilder.html)
