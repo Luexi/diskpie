@@ -11,12 +11,18 @@ pub use diskpie_core::PRODUCT_NAME;
 #[cfg(windows)]
 pub mod windows {
     pub mod filesystem;
+    pub mod project_paths;
     pub mod shell_service;
     pub mod volumes;
 }
 
 #[cfg(windows)]
 pub use windows::filesystem::WindowsFileSystem;
+#[cfg(windows)]
+pub use windows::project_paths::{
+    APPLICATION_IDENTIFIER, ProjectPathError, ProjectPathErrorKind, ProjectPathFacility,
+    ProjectPathOperation, ProjectPaths, resolve_project_paths,
+};
 #[cfg(windows)]
 pub use windows::shell_service::{
     DialogError, DialogErrorStage, DialogEvent, DialogRequestId, FolderDialogRequest, OwnerWindow,
