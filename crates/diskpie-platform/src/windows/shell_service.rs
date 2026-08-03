@@ -18,9 +18,10 @@ use std::{
         ffi::OsStringExt,
         io::{AsRawHandle, FromRawHandle, OwnedHandle},
     },
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
         mpsc::{
             Receiver, SyncSender, TryRecvError as MpscTryRecvError, TrySendError, channel,
@@ -151,13 +152,14 @@ pub enum DialogErrorStage {
     GetDisplayName,
     ClearClientData,
     MessagePump,
+    WorkerPanicked,
     ServiceShutdown,
 }
 
 /// Sanitized failure data returned to non-COM consumers.
 ///
 /// No localized native message or selected path is retained. `hresult` is
-/// absent only for the synthetic service-shutdown outcome. If the primary
+/// absent only for synthetic worker-panic or service-shutdown outcomes. If the primary
 /// operation and privacy cleanup both fail, `cleanup_hresult` preserves the
 /// latter without hiding the former.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -174,6 +176,10 @@ impl DialogError {
 
     const fn service_shutdown() -> Self {
         Self { stage: DialogErrorStage::ServiceShutdown, hresult: None, cleanup_hresult: None }
+    }
+
+    const fn worker_panicked() -> Self {
+        Self { stage: DialogErrorStage::WorkerPanicked, hresult: None, cleanup_hresult: None }
     }
 
     fn with_cleanup_hresult(mut self, hresult: i32) -> Self {
@@ -342,6 +348,7 @@ impl ShellServiceConfig {
     }
 }
 
+#[derive(Clone, Copy)]
 struct QueuedRequest {
     id: DialogRequestId,
     request: ShellRequest,
@@ -387,6 +394,7 @@ struct SharedState {
     lifecycle: AtomicU8,
     shutdown_requested: AtomicBool,
     modal_outstanding: AtomicBool,
+    acceptance: Mutex<()>,
     wake: Arc<WakeEvent>,
 }
 
@@ -396,6 +404,7 @@ impl SharedState {
             lifecycle: AtomicU8::new(STATE_STARTING),
             shutdown_requested: AtomicBool::new(false),
             modal_outstanding: AtomicBool::new(false),
+            acceptance: Mutex::new(()),
             wake,
         }
     }
@@ -495,16 +504,8 @@ impl ShellService {
 
     /// Attempts to enqueue work without waiting for queue capacity.
     pub fn submit(&self, request: ShellRequest) -> Result<DialogRequestId, SubmitError> {
-        if self.status() != ShellServiceStatus::Running {
-            return Err(SubmitError::ServiceUnavailable);
-        }
-
         let id = DialogRequestId(self.next_request_id.fetch_add(1, Ordering::Relaxed));
-        try_enqueue_request(
-            &self.request_tx,
-            &self.shared.modal_outstanding,
-            QueuedRequest { id, request },
-        )?;
+        try_accept_request(&self.request_tx, &self.shared, QueuedRequest { id, request })?;
 
         // Signalling is an optimization backed by a short health timeout in
         // the message-aware wait. Once `try_send` succeeds the request remains
@@ -548,13 +549,17 @@ impl ShellService {
             return Ok(());
         };
 
-        let _ = self.shared.lifecycle.compare_exchange(
-            STATE_RUNNING,
-            STATE_STOPPING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        self.shared.shutdown_requested.store(true, Ordering::Release);
+        {
+            let _acceptance =
+                self.shared.acceptance.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = self.shared.lifecycle.compare_exchange(
+                STATE_RUNNING,
+                STATE_STOPPING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            self.shared.shutdown_requested.store(true, Ordering::Release);
+        }
         let _ = self.shared.wake.signal();
 
         let joined = worker.join().map_err(|_| ShellServiceShutdownError::WorkerPanicked);
@@ -576,6 +581,21 @@ fn lifecycle_from_raw(raw: u8) -> ShellServiceStatus {
         STATE_STOPPING => ShellServiceStatus::Stopping,
         _ => ShellServiceStatus::Stopped,
     }
+}
+
+fn try_accept_request(
+    sender: &SyncSender<QueuedRequest>,
+    shared: &SharedState,
+    queued: QueuedRequest,
+) -> Result<(), SubmitError> {
+    // `try_lock` preserves the public nonblocking contract. The worker takes
+    // the same gate while it closes acceptance and performs its final drain,
+    // so an accepted request cannot arrive after that drain observed empty.
+    let _acceptance = shared.acceptance.try_lock().map_err(|_| SubmitError::ServiceUnavailable)?;
+    if shared.status() != ShellServiceStatus::Running {
+        return Err(SubmitError::ServiceUnavailable);
+    }
+    try_enqueue_request(sender, &shared.modal_outstanding, queued)
 }
 
 fn try_enqueue_request(
@@ -663,53 +683,53 @@ fn worker_entry(
     }
 
     let _apartment = apartment;
-    worker_loop(&request_rx, &event_tx, &shared);
+    let outcome = catch_unwind(AssertUnwindSafe(|| worker_loop(&request_rx, &event_tx, &shared)));
+    match outcome {
+        Ok(error) => stop_accepting_and_fail_queued(&request_rx, &event_tx, &shared, error),
+        Err(payload) => {
+            stop_accepting_and_fail_queued(
+                &request_rx,
+                &event_tx,
+                &shared,
+                DialogError::worker_panicked(),
+            );
+            resume_unwind(payload);
+        }
+    }
 }
 
 fn worker_loop(
     request_rx: &Receiver<QueuedRequest>,
     event_tx: &std::sync::mpsc::Sender<CompletedRequest>,
     shared: &SharedState,
-) {
+) -> DialogError {
     loop {
         if shared.shutdown_requested.load(Ordering::Acquire) {
-            fail_queued_requests(request_rx, event_tx, shared, DialogError::service_shutdown());
-            return;
+            return DialogError::service_shutdown();
         }
 
         match request_rx.try_recv() {
             Ok(queued) => {
                 if shared.shutdown_requested.load(Ordering::Acquire) {
                     fail_request(queued, event_tx, shared, DialogError::service_shutdown());
-                    fail_queued_requests(
-                        request_rx,
-                        event_tx,
-                        shared,
-                        DialogError::service_shutdown(),
-                    );
-                    return;
+                    return DialogError::service_shutdown();
                 }
-                process_request(queued, event_tx, shared);
+                if let Err(error) = guard_request_execution(queued, event_tx, shared, || {
+                    process_request(queued, event_tx, shared);
+                }) {
+                    return error;
+                }
             }
             Err(MpscTryRecvError::Empty) => {}
-            Err(MpscTryRecvError::Disconnected) => return,
+            Err(MpscTryRecvError::Disconnected) => return DialogError::service_shutdown(),
         }
 
         match pump_pending_messages() {
             Ok(PumpResult::Continue) => {}
             Ok(PumpResult::Quit) => {
-                fail_queued_requests(
-                    request_rx,
-                    event_tx,
-                    shared,
-                    DialogError::from_hresult(DialogErrorStage::MessagePump, E_UNEXPECTED.0),
-                );
-                return;
+                return DialogError::from_hresult(DialogErrorStage::MessagePump, E_UNEXPECTED.0);
             }
-            Err(error) => {
-                fail_queued_requests(request_rx, event_tx, shared, error);
-                return;
-            }
+            Err(error) => return error,
         }
 
         let handle = shared.wake.handle();
@@ -731,22 +751,13 @@ fn worker_loop(
             continue;
         }
         if wait == WAIT_FAILED {
-            fail_queued_requests(
-                request_rx,
-                event_tx,
-                shared,
-                DialogError::from_hresult(DialogErrorStage::MessagePump, HRESULT::from_thread().0),
+            return DialogError::from_hresult(
+                DialogErrorStage::MessagePump,
+                HRESULT::from_thread().0,
             );
-            return;
         }
 
-        fail_queued_requests(
-            request_rx,
-            event_tx,
-            shared,
-            DialogError::from_hresult(DialogErrorStage::MessagePump, E_UNEXPECTED.0),
-        );
-        return;
+        return DialogError::from_hresult(DialogErrorStage::MessagePump, E_UNEXPECTED.0);
     }
 }
 
@@ -797,6 +808,23 @@ fn process_request(
     send_completed_request(event_tx, shared, CompletedRequest { event, was_modal });
 }
 
+fn guard_request_execution<F>(
+    queued: QueuedRequest,
+    event_tx: &std::sync::mpsc::Sender<CompletedRequest>,
+    shared: &SharedState,
+    execute: F,
+) -> Result<(), DialogError>
+where
+    F: FnOnce(),
+{
+    if catch_unwind(AssertUnwindSafe(execute)).is_ok() {
+        return Ok(());
+    }
+    let error = DialogError::worker_panicked();
+    fail_request(queued, event_tx, shared, error);
+    Err(error)
+}
+
 fn fail_request(
     queued: QueuedRequest,
     event_tx: &std::sync::mpsc::Sender<CompletedRequest>,
@@ -819,6 +847,17 @@ fn fail_queued_requests(
     while let Ok(queued) = request_rx.try_recv() {
         fail_request(queued, event_tx, shared, error);
     }
+}
+
+fn stop_accepting_and_fail_queued(
+    request_rx: &Receiver<QueuedRequest>,
+    event_tx: &std::sync::mpsc::Sender<CompletedRequest>,
+    shared: &SharedState,
+    error: DialogError,
+) {
+    let _acceptance = shared.acceptance.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    shared.lifecycle.store(STATE_STOPPING, Ordering::Release);
+    fail_queued_requests(request_rx, event_tx, shared, error);
 }
 
 fn send_completed_request(
@@ -1051,6 +1090,67 @@ mod tests {
         );
         assert!(!shared.modal_outstanding.load(Ordering::Acquire));
         assert_eq!(try_enqueue_request(&request_tx, &shared.modal_outstanding, queued(3)), Ok(()));
+    }
+
+    #[test]
+    fn terminal_transition_drains_a_submit_already_inside_the_acceptance_gate() {
+        let wake = Arc::new(WakeEvent::create().expect("test event can be created"));
+        let shared = Arc::new(SharedState::new(wake));
+        shared.lifecycle.store(STATE_RUNNING, Ordering::Release);
+        shared.modal_outstanding.store(true, Ordering::Release);
+        let (request_tx, request_rx) = sync_channel(1);
+        let (event_tx, event_rx) = channel();
+
+        let acceptance = shared.acceptance.lock().expect("test gate is healthy");
+        let worker_shared = Arc::clone(&shared);
+        let worker = thread::spawn(move || {
+            stop_accepting_and_fail_queued(
+                &request_rx,
+                &event_tx,
+                &worker_shared,
+                DialogError::from_hresult(DialogErrorStage::MessagePump, E_UNEXPECTED.0),
+            );
+        });
+
+        // This send models a producer that passed the Running check while it
+        // held the same gate. The terminal transition must wait, then drain it.
+        request_tx.try_send(queued(9)).expect("accepted request fits");
+        drop(acceptance);
+        worker.join().expect("terminal transition completes");
+
+        assert_eq!(shared.status(), ShellServiceStatus::Stopping);
+        let completed = event_rx.try_recv().expect("accepted request receives a terminal event");
+        assert!(matches!(
+            deliver_completed_request(&shared, completed),
+            DialogEvent::Failed { request_id: DialogRequestId(9), .. }
+        ));
+        assert_eq!(
+            try_accept_request(&request_tx, &shared, queued(10)),
+            Err(SubmitError::ServiceUnavailable)
+        );
+    }
+
+    #[test]
+    fn request_panic_produces_one_terminal_event_and_releases_modal_on_delivery() {
+        let wake = Arc::new(WakeEvent::create().expect("test event can be created"));
+        let shared = SharedState::new(wake);
+        let (event_tx, event_rx) = channel();
+        shared.modal_outstanding.store(true, Ordering::Release);
+
+        let error = guard_request_execution(queued(11), &event_tx, &shared, || {
+            panic!("injected Shell request panic");
+        })
+        .expect_err("the panic is converted to a typed terminal failure");
+
+        assert_eq!(error, DialogError::worker_panicked());
+        assert!(shared.modal_outstanding.load(Ordering::Acquire));
+        let completed = event_rx.try_recv().expect("panic result is queued");
+        assert_eq!(
+            deliver_completed_request(&shared, completed),
+            DialogEvent::Failed { request_id: DialogRequestId(11), error }
+        );
+        assert!(!shared.modal_outstanding.load(Ordering::Acquire));
+        assert_eq!(event_rx.try_recv(), Err(MpscTryRecvError::Empty));
     }
 
     #[test]
