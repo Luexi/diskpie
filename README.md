@@ -7,12 +7,12 @@
 **A fast visual disk usage scanner.**
 
 DiskPie is a clean-room, Windows-first disk space analyzer built with stable
-Rust and egui. It turns a folder, drive, or multi-drive summary into an
-interactive sunburst so large branches stand out immediately while the scan is
-still running.
+Rust and egui. It scans a folder, a drive, or every drive and renders the result
+as an interactive sunburst while the scan is still running, with a synchronized
+keyboard-operable list of the largest items beside it.
 
-> Development is underway toward the first stable portable release. The
-> requirements and verification status are tracked in
+> Development is underway toward the first stable portable release. Per-feature
+> status and evidence are tracked in
 > [`docs/requirements-traceability.md`](docs/requirements-traceability.md).
 
 Continuation and design context are maintained in the
@@ -33,24 +33,46 @@ Continuation and design context are maintained in the
 - English and Spanish user interfaces, system/light/dark themes, persistent
   preferences, logging, and local diagnostic export.
 
-## Project status
+## What works today
 
-The architecture, scanner, interface, Windows adapters, verification evidence,
-and release links will be documented here as they land. Until a signed-off
-GitHub release is published, build artifacts are development snapshots.
+- Choose a folder with the native dialog, pick a drive from the list, scan
+  all drives, or start with a path: `diskpie.exe [--scan-path PATH | [--] PATH]`.
+- Watch the sunburst grow while scanning; hover for the exact path, logical
+  and allocated sizes, counts, omissions, and share of the view.
+- Zoom, go back, go to the parent, hide and restore branches, switch between
+  logical and allocated size, rescan, and cancel, by mouse or keyboard.
+- Preferences persist between runs; logs are bounded, local, and path-free;
+  an unexpected exit leaves a small local marker and nothing is sent anywhere.
+
+## Known limitations
+
+- Open, reveal, recycle, permanent delete, empty recycle bin, and Installed
+  Apps are implemented and tested below the interface but are not exposed in
+  it yet.
+- The optional Explorer context-menu verb has no settings toggle yet.
+- Rescanning a single branch is not available; use a full rescan.
+- Exporting a diagnostics bundle from the interface is not available yet.
+- No release has been published yet; clean-machine Windows 10 and 11
+  verification is pending. The command-line help is English only.
 
 ## Development
 
-Install the stable Rust MSVC toolchain on Windows, then run:
+Install the pinned Rust MSVC toolchain on Windows (`rust-toolchain.toml`
+selects it), then run the same gate CI enforces:
 
 ```powershell
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+$env:RUSTDOCFLAGS = "-D warnings"; cargo doc --workspace --no-deps --locked
+cargo build --release -p diskpie --locked
 ```
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for workflow, safety rules, and the
-required evidence for changes.
+The release configuration links the C runtime statically, so the first build
+after a fresh clone compiles the whole graph. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for workflow, safety rules, and the
+required evidence for changes, and `THIRD-PARTY-NOTICES.md` for the licenses
+of shipped dependencies.
 
 ## Clean-room provenance
 
