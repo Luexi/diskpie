@@ -70,3 +70,5 @@ item-count = { $count ->
    *[other] { $count } elementos
 }
 optional-services-unavailable = Algunos servicios opcionales de configuración o diagnóstico no están disponibles; el análisis sigue habilitado.
+chart-accessibility-label = Gráfico radial de uso de disco
+previous-session-ended-unexpectedly = DiskPie terminó de forma inesperada la última vez que se ejecutó. Se conservó una pequeña marca local; no se envió nada a ningún lado.

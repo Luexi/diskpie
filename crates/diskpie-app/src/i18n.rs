@@ -117,10 +117,12 @@ pub enum MessageId {
     OptionalServicesUnavailable,
     DiagnosticsExported,
     ItemCount,
+    ChartAccessibilityLabel,
+    PreviousSessionEndedUnexpectedly,
 }
 
 impl MessageId {
-    pub const ALL: [Self; 69] = [
+    pub const ALL: [Self; 71] = [
         Self::AppName,
         Self::Tagline,
         Self::Back,
@@ -190,11 +192,29 @@ impl MessageId {
         Self::OptionalServicesUnavailable,
         Self::DiagnosticsExported,
         Self::ItemCount,
+        Self::ChartAccessibilityLabel,
+        Self::PreviousSessionEndedUnexpectedly,
     ];
 
     #[must_use]
     pub const fn index(self) -> usize {
         self as usize
+    }
+
+    /// Whether the message interpolates Fluent arguments and therefore cannot
+    /// be resolved through [`I18n::text`]. Callers must use [`I18n::format`]
+    /// (or the typed helpers) for these at the moment the value is known.
+    #[must_use]
+    pub const fn requires_arguments(self) -> bool {
+        matches!(
+            self,
+            Self::OtherGroup
+                | Self::HiddenGroup
+                | Self::ConfirmRecycleBody
+                | Self::ConfirmDeleteBody
+                | Self::DiagnosticsExported
+                | Self::ItemCount
+        )
     }
 
     #[must_use]
@@ -269,6 +289,8 @@ impl MessageId {
             Self::OptionalServicesUnavailable => "optional-services-unavailable",
             Self::DiagnosticsExported => "diagnostics-exported",
             Self::ItemCount => "item-count",
+            Self::ChartAccessibilityLabel => "chart-accessibility-label",
+            Self::PreviousSessionEndedUnexpectedly => "previous-session-ended-unexpectedly",
         }
     }
 }
@@ -395,6 +417,23 @@ mod tests {
                     .format(id, &arguments)
                     .unwrap_or_else(|error| panic!("{}: {error}", id.key()));
                 assert!(!text.trim().is_empty(), "{} is empty in {}", id.key(), locale.code());
+            }
+        }
+    }
+
+    #[test]
+    fn argument_free_messages_resolve_without_arguments_and_only_those() {
+        for locale in Locale::ALL {
+            let bundle = I18n::new(locale).unwrap_or_else(|error| panic!("{error}"));
+            for id in MessageId::ALL {
+                let resolved = bundle.text(id);
+                assert_eq!(
+                    resolved.is_ok(),
+                    !id.requires_arguments(),
+                    "{} in {} disagrees with requires_arguments(): {resolved:?}",
+                    id.key(),
+                    locale.code()
+                );
             }
         }
     }

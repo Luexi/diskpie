@@ -22,8 +22,12 @@ use diskpie_app::{
 use crate::theme;
 
 /// Preformatted static messages keep Fluent parsing and allocation off the frame loop.
+///
+/// Messages that interpolate arguments cannot be resolved ahead of time; they
+/// are left out of the cache and must be formatted through [`I18n`] at the
+/// moment their value is known (see [`DiskPieShell::item_count`]).
 struct UiStrings {
-    values: Box<[String]>,
+    values: Box<[Option<String>]>,
 }
 
 impl UiStrings {
@@ -31,16 +35,22 @@ impl UiStrings {
         let values = MessageId::ALL
             .into_iter()
             .map(|id| {
-                i18n.text(id)
-                    .map(std::borrow::Cow::into_owned)
-                    .unwrap_or_else(|_| id.key().to_owned())
+                if id.requires_arguments() {
+                    None
+                } else {
+                    i18n.text(id).ok().map(std::borrow::Cow::into_owned)
+                }
             })
             .collect();
         Self { values }
     }
 
+    /// Returns the cached text. A message that needs arguments is a caller
+    /// error and yields its stable key so the defect is visible, never a
+    /// half-formatted sentence.
     fn get(&self, id: MessageId) -> &str {
-        self.values.get(id.index()).map_or_else(|| id.key(), String::as_str)
+        debug_assert!(!id.requires_arguments(), "{} needs arguments", id.key());
+        self.values.get(id.index()).and_then(Option::as_deref).unwrap_or_else(|| id.key())
     }
 }
 
@@ -160,44 +170,68 @@ impl DiskPieShell {
                         );
                     }
 
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        egui::ComboBox::from_id_salt("theme-preference")
-                            .selected_text(theme_name(*theme_preference, strings))
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    theme_preference,
-                                    ThemePreference::System,
-                                    strings.get(MessageId::ThemeSystem),
-                                );
-                                ui.selectable_value(
-                                    theme_preference,
-                                    ThemePreference::Dark,
-                                    strings.get(MessageId::ThemeDark),
-                                );
-                                ui.selectable_value(
-                                    theme_preference,
-                                    ThemePreference::Light,
-                                    strings.get(MessageId::ThemeLight),
-                                );
-                            });
-                        if ui.available_width() > 820.0 {
-                            ui.label(RichText::new(strings.get(MessageId::Theme)).weak());
+                    // The trailing preference cluster is laid out left to right
+                    // inside a right-aligned region so keyboard focus travels in
+                    // reading order instead of mirroring the visual order.
+                    let show_labels = ui.available_width() > 820.0;
+                    let theme_label = strings.get(MessageId::Theme);
+                    let language_label = strings.get(MessageId::Language);
+                    let spacing = ui.spacing().item_spacing.x;
+                    let label_width = |ui: &egui::Ui, text: &str| {
+                        if show_labels {
+                            ui.painter()
+                                .layout_no_wrap(
+                                    text.to_owned(),
+                                    egui::TextStyle::Body.resolve(ui.style()),
+                                    ui.visuals().text_color(),
+                                )
+                                .size()
+                                .x
+                                + spacing
+                        } else {
+                            0.0
                         }
-                        egui::ComboBox::from_id_salt("language")
-                            .selected_text(selected_locale.native_name())
-                            .show_ui(ui, |ui| {
-                                for locale in Locale::ALL {
-                                    ui.selectable_value(
-                                        &mut selected_locale,
-                                        locale,
-                                        locale.native_name(),
-                                    );
-                                }
-                            });
-                        if ui.available_width() > 820.0 {
-                            ui.label(RichText::new(strings.get(MessageId::Language)).weak());
-                        }
-                    });
+                    };
+                    let cluster_width = 2.0 * (PREFERENCE_COMBO_WIDTH + spacing)
+                        + label_width(ui, theme_label)
+                        + label_width(ui, language_label);
+                    ui.add_space((ui.available_width() - cluster_width - 8.0).max(0.0));
+
+                    let theme_combo = egui::ComboBox::from_id_salt("theme-preference")
+                        .width(PREFERENCE_COMBO_WIDTH)
+                        .selected_text(theme_name(*theme_preference, strings))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                theme_preference,
+                                ThemePreference::System,
+                                strings.get(MessageId::ThemeSystem),
+                            );
+                            ui.selectable_value(
+                                theme_preference,
+                                ThemePreference::Dark,
+                                strings.get(MessageId::ThemeDark),
+                            );
+                            ui.selectable_value(
+                                theme_preference,
+                                ThemePreference::Light,
+                                strings.get(MessageId::ThemeLight),
+                            );
+                        });
+                    label_combo(ui, theme_combo.response, theme_label, show_labels);
+
+                    let language_combo = egui::ComboBox::from_id_salt("language")
+                        .width(PREFERENCE_COMBO_WIDTH)
+                        .selected_text(selected_locale.native_name())
+                        .show_ui(ui, |ui| {
+                            for locale in Locale::ALL {
+                                ui.selectable_value(
+                                    &mut selected_locale,
+                                    locale,
+                                    locale.native_name(),
+                                );
+                            }
+                        });
+                    label_combo(ui, language_combo.response, language_label, show_labels);
                 });
             },
         );
@@ -299,6 +333,13 @@ impl DiskPieShell {
         let diameter = available.x.min(available.y - 56.0).clamp(220.0, 680.0);
         ui.vertical_centered(|ui| {
             let (response, painter) = ui.allocate_painter(Vec2::splat(diameter), Sense::click());
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Other,
+                    true,
+                    self.strings.get(MessageId::ChartAccessibilityLabel),
+                )
+            });
             response.clone().on_hover_text(self.strings.get(MessageId::ChartEmptyTooltip));
 
             let center = response.rect.center();
@@ -456,6 +497,21 @@ const fn setting_from_metric(metric: SizeMetric) -> SizePreference {
     match metric {
         SizeMetric::Logical => SizePreference::Logical,
         SizeMetric::Allocated => SizePreference::Allocated,
+    }
+}
+
+/// Fixed width keeps the preference cluster measurable for right alignment.
+const PREFERENCE_COMBO_WIDTH: f32 = 132.0;
+
+/// Gives a combo box an accessible name and, when there is room, a visible
+/// label after it in egui's usual control-then-label order.
+fn label_combo(ui: &mut egui::Ui, combo: egui::Response, label: &str, show_label: bool) {
+    combo.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, ui.is_enabled(), label)
+    });
+    if show_label {
+        let label_response = ui.label(RichText::new(label).weak());
+        let _labelled = combo.labelled_by(label_response.id);
     }
 }
 

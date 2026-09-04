@@ -70,3 +70,5 @@ item-count = { $count ->
     [one] 1 item
    *[other] { $count } items
 }
+chart-accessibility-label = Disk usage sunburst chart
+previous-session-ended-unexpectedly = DiskPie ended unexpectedly the last time it ran. A small local marker was kept; nothing was sent anywhere.
