@@ -138,3 +138,53 @@ Accepted tradeoffs:
   policy, and legal review; it cannot amend this ADR silently.
 - Evidence shows the hook itself contributes to recursive failure; simplify or
   disable the marker rather than collecting broader state.
+
+## Implementation note (2026-09-04)
+
+The marker transport is wired on Windows through
+`diskpie_platform::WindowsMarkerSession` and the sealed bridge in
+`crates/diskpie/src/panic_marker.rs`. Native evidence:
+
+- Preparation opens the crash directory once with `CreateFileW`
+  (`FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT`), keeps that
+  handle for the process lifetime, and proves it has not moved with
+  `GetFinalPathNameByHandleW` before every later operation. Each slot is
+  opened through the retained parent's final path with
+  `FILE_FLAG_OPEN_REPARSE_POINT`, inspected with `GetFileInformationByHandle`
+  and `GetFileInformationByHandleEx` (`FileAttributeTagInfo`, `FileIdInfo`),
+  and required to be a regular, single-link, non-reparse direct child. The
+  bounded read uses `GetFileSizeEx` plus `ReadFile` on that same handle.
+- The hook path uses only precomputed UTF-16 buffers: `CreateFileW` with
+  `CREATE_NEW | FILE_SHARE_NONE | FILE_FLAG_WRITE_THROUGH` for the sibling,
+  `WriteFile`, `FlushFileBuffers`, and a size/identity/link-count
+  verification, then the namespace commit. It performs no heap allocation,
+  takes no lock, and never re-resolves a path.
+- The commit is `NtSetInformationFile` with `FileRenameInformationEx`, the
+  retained parent as `RootDirectory`, a plain relative name, and
+  `FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS`
+  when the inspected target still exists, or no flags (create-only) when it
+  was and still is missing, so a concurrently created entry fails atomically.
+  `SetFileInformationByHandle` cannot express a `RootDirectory` (ADR 0019) and
+  is used only for `FileDispositionInfo` on an already inspected handle.
+- Every outcome is classified from post-operation identities: the sibling
+  identity observed at the target name is `Committed`; an unchanged target is
+  `NotCommitted` and the never-renamed sibling is deleted through its own
+  handle; errors 1176/1177 or an unprovable result are
+  `CommittedButUnverified`, which preserves every copy for the rest of the
+  session. The identity is recorded in a lock-free atomic record; a contended
+  or unverified record disables reconciliation.
+- Reconciliation is identity-conditional: the target is re-inspected through
+  the retained parent, its bytes must validate with the session token, and the
+  mutation is applied to that inspected object (a `FileDispositionInfo` delete
+  on its handle, or a rename-by-handle over it while the inspected handle with
+  delete sharing stays open). A different identity, token, directory, reparse
+  point, or hard link returns `OwnershipLost` without touching anything; any
+  post-operation doubt returns `PreservedUncertain` and deletes nothing.
+- Item 7 is implemented more strictly than allowed: the installed hook never
+  chains the previous hook in any build. The hook returns normally, so a
+  panic on the main thread still terminates the process through the standard
+  panic runtime; a subprocess test asserts the non-success exit status and
+  the redacted marker.
+- The composition root mints `ShutdownQuiescenceProof` only from a
+  `DiagnosticsFinishStatus::Completed` receipt; the runtime receipt is a
+  placeholder that the scan/Shell wiring must replace with joined receipts.

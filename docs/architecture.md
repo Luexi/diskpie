@@ -405,24 +405,45 @@ Accepted lifecycle rules:
 
 ### Panic marker
 
-`panic_marker.rs` currently contains a pure capability/session contract and
-standalone tests. It is intentionally not declared from `main.rs` yet.
+`panic_marker.rs` owns the pure capability/session contract and is declared
+from `main.rs`. On Windows the composition root installs `CrashRuntime` after
+the crash directory is created and before the native window exists; the hook
+is backed by `diskpie_platform::WindowsMarkerSession`, a retained-handle
+adapter that mirrors the settings transport.
 
-The intended lifecycle is:
+The wired lifecycle is:
 
-1. Prepare retained native marker capabilities and read the previous snapshot.
-2. Install a release hook containing only prebuilt bounded data.
-3. On panic, commit the current marker without reopening paths or allocating
-   unbounded data.
-4. An uncaught crash leaves the marker for the next launch.
-5. A caught panic followed by verified clean shutdown restores/removes the
-   session marker.
-6. Reconciliation consumes an unforgeable shutdown-quiescence proof created
-   only after every provider and worker has joined.
+1. `WindowsMarkerSession::prepare` retains the local non-reparse crash
+   directory handle, inspects `last-panic.txt` and the fixed sibling
+   `last-panic.write` as regular single-link direct children, reads each
+   present slot with a 4 KiB ASCII bound, and precomputes the sibling path
+   plus the replace/create/recovery `FileRenameInformationEx` buffers. A
+   directory, reparse point, hard-linked, oversized, or non-ASCII slot is
+   reported unavailable and is never touched afterwards.
+2. The hook is installed with only prebuilt bounded marker variants and the
+   sealed capability; no path survives preparation.
+3. On panic, `commit` creates the exclusive sibling from the precomputed path,
+   writes, flushes, and verifies it through its own handle, revalidates the
+   target identity through the retained parent, renames by handle, and
+   classifies `Committed`, `NotCommitted`, or `CommittedButUnverified` from
+   post-operation identities. It never allocates, locks, or reopens a path.
+4. An uncaught crash leaves the marker for the next launch, where its presence
+   is recorded as `panic.marker_found` without any inferred cause.
+5. A caught panic followed by a clean shutdown restores or removes only the
+   marker whose native identity and session token still belong to this
+   session (`OwnershipReconciliation::AtomicFileIdentity`); any uncertainty
+   preserves every copy.
+6. Reconciliation consumes `ShutdownQuiescenceProof::from_receipts`, which is
+   minted only from a `DiagnosticsFinishStatus::Completed` receipt plus the
+   runtime receipt. The runtime receipt is a documented placeholder because
+   the executable composes no scan, layout, or Shell worker yet; the UI wiring
+   that starts them MUST replace it with joined receipts from those services.
+   Without a proof the runtime is dropped and the marker is preserved.
 
-The native marker writer still needs the same retained-handle, post-operation
-identity classification required by settings. Do not wire the pure module into
-production with the existing path-based marker helper.
+Explicit preview and delete reuse the same session type through
+`preview_marker` and `delete_marker`; deletion goes only through freshly
+inspected handles whose identities still match, so a swapped file is
+preserved and reported.
 
 ## 12. Process and thread ownership
 
