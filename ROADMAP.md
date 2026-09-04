@@ -1,8 +1,9 @@
 # DiskPie roadmap and continuation handoff
 
-> Paused on 2026-08-02 at the user's request. This document is the operational
-> handoff for the next maintainer or Codex agent. It describes the dirty working
-> tree as it exists now; it is not a claim that the product is complete.
+> Updated on 2026-09-04 after the integration cycle that connected the product.
+> This document is the operational handoff for the next maintainer or agent.
+> It describes the committed tree as it exists now; it is not a claim that the
+> product is complete. The status of every execution phase is at the end.
 
 ## Mission and completion boundary
 
@@ -26,92 +27,83 @@ Read these sources before changing code, in this order:
 The original proprietary Scanner reference files in the parent directory must
 never be modified, moved, copied into this repository, committed, or published.
 
-## Frozen repository state
+## Repository state
 
 | Item | Value |
 | --- | --- |
 | Local repository | `C:\Users\Luis\Desktop\scan\diskpie` |
 | Public repository | <https://github.com/Luexi/diskpie> |
-| Working branch | `feat/initial-release` |
-| Last pushed commit | `a1ba3d0dc5a35cce5c515eb574f10ac7f55d0fcd` |
-| Draft pull request | <https://github.com/Luexi/diskpie/pull/1> |
-| Last green pushed CI | <https://github.com/Luexi/diskpie/actions/runs/30775009484> and <https://github.com/Luexi/diskpie/actions/runs/30775009490> |
-| Stable Rust baseline | Rust 1.92, edition 2024 |
-| Product version | `0.1.0` development version |
+| Integration branch | `main` (the `feat/initial-release` work was fast-forwarded into it on 2026-09-04) |
+| Release toolchain / MSRV | Rust 1.97.1 pinned by `rust-toolchain.toml`; `rust-version = "1.92"` checked by a dedicated CI job |
+| Product version | `0.1.0` development version; no tag or release exists yet |
 
-The working tree is intentionally dirty and contains substantial uncommitted
-work. Do not reset, checkout, clean, or broadly reformat it. Existing changes
-belong to the current implementation effort and must be reviewed in place.
-
-Uncommitted areas include:
-
-- application runtime, reducer, navigation, and layout-service ownership;
-- typed diagnostics, local diagnostic lifecycle, and Windows diagnostic files;
-- settings-policy and explicit native-settings design work;
-- local panic-marker contract work that is not yet wired into the executable;
-- eframe composition-root and shell scaffolding;
-- ADR and research updates; and
-- the UI product-direction document.
-
-Run `git status --short` and inspect each diff before editing. There has been no
-commit after `a1ba3d0`; the remote CI proves only that pushed commit, not the
-current working tree.
+The working tree is clean. Every line of the previously uncommitted work is
+committed, so a fresh clone builds and CI exercises the whole tree. Use
+`git status --short` before editing and keep commits small and coherent.
 
 ## Current delivery estimate
 
-Approximately 40-45% of the literal release contract is implemented or has
-strong underlying infrastructure. This is an orientation estimate, not an
-acceptance metric. The remaining 55-60% is concentrated in product integration,
-native actions, end-to-end verification, packaging, and release evidence.
+Roughly 75% of the literal release contract is implemented and reachable by a
+user; the connected application scans, renders, navigates, persists
+preferences, logs, and recovers from a crash marker. This is an orientation
+estimate, not an acceptance metric. What remains is concentrated in binding
+the destructive actions and the Explorer toggle to the interface, the
+benchmark report, clean-machine validation, and publishing the release.
+[`docs/requirements-traceability.md`](docs/requirements-traceability.md)
+carries the per-requirement evidence.
 
 ### Status legend
 
-- **Accepted**: independently reviewed with no blocking/high finding.
-- **Implemented, revalidation pending**: code and focused tests exist, but the
-  last independent review or full-workspace gate was interrupted by the pause.
-- **Contract only**: policy or pure logic exists, but the native adapter or
-  composition-root integration does not.
-- **Not implemented**: required product behavior is absent.
+- **Wired**: reachable from the executable, with the named automated or manual
+  evidence. `Wired (partial)` names the missing piece.
+- **Adapter, unwired**: the native adapter and its tests exist, but the
+  executable does not call it yet.
+- **Logic only**: portable policy or pure logic exists without a native
+  adapter or user-reachable path.
+- **Not started**: required product behavior is absent.
 
 ## What exists today
 
 | Area | State | Evidence and caveats |
 | --- | --- | --- |
-| Compact tree, exact metrics, aggregation | Accepted baseline | `diskpie-core`; unit and property coverage already exists. |
-| Portable bounded scanner | Accepted baseline | `diskpie-scan`; fixed workers, bounded channels, generation cancellation, partial batches, omissions. |
-| Windows conventional filesystem adapter | Accepted baseline | Long/native paths, allocated-size metadata, file identity, reparse/cloud boundaries. |
-| Windows volumes and selected-root resolution | Accepted baseline | Volume discovery, stable keys, device hints, capacity, DOS/UNC resolution. |
-| Sunburst layout and hit testing | Accepted baseline | UI-independent layout plus egui mesh/hit-test adapter. |
-| Presentation, navigation, hide/restore, rescan intent | Implemented, revalidation pending | Latest focused runtime/navigation stress checks passed; final independent review was interrupted. |
-| Runtime orchestration | Implemented, revalidation pending | Bounded scans, progressive snapshots, off-thread layout, cancellation/replacement, retirement reaper. |
-| Folder picker | Implemented | Direct `IFileOpenDialog` on one message-pumping Shell STA. Its shutdown path still needs hardening. |
-| CLI initial path | Implemented at parser boundary | Path-preserving parser exists; it is not yet connected to a real UI scan. |
-| Settings schema/policy | Implemented | Versioned, bounded RON policy exists. Native Windows retained-handle file transport is absent. |
-| Typed diagnostics and local log lifecycle | Accepted | Independent review accepted the latest bounded/nonblocking lifecycle. Full workspace rerun still required. |
-| Panic marker | Contract only | Pure contract and standalone tests exist; module is not declared or integrated, and native retained-handle transport is absent. |
-| English and Spanish infrastructure | Partially implemented | Typed Fluent IDs and both bundles exist; final connected UI strings and completeness checks remain. |
-| Visual shell | Scaffold only | It renders an original responsive instrument shell, but still shows calibration/demo data and disabled actions. |
-| Open/recycle/delete/empty recycle bin/Installed Apps | Implemented below the UI | ADR 0008 confirmation flow, single-use capabilities, STA requests/outcomes, late identity validation, and cancellation exist; the egui binding and the disposable-VM provider matrix remain. |
-| Explorer integration | Partially implemented | Portable policy, HKCU adapter with unique test roots, and the `--scan-path` verb argument exist; the settings UI remains. |
-| Benchmarks and release evidence | Not implemented as a complete gate | Some lower-level tests exist; required benchmark suite/report and portable binary measurements remain. |
-| Stable GitHub release | Not implemented | Repository and draft PR exist; no release or portable asset exists. |
+| Compact tree, exact metrics, aggregation | Wired | `diskpie-core`; unit and property coverage; real-NTFS sparse, compressed, and hard-link fixtures confirm the size model. |
+| Portable bounded scanner | Wired | `diskpie-scan`; fixed workers, per-volume queues, bounded channels, generation cancellation, partial batches, omissions; abandoned cancellations report `Cancelled`. |
+| Windows conventional filesystem adapter | Wired | Long/native paths, allocated-size metadata, file identity, reparse/cloud boundaries; junction, symlink, denied-access, and long-path fixtures. |
+| Windows volumes and selected-root resolution | Wired | Volume discovery feeds the drive list; selected and CLI paths are resolved off the frame thread. |
+| Sunburst layout and hit testing | Wired | `SunburstView` renders the committed layout with localized tooltips; the zero-weight list is bounded by the sector budget. |
+| Presentation, navigation, hide/restore, rescan intent | Wired | Every command goes through `navigation_command`/`execute_navigation`; branch rescan is shown as unavailable because the engine has no path for it. |
+| Runtime orchestration | Wired | Bounded scans, cost-paced progressive snapshots, off-thread layout, cancellation/replacement, retirement reaper, ordered shutdown with typed receipts. |
+| Folder picker | Wired | `IFileOpenDialog` on the Shell STA with nonblocking `request_shutdown`, bounded `finish`, and a process-wide reaper; a dismissed dialog keeps the previous scan state. |
+| CLI initial path | Wired | `[--scan-path PATH \| [--] PATH]` parsed path-preservingly and scanned at startup; release builds print help, version, and usage errors. |
+| Settings | Wired | Versioned RON policy read before the window and published after the event loop through the retained-handle `app.ron` adapter. |
+| Typed diagnostics and local log lifecycle | Wired | Bounded daily logs, redaction, retention, startup/settings/scan/Shell events; export from the interface is not connected yet. |
+| Panic marker | Wired | Native retained-handle session, process hook, next-start notice, and clean-shutdown reconciliation that requires diagnostics, runtime, Shell, resolver, and bridge receipts. |
+| English and Spanish interfaces | Wired | 113 typed messages in both bundles with completeness, argument, and independence tests; runtime locale switch. |
+| Visual shell | Wired | Connected product with the required scan states, telemetry, inspector, synchronized largest-items list, keyboard parity, and system fallback fonts. |
+| Open/recycle/delete/empty recycle bin/Installed Apps | Adapter, unwired | ADR 0008 confirmation flow, single-use capabilities, STA requests/outcomes, late identity validation, post-operation observation, and cancellation exist; the interface binding and the disposable-VM provider matrix remain. |
+| Explorer integration | Adapter, unwired | Portable policy, HKCU adapter under unique test roots, and the `--scan-path` verb exist; the settings toggle and the Windows 10/11 VM checks remain. |
+| Packaging | Wired (partial) | Manifest, icon, version resources, static CRT, import-table gate, and a reproducible release workflow exist; clean-machine launches are pending. |
+| Benchmarks and release evidence | Not started | No benchmark harness or report exists; binary size is measured only by the release workflow. |
+| Stable GitHub release | Not started | The release workflow can publish a draft from a `v*` tag; no tag has been created. |
 
-## Last known verification evidence
+## Latest verification evidence (2026-09-04)
 
-Do not combine these results into a claim that the current tree is fully green:
-
-- A prior full-workspace run, before the newest runtime/diagnostic changes,
-  passed 264 unit/integration tests plus one doc test.
-- The latest runtime/navigation remediation passed seven focused tests, twenty
-  repeated ceiling/stall stress cycles, strict all-target Clippy, and a format
-  check for `diskpie-app`.
-- The diagnostic lifecycle passed fourteen focused tests, crate checks, strict
-  Clippy, and formatting; an independent reviewer returned **ACCEPT**.
-- The panic-marker file passed a standalone test harness: 22 tests passed and
-  four subprocess helper tests were intentionally ignored by direct execution.
-  This does not prove executable integration.
-- The current combined dirty tree was **not** rerun through the full workspace
-  gate after the pause. That is the first resumption task.
+- The full local gate passed on the integrated tree: `cargo fmt --check`,
+  `cargo clippy --workspace --all-targets --all-features --locked -D warnings`,
+  `cargo test --workspace --all-features --locked` (499 passed, 6 subprocess
+  helpers ignored by design), `cargo doc` with `-D warnings`, and
+  `cargo build --release -p diskpie --locked`.
+- The release executable (10.0 MB, static CRT) carries the manifest, icon,
+  and version resources, imports no Visual C++ runtime DLL, prints `--help`
+  and `--version` and returns exit code 2 for an unknown option through
+  redirected handles, and completed a smoke scan of a 40-file fixture with
+  exact counts and a clean exit code 0.
+- Every workstream merged in this cycle was implemented and then reviewed by
+  an independent adversarial pass before merging; findings rated high or
+  blocking were fixed before integration.
+- Not yet run: clean Windows 10/11 virtual-machine launches, the disposable
+  Recycle Bin matrix, Narrator/accessibility review, benchmarks, and the
+  remote CI run on the pushed head (check the Actions tab).
 
 ## Critical contracts that must not regress
 
@@ -419,3 +411,23 @@ Do not begin by deleting untracked files, resetting to the pushed commit, or
 rewriting the architecture. The fastest safe continuation is to validate and
 commit the substantial work already present.
 
+
+## Status of the execution roadmap (2026-09-04)
+
+The phases above are kept as the plan of record. Their state after the
+integration cycle:
+
+| Phase | State | What remains |
+| --- | --- | --- |
+| 1 - Stabilize and commit | Done | Nothing. The tree is committed, the gate is green locally, and CI runs the same commands. |
+| 2 - Native settings and crash transport | Done | Nothing blocking. The retained-handle rename goes through `NtSetInformationFile` (ADR 0019 addendum); clean-VM checks are part of phase 8. |
+| 3 - Harden native service lifecycles | Done | Nothing. `request_shutdown`, bounded `finish`, and the process-wide reaper are in place with stalled- and panicking-worker tests. |
+| 4 - Connect the actual application UI | Done, with two gaps | Rescanning one branch has no engine path and is shown as unavailable; a Narrator pass and wide/narrow headless frame tests are still open. |
+| 5 - Shell actions and confirmations | Adapter done, interface pending | Bind the ADR 0008 flow and the STA requests to the inspector buttons and confirmation dialogs; run the disposable Recycle Bin matrix; verify directory recycling callback shape. |
+| 6 - Optional Explorer integration | Adapter done, interface pending | Add the settings toggle with status, Repair, and Remove; verify on Windows 10 and 11 machines. |
+| 7 - Performance, robustness, audits | Partly done | Fixture coverage exists; the benchmark harness and report, the manual OneDrive check, and the accessibility review remain. |
+| 8 - Portable release | Workflow ready, release pending | Confirm CI is green on `main`, launch the exe on clean Windows 10 and 11 machines, capture screenshots, tag `v0.1.0`, and publish the draft the workflow produces. |
+
+Next steps, in order: bind the destructive actions and the Explorer toggle to
+the interface, add the benchmark harness and report, run the clean-machine and
+accessibility checks, then tag the release.
