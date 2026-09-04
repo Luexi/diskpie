@@ -24,7 +24,8 @@ pub use windows::diagnostic_files::{
     DiagnosticFileError, DiagnosticFileErrorKind, DiagnosticFileOperation,
     DiagnosticRetentionReport, ExportDestinationKind, ExportWriteOutcome, MAX_DAILY_LOG_BYTES,
     MAX_DIAGNOSTIC_EXPORT_BYTES, MAX_PANIC_MARKER_BYTES, MAX_RETAINED_LOG_FILES,
-    WindowsAtomicMarkerWriter, WindowsDailyLogHealth, WindowsDailyLogWriter,
+    MarkerCommitStatus, MarkerReconcileAction, MarkerReconcileOutcome, MarkerSlotState,
+    WindowsAtomicMarkerWriter, WindowsDailyLogHealth, WindowsDailyLogWriter, WindowsMarkerSession,
     classify_export_destination, prune_diagnostic_logs, write_diagnostic_export,
 };
 #[cfg(windows)]
