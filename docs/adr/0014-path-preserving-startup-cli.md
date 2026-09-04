@@ -113,3 +113,13 @@ Accepted tradeoffs:
   materially larger dependency/unsafe surface, or becomes unmaintained.
 - A multi-root CLI requires a new product grammar decision; it must not emerge
   from silently accepting extra positional values.
+
+## Addendum 2026-09-04: `--scan-path`
+
+ADR 0009's Explorer verb launches `diskpie.exe --scan-path "%1"`. The grammar
+is therefore `diskpie.exe [--scan-path PATH | [--] PATH]`: `--scan-path` takes
+exactly one `OsString` value (separate or `=`-joined, taken verbatim even when
+it starts with a dash) and is equivalent to the positional path. Combining it
+with a positional path or a second `--scan-path` is a `TooManyPaths` usage
+error; combining it with help or version is a `ConflictingAction`. No other
+option, subcommand, or normalization was added.
