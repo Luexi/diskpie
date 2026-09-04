@@ -55,6 +55,7 @@ windows = { version = "=0.62.2", default-features = false, features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+windows-registry = { version = "=0.6.1", default-features = false, features = ["std"] }
 winresource = { version = "=0.1.31", default-features = false }
 
 [workspace.lints.rust]

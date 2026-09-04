@@ -92,7 +92,7 @@ native actions, end-to-end verification, packaging, and release evidence.
 | English and Spanish infrastructure | Partially implemented | Typed Fluent IDs and both bundles exist; final connected UI strings and completeness checks remain. |
 | Visual shell | Scaffold only | It renders an original responsive instrument shell, but still shows calibration/demo data and disabled actions. |
 | Open/recycle/delete/empty recycle bin/Installed Apps | Not implemented | Research and ADR contracts exist; native requests and confirmations remain. |
-| Explorer integration | Not implemented | ADR exists; reversible per-user adapter and UI remain. |
+| Explorer integration | Partially implemented | Portable policy, HKCU adapter with unique test roots, and the `--scan-path` verb argument exist; the settings UI remains. |
 | Benchmarks and release evidence | Not implemented as a complete gate | Some lower-level tests exist; required benchmark suite/report and portable binary measurements remain. |
 | Stable GitHub release | Not implemented | Repository and draft PR exist; no release or portable asset exists. |
 

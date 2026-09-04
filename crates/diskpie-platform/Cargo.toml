@@ -17,6 +17,7 @@ diskpie-scan = { path = "../diskpie-scan", version = "0.1.0" }
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
+windows-registry.workspace = true
 
 [lints]
 workspace = true

@@ -473,6 +473,38 @@ always quoted; no command interpreter is involved; and startup parsing uses
 percent signs, ampersands, carets, emoji, and option-like names remain ordinary
 argument content when no shell interpreter is introduced.
 
+Drive roots need one extra character. Explorer substitutes `%1` with `C:\` for
+a `Drive` verb, and the Windows argv rules (`CommandLineToArgvW` and Rust's
+`args_os`) treat a backslash before a closing quote as an escaped quote, so
+`"C:\"` arrives as `C:"`. The `Drive` command therefore stores
+`"<exe>" --scan-path "%1\"`, which expands to `"C:\\"` and parses back to the
+exact `C:\`. Folder selections carry no trailing separator, so the `Directory`
+command keeps the plain `"%1"`. `diskpie-platform` proves both templates
+against the real parser with `CommandLineToArgvW` (implemented 2026-09-04).
+
+Implementation notes recorded 2026-09-04:
+
+- The staging key becomes final through `RegRenameKey` (documented in
+  `winreg.h` since Windows Vista). It works for a standard user below
+  `HKEY_CURRENT_USER`, including `Software\Classes`, and is exercised by the
+  platform tests on every install and repair; no copy-then-delete fallback was
+  needed. A repair renames the owned final key to a `DiskPie.Scan.previous.*`
+  sibling, renames the verified staging key into place, then deletes the
+  previous sibling, so a failure at any step can rename the original back.
+- Creating a staging key also creates missing `Directory\shell` or
+  `Drive\shell` ancestors. Rollback removes only the keys this request created
+  below `shell`; ancestors are never deleted, matching the parent-preservation
+  rule.
+- Inspection also reports DiskPie-owned `DiskPie.Scan.*` siblings (staging or
+  previous keys whose ownership marker survived a failed rollback). Remove
+  deletes them after re-checking the marker; siblings without the marker are
+  never touched.
+- Tests run against `HKCU\Software\DiskPieTest\<unique run id>\Classes`,
+  never the real Classes tree. Each test deletes exactly its own run subtree
+  through a drop guard and verifies the key no longer opens; the empty shared
+  `Software\DiskPieTest` parent is intentionally left in place because a
+  recursive delete of a shared parent could race a concurrent test.
+
 `HKEY_CLASSES_ROOT` is a merged HKCU/HKLM view, so direct writes under
 `HKCU\Software\Classes` require no administrator privileges. See
 [Merged View of HKEY_CLASSES_ROOT](https://learn.microsoft.com/en-us/windows/win32/sysinfo/merged-view-of-hkey-classes-root),
@@ -539,6 +571,31 @@ advisory found” is not a guarantee; the resolved lockfile still requires
 | [`windows` 0.62.2](https://crates.io/crates/windows/0.62.2) | `MIT OR Apache-2.0`; Microsoft windows-rs; published 2025-10-06; active; Rust 1.82. | Safe generated COM projections and `#[implement]` support over generated FFI; project unsafe can stay in a small adapter. Windows target only. [`RUSTSEC-2022-0008`](https://rustsec.org/advisories/RUSTSEC-2022-0008.html) affects versions before 0.32, not this baseline. | The source package and generated graph are nontrivial, but features can be restricted to Foundation, COM, Shell, WindowsMessaging, and any exact handle APIs. It avoids handwritten COM vtables/refcounts and is already the selected binding family. | Microsoft API naming creates platform coupling, contained by `PlatformActions`. `windows-sys` remains a whole-adapter alternative if measured binary/build cost justifies a rewrite. | **Adopt 0.62.2.** |
 | [`windows-sys` 0.61.2](https://crates.io/crates/windows-sys/0.61.2) | `MIT OR Apache-2.0`; Microsoft; published 2025-10-06; active; Rust 1.71. | Raw FFI requires unsafe at every call and local COM vtables/refcounts/progress-sink plumbing. Windows only. No directly applicable advisory found. | Smaller projection surface and one `windows-link` support dependency, but substantially more local unsafe and testing for this COM-heavy adapter. | Mixing it with `windows` duplicates types and abstractions. It is a fallback only if the complete Windows adapter switches after measurement. | **Reject for Shell actions.** |
 | [`windows-registry` 0.6.1](https://crates.io/crates/windows-registry/0.6.1) | `MIT OR Apache-2.0`; Microsoft; published 2025-10-06; active; Rust 1.82. | Safe RAII key create/open/get/set/remove/rename surface over reviewed Windows calls. Windows only. No direct RustSec advisory found. | Small focused crate with `windows-link`, `windows-result`, and `windows-strings`; materially reduces handle leaks and accidental broad deletion in the reversible registry layer. | Encapsulate behind `IntegrationRegistry`; direct `windows` registry calls are a viable fallback. Avoid unneeded transaction APIs. | **Adopt narrowly.** |
+
+`windows-registry` adoption record (verified 2026-09-04 with `cargo search`,
+`cargo info`, and the downloaded 0.6.1 source):
+
+- Pinned `=0.6.1` in the workspace with `default-features = false` and only
+  the `std` feature. crates.io's latest release is 0.100.0, which declares
+  `rust-version = "1.95"` (above the workspace's 1.92 contract) and moves to
+  the newer `windows-*` support-crate generation; it was rejected for now.
+- Dependencies `windows-link 0.2.1`, `windows-result 0.4.1`, and
+  `windows-strings 0.5.1` were already locked by `windows 0.62.2`, so the
+  adoption added exactly one crate to `Cargo.lock` and no duplicate versions.
+- Unsafe footprint: the crate wraps `RegCreateKeyExW`, `RegOpenKeyExW`,
+  `RegSetValueExW`, `RegQueryValueExW`, `RegEnumKeyExW`, `RegEnumValueW`,
+  `RegRenameKey`, `RegDeleteTreeW`, and `RegCloseKey` in internal unsafe
+  blocks behind a safe API; DiskPie adds no registry `unsafe` of its own. Its
+  `Transaction` API is unused.
+- Operations DiskPie needs and found: create with intermediate keys, open with
+  explicit access, `REG_SZ` write through `set_hstring` (lossless UTF-16 from
+  `OsStr`), typed read-back through `get_value`/`Value::as_wide`, value and
+  subkey enumeration, sibling rename, and exact `remove_tree`. No fallback to
+  direct `windows` registry calls was required, so `Win32_System_Registry`
+  stays disabled.
+- Build impact: one small `no_std` crate compiled only for Windows targets.
+  The release import-list gate remains the backstop for the `advapi32.dll`
+  registry exports it links.
 | [`trash` 5.2.6](https://crates.io/crates/trash/5.2.6) | MIT; published 2026-05-03; active cross-platform crate; Rust 1.85. | Public safe API, but its [tagged Windows implementation](https://github.com/ArturKovacs/trash/blob/v5.2.6/src/windows.rs) strips `\\?\`, uses `FOF_ALLOWUNDO`, has no owner/progress sink/per-item outcome, can panic on COM creation, and exposes only coarse abort state. Windows pulls old `windows ^0.56`. No direct advisory found. | Convenient cross-platform trash abstraction, but adds a duplicate bindings graph and cannot satisfy DiskPie's confirmation, identity, fail-closed recycle, or reporting contract. | Its portable abstraction would hide required Windows semantics; replacing it later would change result behavior. | **Reject.** |
 | [`open` 5.4.0](https://crates.io/crates/open/5.4.0) | MIT; published 2026-07-12; active; Rust 1.62. | The [Windows implementation](https://github.com/Byron/open-rs/blob/v5.4.0/src/windows.rs) defaults to PowerShell `Start-Process` with Explorer fallback; an optional feature uses manual unsafe ShellExecute FFI. No direct advisory found. | Small cross-platform convenience, but adds subprocess/quoting policy, does not reveal items, and provides no STA ownership or structured dispatch result. | Easy to replace, but it weakens the explicit no-command-interpreter boundary immediately. | **Reject.** |
 | [`opener` 0.8.5](https://crates.io/crates/opener/0.8.5) | `MIT OR Apache-2.0`; published 2026-06-11; active. | Uses `windows-sys`; its [open](https://github.com/Seeker14491/opener/blob/v0.8.5/opener/src/windows.rs) and [reveal](https://github.com/Seeker14491/opener/blob/v0.8.5/opener/src/windows/reveal.rs) paths normalize names, create an MTA thread for reveal, join synchronously, and use `ILCreateFromPathW`. No direct advisory found. | Useful generic open/reveal API, but duplicate bindings, path transformation, wrong apartment policy, blocking join, and coarse errors conflict with DiskPie. | Adapter replacement is possible, but behavior would already be coupled to normalization and threading choices. | **Reject.** |
