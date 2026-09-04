@@ -353,7 +353,7 @@ mod tests {
         for target in VerbTarget::ALL {
             let verb = classes.open(verb_key(target).to_native()).expect("verb key exists");
             assert_eq!(raw_string(&verb, MUI_VERB_VALUE), OsString::from(VERB_LABEL));
-            assert_eq!(raw_string(&verb, ICON_VALUE), OsString::from(exe));
+            assert_eq!(raw_string(&verb, ICON_VALUE), OsString::from(format!("\"{exe}\",0")));
             assert_eq!(raw_string(&verb, MULTI_SELECT_MODEL_VALUE), OsString::from("Single"));
             assert_eq!(raw_string(&verb, OWNER_VALUE), OsString::from(OWNER_MARKER));
             assert_eq!(raw_string(&verb, SCHEMA_VALUE), OsString::from("1"));
@@ -557,11 +557,11 @@ mod tests {
             .expect("install");
         let stray = staging_verb_key(VerbTarget::Directory, &token(99));
         let classes = root.classes();
-        classes
-            .create(stray.to_native())
-            .expect("create")
-            .set_string(OWNER_VALUE, OWNER_MARKER)
-            .expect("set");
+        let stray_key = classes.create(stray.to_native()).expect("create");
+        stray_key.set_string(OWNER_VALUE, OWNER_MARKER).expect("set");
+        stray_key.set_string(SCHEMA_VALUE, "1").expect("set");
+        stray_key.set_string(EXECUTABLE_VALUE, EXE).expect("set");
+        drop(stray_key);
         drop(classes);
 
         let status = inspect(root.registry(), Path::new(EXE)).expect("inspect");

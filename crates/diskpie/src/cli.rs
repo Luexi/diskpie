@@ -310,6 +310,11 @@ mod tests {
             .expect("after the terminator the option text is a path");
         assert_eq!(run_path(terminated), Some(PathBuf::from("--scan-path")));
         assert!(HELP_TEXT.contains("--scan-path PATH"));
+        assert_eq!(
+            format!("--{SCAN_PATH_OPTION}"),
+            diskpie_app::explorer_integration::SCAN_PATH_OPTION,
+            "the parser must accept exactly the option the Explorer verb writes"
+        );
         assert!(USAGE.contains("--scan-path PATH"));
     }
 

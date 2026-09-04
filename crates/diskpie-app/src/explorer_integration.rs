@@ -456,6 +456,9 @@ pub enum ExecutablePathError {
     ContainsQuote,
     ContainsNul,
     TrailingSeparator,
+    /// A `%` followed by an alphanumeric, `*`, or `~` would be substituted by
+    /// Explorer inside the command string, changing the executable path.
+    ContainsPlaceholder,
 }
 
 impl fmt::Display for ExecutablePathError {
@@ -465,6 +468,9 @@ impl fmt::Display for ExecutablePathError {
             Self::ContainsQuote => "the executable path contains a double quote",
             Self::ContainsNul => "the executable path contains a NUL unit",
             Self::TrailingSeparator => "the executable path ends with a separator",
+            Self::ContainsPlaceholder => {
+                "the executable path contains a shell placeholder sequence"
+            }
         })
     }
 }
@@ -493,6 +499,14 @@ impl VerbRecord {
         if matches!(bytes.last(), Some(b'\\' | b'/')) {
             return Err(ExecutablePathError::TrailingSeparator);
         }
+        // Explorer substitutes %0-%9, %L, %V, %D, %I, %S, %W, %* and %~
+        // (in either case) anywhere in the command string, even inside the
+        // quoted executable, so such a path cannot be templated verbatim.
+        if bytes.windows(2).any(|pair| {
+            pair[0] == b'%' && (pair[1].is_ascii_alphanumeric() || matches!(pair[1], b'*' | b'~'))
+        }) {
+            return Err(ExecutablePathError::ContainsPlaceholder);
+        }
         Ok(Self { executable: executable.to_path_buf() })
     }
 
@@ -513,12 +527,23 @@ impl VerbRecord {
         line
     }
 
+    /// `"<exe>",0`: Explorer parses `Icon` as `path,index`, so the path is
+    /// quoted to survive a comma inside it and the first icon group is named
+    /// explicitly.
+    #[must_use]
+    pub fn icon_value(&self) -> OsString {
+        let mut icon = OsString::from("\"");
+        icon.push(self.executable.as_os_str());
+        icon.push("\",0");
+        icon
+    }
+
     /// Expected content of the verb key.
     #[must_use]
     pub fn verb_snapshot(&self) -> KeySnapshot {
         KeySnapshot::new()
             .with_string(MUI_VERB_VALUE, VERB_LABEL)
-            .with_string(ICON_VALUE, self.executable.as_os_str())
+            .with_string(ICON_VALUE, self.icon_value())
             .with_string(MULTI_SELECT_MODEL_VALUE, MULTI_SELECT_MODEL)
             .with_string(OWNER_VALUE, OWNER_MARKER)
             .with_string(SCHEMA_VALUE, SCHEMA_VERSION)
@@ -1011,10 +1036,13 @@ fn inspect_record(
     Ok(ExplorerIntegrationStatus::from_key_states(record.executable(), keys).with_strays(strays))
 }
 
-/// Finds `DiskPie.Scan.*` siblings that carry DiskPie's ownership marker.
+/// Finds the staging and previous siblings DiskPie itself creates
+/// (`DiskPie.Scan.staging.<token>` and `DiskPie.Scan.previous.<token>`) that
+/// still carry DiskPie's complete ownership value set.
 ///
 /// Such keys can only remain after an interrupted request whose rollback
-/// failed. Siblings without the marker are not DiskPie's and are ignored.
+/// failed. Any other sibling name, and any key that lacks the marker, schema,
+/// or stored executable value, is not DiskPie's and is never touched.
 fn owned_strays(
     registry: &dyn IntegrationRegistry,
     target: VerbTarget,
@@ -1023,12 +1051,9 @@ fn owned_strays(
     let Some(snapshot) = registry.read_key(&shell)? else {
         return Ok(Vec::new());
     };
-    let prefix = format!("{VERB_KEY_NAME}.");
     let mut strays = Vec::new();
     for name in snapshot.subkeys() {
-        let is_sibling = name.len() > prefix.len()
-            && name.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(&prefix));
-        if !is_sibling {
+        if !is_diskpie_transient_name(name) {
             continue;
         }
         let candidate = shell.child(name);
@@ -1039,12 +1064,27 @@ fn owned_strays(
     Ok(strays)
 }
 
+/// Whether `name` has the exact shape of a DiskPie staging or previous key
+/// with a non-empty token, compared ASCII-case-insensitively like the
+/// registry itself.
+fn is_diskpie_transient_name(name: &str) -> bool {
+    [STAGING_INFIX, PREVIOUS_INFIX].iter().any(|infix| {
+        let prefix = format!("{VERB_KEY_NAME}.{infix}.");
+        name.len() > prefix.len()
+            && name.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(&prefix))
+    })
+}
+
+/// A key counts as DiskPie's only when the marker, the schema, and the stored
+/// executable value are all present: the marker alone is not ownership.
 fn is_marked_owned(
     registry: &dyn IntegrationRegistry,
     key: &KeyPath,
 ) -> Result<bool, RegistryError> {
     Ok(registry.read_key(key)?.is_some_and(|snapshot| {
         snapshot.string_value(OWNER_VALUE) == Some(OsStr::new(OWNER_MARKER))
+            && snapshot.string_value(SCHEMA_VALUE) == Some(OsStr::new(SCHEMA_VERSION))
+            && snapshot.string_value(EXECUTABLE_VALUE).is_some_and(|value| !value.is_empty())
     }))
 }
 
@@ -1639,7 +1679,11 @@ mod tests {
             ]
         );
         assert_eq!(verb.string_value("muiverb"), Some(OsStr::new(VERB_LABEL)));
-        assert_eq!(verb.string_value(ICON_VALUE), Some(OsStr::new(EXE)));
+        assert_eq!(
+            verb.string_value(ICON_VALUE),
+            Some(OsStr::new(&format!("\"{EXE}\",0"))),
+            "the icon path is quoted so a comma inside it cannot be read as an index"
+        );
         assert_eq!(verb.string_value(MULTI_SELECT_MODEL_VALUE), Some(OsStr::new("Single")));
         assert_eq!(verb.string_value(OWNER_VALUE), Some(OsStr::new(OWNER_MARKER)));
         assert_eq!(verb.string_value(SCHEMA_VALUE), Some(OsStr::new("1")));
@@ -1701,6 +1745,15 @@ mod tests {
         nul.push("\0");
         nul.push(".exe");
         assert_eq!(VerbRecord::new(Path::new(&nul)), Err(ExecutablePathError::ContainsNul));
+        for placeholder in [r"C:\tools\100%1\diskpie.exe", r"C:\%L\diskpie.exe", r"C:\a%~b\d.exe"] {
+            assert_eq!(
+                VerbRecord::new(Path::new(placeholder)),
+                Err(ExecutablePathError::ContainsPlaceholder),
+                "{placeholder}"
+            );
+        }
+        assert!(VerbRecord::new(Path::new(r"C:\100% tools\diskpie.exe")).is_ok());
+        assert!(VerbRecord::new(Path::new(r"C:\a%\diskpie.exe")).is_ok());
         assert_eq!(
             apply(&mut FakeRegistry::new(), IntegrationRequest::Install, Path::new(""), &token()),
             Err(IntegrationError::InvalidExecutable(ExecutablePathError::Empty))
@@ -2056,7 +2109,7 @@ mod tests {
             .write_string(&verb_key(VerbTarget::Drive), EXECUTABLE_VALUE, OsStr::new(MOVED_EXE))
             .expect("write");
         divergent
-            .write_string(&verb_key(VerbTarget::Drive), ICON_VALUE, OsStr::new(MOVED_EXE))
+            .write_string(&verb_key(VerbTarget::Drive), ICON_VALUE, &record(MOVED_EXE).icon_value())
             .expect("write");
         divergent
             .write_string(
@@ -2192,12 +2245,23 @@ mod tests {
         let owned_stray = staging_verb_key(VerbTarget::Drive, &StagingToken::new(1, 1));
         registry.create_key(&owned_stray.child(COMMAND_KEY_NAME)).expect("create");
         registry.write_string(&owned_stray, OWNER_VALUE, OsStr::new(OWNER_MARKER)).expect("write");
+        registry
+            .write_string(&owned_stray, SCHEMA_VALUE, OsStr::new(SCHEMA_VERSION))
+            .expect("write");
+        registry.write_string(&owned_stray, EXECUTABLE_VALUE, OsStr::new(EXE)).expect("write");
         let unmarked = shell_key(VerbTarget::Directory).child("DiskPie.Scan.previous.someone");
         registry.create_key(&unmarked).expect("create");
         registry.write_string(&unmarked, MUI_VERB_VALUE, OsStr::new("Not ours")).expect("write");
+        // A transient name carrying only the marker is not proof of ownership.
+        let marker_only = previous_verb_key(VerbTarget::Directory, &StagingToken::new(2, 2));
+        registry.create_key(&marker_only).expect("create");
+        registry.write_string(&marker_only, OWNER_VALUE, OsStr::new(OWNER_MARKER)).expect("write");
+        // A fully marked key under a non-transient sibling name is never a stray.
         let unrelated = shell_key(VerbTarget::Directory).child("DiskPie.Scanner");
         registry.create_key(&unrelated).expect("create");
         registry.write_string(&unrelated, OWNER_VALUE, OsStr::new(OWNER_MARKER)).expect("write");
+        registry.write_string(&unrelated, SCHEMA_VALUE, OsStr::new(SCHEMA_VERSION)).expect("write");
+        registry.write_string(&unrelated, EXECUTABLE_VALUE, OsStr::new(EXE)).expect("write");
         registry.clear_operations();
 
         let status = inspect(&registry, Path::new(EXE)).expect("inspect");
@@ -2225,14 +2289,20 @@ mod tests {
         assert_eq!(report.outcome, IntegrationOutcome::Removed);
         assert_eq!(registry.key_exists(&owned_stray), Ok(false));
         assert_eq!(registry.key_exists(&unmarked), Ok(true), "unmarked sibling is not ours");
+        assert_eq!(registry.key_exists(&marker_only), Ok(true), "a marker alone is not ownership");
         assert_eq!(registry.key_exists(&unrelated), Ok(true), "other prefixes are ignored");
         let status = inspect(&registry, Path::new(EXE)).expect("inspect");
         assert_eq!(status.state(), &IntegrationState::NotInstalled);
         assert!(status.strays().is_empty());
 
-        // A stray alone is enough for Remove to act and to notify Explorer.
+        // A fully marked stray alone is enough for Remove to act and to
+        // notify Explorer.
         registry.create_key(&owned_stray).expect("create");
         registry.write_string(&owned_stray, OWNER_VALUE, OsStr::new(OWNER_MARKER)).expect("write");
+        registry
+            .write_string(&owned_stray, SCHEMA_VALUE, OsStr::new(SCHEMA_VERSION))
+            .expect("write");
+        registry.write_string(&owned_stray, EXECUTABLE_VALUE, OsStr::new(EXE)).expect("write");
         let notifications = registry.notifications();
         let report = apply(&mut registry, IntegrationRequest::Remove, Path::new(EXE), &token())
             .expect("stray-only remove succeeds");
