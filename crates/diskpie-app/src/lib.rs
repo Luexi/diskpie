@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod diagnostics;
+pub mod explorer_integration;
 pub mod format;
 pub mod i18n;
 pub mod layout_service;
