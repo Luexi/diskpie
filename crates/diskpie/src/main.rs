@@ -37,8 +37,7 @@ use diskpie_platform::{
 use local_diagnostics::{InitialRetentionOutcome, LocalDiagnostics};
 #[cfg(windows)]
 use panic_marker::{
-    CrashMarkerErrorKind, CrashRuntime, DiagnosticsQuiescenceReceipt, RuntimeQuiescenceReceipt,
-    ShutdownQuiescenceProof,
+    CrashMarkerErrorKind, CrashRuntime, RuntimeQuiescenceReceipt, ShutdownQuiescenceProof,
 };
 
 /// What happened to this session's crash marker at exit.
@@ -340,7 +339,12 @@ impl WindowsStartupServices {
     /// then reconciles the crash marker with a proof minted from that join.
     ///
     /// Without a completed diagnostics finish there is no proof: the runtime
-    /// is dropped, which preserves every marker state by construction.
+    /// is dropped, which preserves every marker state by construction. That
+    /// deliberately includes a session whose diagnostics never started: no
+    /// worker exists to join, but there is also no receipt to certify it, so
+    /// a marker from a caught worker panic stays on disk and the next start
+    /// records `panic.marker_found`. A "diagnostics never started" receipt
+    /// would be mintable without any join and is therefore not offered.
     fn finish(self) -> CrashMarkerFinish {
         let Self { diagnostics, crash_runtime, .. } = self;
         let diagnostics_receipt = diagnostics.and_then(|diagnostics| {
@@ -358,7 +362,9 @@ impl WindowsStartupServices {
                 ));
             }
             diagnostics.record(application_event(DiagnosticCode::AppStopped));
-            DiagnosticsQuiescenceReceipt::from_finish_status(diagnostics.finish().status)
+            // The receipt is minted inside `LocalDiagnostics::finish` from
+            // the worker's own completion message and cannot be built here.
+            diagnostics.finish().quiescence
         });
 
         let Some(runtime) = crash_runtime else {

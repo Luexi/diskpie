@@ -30,6 +30,9 @@ use std::{
     io::{self, Read, Write},
 };
 
+#[cfg(windows)]
+use crate::local_diagnostics::DiagnosticsQuiescenceReceipt;
+
 /// Maximum size of a complete panic marker, in bytes.
 pub const MAX_MARKER_BYTES: usize = 4 * 1024;
 
@@ -353,6 +356,9 @@ pub(crate) struct MarkerSnapshot {
 }
 
 impl MarkerSnapshot {
+    /// Only the Windows bridge and the tests build snapshots from raw slot
+    /// bytes; other targets have no native store.
+    #[cfg(any(windows, test))]
     pub(crate) fn from_bytes(bytes: Vec<u8>) -> Result<Self, MarkerStoreFailure> {
         if bytes.len() > MAX_MARKER_BYTES {
             return Err(MarkerStoreFailure::new(MarkerStoreFailureKind::MarkerTooLarge, None));
@@ -460,12 +466,17 @@ pub(crate) trait PreparedMarkerCapability:
     fn commit(&self, contents: &[u8]) -> MarkerCommitResult;
 
     /// Reconciles only the expected session marker after shutdown quiescence.
-    /// `AtomicFileIdentity` implementations must make the identity check and
-    /// mutation one native conditional operation, and must conditionally clean
-    /// an owned sibling without touching any other token or file identity. The
-    /// bridge must flush explicitly and must not use unsupported
-    /// `REPLACEFILE_WRITE_THROUGH`. Any post-operation uncertainty returns
-    /// `PreservedUncertain` and preserves every known complete copy.
+    /// `AtomicFileIdentity` implementations must check identity and token on
+    /// a retained handle that pins the object against unlink and replacement,
+    /// must apply `Delete` to that very inspected object as one native
+    /// conditional operation, and may apply `Restore` only by an atomic
+    /// rename over the pinned object immediately after releasing that pin;
+    /// the adapter must document any residual window of that release. They
+    /// must conditionally clean an owned sibling without touching any other
+    /// token or file identity. The bridge must flush explicitly and must not
+    /// use unsupported `REPLACEFILE_WRITE_THROUGH`. Any post-operation
+    /// uncertainty returns `PreservedUncertain` and preserves every known
+    /// complete copy.
     fn reconcile_if_owned(
         &self,
         expected_owner: SessionToken,
@@ -635,7 +646,8 @@ fn classify_recovery(
 /// The bridge forwards the two fixed paths exactly once during preparation.
 /// Afterwards it holds no path: commit, reconciliation, and explicit deletion
 /// operate on the handles, identities, and precomputed buffers retained by
-/// [`WindowsMarkerSession`]. The bridge contains no `unsafe` code.
+/// [`WindowsMarkerSession`](diskpie_platform::WindowsMarkerSession). The
+/// bridge contains no `unsafe` code.
 #[cfg(windows)]
 mod native {
     use std::{path::Path, sync::Arc};
@@ -724,9 +736,11 @@ mod native {
             ReplacementSemantics::AtomicVisibility
         }
 
-        /// The session mutates only the object whose retained handle carries
-        /// the identity it committed and whose bytes carry the expected token,
-        /// and classifies the result from post-operation identities.
+        /// The session checks identity and token on a handle opened without
+        /// delete sharing, deletes through that very handle, and restores by
+        /// an atomic rename issued immediately after releasing it (Windows
+        /// has no compare-and-rename; the platform documents that single-call
+        /// window). Results are classified from post-operation identities.
         fn ownership_reconciliation(&self) -> OwnershipReconciliation {
             OwnershipReconciliation::AtomicFileIdentity
         }
@@ -1020,20 +1034,35 @@ pub struct CrashRuntime {
 /// production constructor is [`Self::from_receipts`], which demands one typed
 /// receipt per owned worker family; a receipt can only be minted from real
 /// join evidence. A detached provider invalidates any future proof.
+///
+/// Only the Windows composition root and the tests coordinate a shutdown,
+/// so the proof and its receipts exist on no other target.
+#[cfg(any(windows, test))]
 #[derive(Debug)]
 pub(crate) struct ShutdownQuiescenceProof {
     _private: (),
 }
 
+#[cfg(any(windows, test))]
 impl ShutdownQuiescenceProof {
     /// Assembles the proof from the receipts of every worker family the
     /// composition root owns. Adding a worker family means adding a receipt
     /// parameter here, so a caller cannot forget new evidence silently.
+    ///
+    /// The diagnostics receipt is minted only by
+    /// [`LocalDiagnostics::finish`](crate::local_diagnostics::LocalDiagnostics::finish)
+    /// when the worker guard received the worker's own completion message;
+    /// `HandedOff` and `WorkerFailed` leave a thread that may still run (or
+    /// may have died panicking) under the process-wide reaper and never carry
+    /// one, so the crash runtime is dropped and the marker is preserved.
+    #[cfg(windows)]
     pub(crate) const fn from_receipts(
         diagnostics: DiagnosticsQuiescenceReceipt,
         runtime: RuntimeQuiescenceReceipt,
     ) -> Self {
-        let DiagnosticsQuiescenceReceipt { _private: () } = diagnostics;
+        // The receipts are consumed, not inspected: their private fields are
+        // the evidence, and only their minting modules can produce them.
+        let _joined_diagnostics_worker = diagnostics;
         let RuntimeQuiescenceReceipt { _private: () } = runtime;
         Self { _private: () }
     }
@@ -1041,31 +1070,6 @@ impl ShutdownQuiescenceProof {
     #[cfg(test)]
     const fn for_test() -> Self {
         Self { _private: () }
-    }
-}
-
-/// Receipt that the local diagnostics worker drained, flushed, and reported
-/// completion inside its bounded `finish`.
-///
-/// `HandedOff` and `WorkerFailed` leave a thread that may still run (or may
-/// have died panicking) under the process-wide reaper; neither mints a
-/// receipt, so the crash runtime is dropped and the marker is preserved.
-#[derive(Debug)]
-pub(crate) struct DiagnosticsQuiescenceReceipt {
-    _private: (),
-}
-
-impl DiagnosticsQuiescenceReceipt {
-    /// Mints a receipt only from a completed bounded finish.
-    #[cfg(windows)]
-    pub(crate) const fn from_finish_status(
-        status: crate::local_diagnostics::DiagnosticsFinishStatus,
-    ) -> Option<Self> {
-        use crate::local_diagnostics::DiagnosticsFinishStatus;
-        match status {
-            DiagnosticsFinishStatus::Completed => Some(Self { _private: () }),
-            DiagnosticsFinishStatus::HandedOff | DiagnosticsFinishStatus::WorkerFailed => None,
-        }
     }
 }
 
@@ -1078,11 +1082,13 @@ impl DiagnosticsQuiescenceReceipt {
 /// those services MUST replace [`Self::no_runtime_composed`] with a
 /// constructor that consumes the joined receipts of every runtime worker;
 /// keeping the placeholder after that point would forge quiescence.
+#[cfg(windows)]
 #[derive(Debug)]
 pub(crate) struct RuntimeQuiescenceReceipt {
     _private: (),
 }
 
+#[cfg(windows)]
 impl RuntimeQuiescenceReceipt {
     /// Evidence that no scan/layout/Shell runtime was ever started in this
     /// process. Valid only while the executable composes none of them.
@@ -1236,6 +1242,7 @@ impl CrashRuntime {
     /// The proof must come from the composite shutdown coordinator after every
     /// panic-capable worker has stopped. Without it there is no cleanup API;
     /// dropping the runtime preserves all marker state.
+    #[cfg(any(windows, test))]
     pub(crate) fn finish_clean(
         self,
         _proof: ShutdownQuiescenceProof,
@@ -2604,7 +2611,6 @@ mod tests {
     #[cfg(windows)]
     mod native_bridge {
         use super::*;
-        use crate::local_diagnostics::DiagnosticsFinishStatus;
         use crate::panic_marker::native::{WindowsMarkerStore, failure_from_native};
         use diskpie_platform::{
             DiagnosticFileError, DiagnosticFileErrorKind, DiagnosticFileOperation,
@@ -2823,28 +2829,6 @@ mod tests {
         }
 
         #[test]
-        fn quiescence_receipts_are_minted_only_from_a_completed_finish() {
-            assert!(
-                DiagnosticsQuiescenceReceipt::from_finish_status(
-                    DiagnosticsFinishStatus::Completed
-                )
-                .is_some()
-            );
-            assert!(
-                DiagnosticsQuiescenceReceipt::from_finish_status(
-                    DiagnosticsFinishStatus::HandedOff
-                )
-                .is_none()
-            );
-            assert!(
-                DiagnosticsQuiescenceReceipt::from_finish_status(
-                    DiagnosticsFinishStatus::WorkerFailed
-                )
-                .is_none()
-            );
-        }
-
-        #[test]
         #[ignore = "subprocess helper"]
         fn subprocess_child_records_native_redacted_marker() {
             let crashes = PathBuf::from(
@@ -2919,6 +2903,11 @@ mod tests {
             panic!("{PRIVATE_PAYLOAD_SENTINEL}");
         }
 
+        /// The child panics on the libtest worker thread that installed the
+        /// hook (its `thread_role=main`), not on the process main thread; the
+        /// non-success exit comes from libtest's failure accounting, which
+        /// only happens because the hook returned instead of swallowing the
+        /// panic.
         #[test]
         fn subprocess_native_hook_does_not_swallow_the_panic() {
             let directory = TestDirectory::new("native-subprocess-main");
@@ -2927,7 +2916,10 @@ mod tests {
                 directory.path(),
                 directory.path(),
             );
-            assert!(!status.success(), "the hook returns and the panic still fails the process");
+            assert!(
+                !status.success(),
+                "the hook returns and libtest still reports the installing thread's panic"
+            );
 
             let preview = preview_marker(directory.path())
                 .expect("marker is readable")

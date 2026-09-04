@@ -105,6 +105,21 @@ pub enum DiagnosticsFinishStatus {
 pub struct DiagnosticsFinishOutcome {
     pub status: DiagnosticsFinishStatus,
     pub counters: DiagnosticCounters,
+    /// Present only when the owned worker reported completion inside the
+    /// bounded finish; `HandedOff` and `WorkerFailed` never carry one.
+    pub quiescence: Option<DiagnosticsQuiescenceReceipt>,
+}
+
+/// Receipt that the diagnostics worker drained, flushed, dropped its writer,
+/// and reported completion inside [`LocalDiagnostics::finish`].
+///
+/// The private field keeps the receipt mintable only by `finish` from the
+/// worker's own completion message, never from a bare
+/// [`DiagnosticsFinishStatus`] value. The crash-marker shutdown proof
+/// consumes it as the diagnostics worker family's join evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiagnosticsQuiescenceReceipt {
+    _private: (),
 }
 
 /// Owns the asynchronous writer guard and bounded health counters.
@@ -172,12 +187,17 @@ impl LocalDiagnostics {
     }
 
     /// Attempts an orderly drain and flush for a fixed, bounded duration.
+    ///
+    /// The quiescence receipt is minted here and nowhere else, and only when
+    /// the worker guard observed the worker's own completion message. A
+    /// diagnostics value that never attached a guard reports completion
+    /// without a receipt: there is no join evidence to certify.
     pub fn finish(mut self) -> DiagnosticsFinishOutcome {
-        let status = self.guard.as_mut().map_or(DiagnosticsFinishStatus::Completed, |guard| {
-            guard.finish(DIAGNOSTICS_FINISH_TIMEOUT)
-        });
-        self.guard.take();
-        DiagnosticsFinishOutcome { status, counters: self.counters() }
+        let GuardFinish { status, quiescence } = match self.guard.take() {
+            Some(mut guard) => guard.finish(DIAGNOSTICS_FINISH_TIMEOUT),
+            None => GuardFinish { status: DiagnosticsFinishStatus::Completed, quiescence: None },
+        };
+        DiagnosticsFinishOutcome { status, counters: self.counters(), quiescence }
     }
 }
 
@@ -452,19 +472,31 @@ struct DiagnosticsWorkerGuard {
     released: Arc<AtomicBool>,
 }
 
+/// Result of one bounded guard finish; the receipt exists only when the
+/// worker's completion message was received.
+struct GuardFinish {
+    status: DiagnosticsFinishStatus,
+    quiescence: Option<DiagnosticsQuiescenceReceipt>,
+}
+
 impl DiagnosticsWorkerGuard {
-    fn finish(&mut self, timeout: Duration) -> DiagnosticsFinishStatus {
+    fn finish(&mut self, timeout: Duration) -> GuardFinish {
         self.owner.take();
-        let status = match self.completion.recv_timeout(timeout) {
-            Ok(WorkerExit::Completed) => DiagnosticsFinishStatus::Completed,
-            Err(RecvTimeoutError::Disconnected) => DiagnosticsFinishStatus::WorkerFailed,
+        let finish = match self.completion.recv_timeout(timeout) {
+            Ok(WorkerExit::Completed) => GuardFinish {
+                status: DiagnosticsFinishStatus::Completed,
+                quiescence: Some(DiagnosticsQuiescenceReceipt { _private: () }),
+            },
+            Err(RecvTimeoutError::Disconnected) => {
+                GuardFinish { status: DiagnosticsFinishStatus::WorkerFailed, quiescence: None }
+            }
             Err(RecvTimeoutError::Timeout) => {
                 self.cancel.store(true, Ordering::Release);
-                DiagnosticsFinishStatus::HandedOff
+                GuardFinish { status: DiagnosticsFinishStatus::HandedOff, quiescence: None }
             }
         };
         self.released.store(true, Ordering::Release);
-        status
+        finish
     }
 }
 
@@ -1094,7 +1126,13 @@ mod tests {
     }
 
     fn finish_test_worker(mut guard: DiagnosticsWorkerGuard) -> DiagnosticsFinishStatus {
-        guard.finish(Duration::from_secs(2))
+        let GuardFinish { status, quiescence } = guard.finish(Duration::from_secs(2));
+        assert_eq!(
+            quiescence.is_some(),
+            status == DiagnosticsFinishStatus::Completed,
+            "a quiescence receipt is minted exactly for a completed finish"
+        );
+        status
     }
 
     #[test]
@@ -1299,8 +1337,9 @@ mod tests {
         }
 
         let started = Instant::now();
-        let status = guard.finish(Duration::from_millis(50));
+        let GuardFinish { status, quiescence } = guard.finish(Duration::from_millis(50));
         assert_eq!(status, DiagnosticsFinishStatus::HandedOff);
+        assert!(quiescence.is_none(), "a handed-off worker never yields a receipt");
         assert!(started.elapsed() < Duration::from_millis(500));
         drop(guard);
 
@@ -1323,7 +1362,9 @@ mod tests {
         let (writer, mut guard, _failures) = test_worker(capture);
         let retained_by_subscriber = writer.clone();
 
-        assert_eq!(guard.finish(Duration::from_secs(2)), DiagnosticsFinishStatus::Completed);
+        let GuardFinish { status, quiescence } = guard.finish(Duration::from_secs(2));
+        assert_eq!(status, DiagnosticsFinishStatus::Completed);
+        assert!(quiescence.is_some(), "a completed finish mints the quiescence receipt");
         assert!(retained_by_subscriber.owner.upgrade().is_none());
         let before = retained_by_subscriber.dropped_lines();
         retained_by_subscriber.submit(b"after-disconnect\n");
