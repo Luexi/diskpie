@@ -334,10 +334,14 @@ impl SunburstLayout {
         &self.rings
     }
 
-    /// Direct children skipped because their selected known-byte weight is zero.
+    /// Direct children of the zoom root skipped because their selected
+    /// known-byte weight is zero.
     ///
     /// This includes fully unknown children, which cannot receive a meaningful
     /// angle but remain available to a synchronized textual representation.
+    /// Only the zoom root's own children are recorded, and at most
+    /// [`LayoutOptions::max_sectors`] of them, so the list is bounded by the
+    /// same budget as the geometry regardless of directory width.
     #[must_use]
     pub fn zero_weight_nodes(&self) -> &[NodeId] {
         &self.zero_weight_nodes
@@ -658,7 +662,7 @@ pub fn compute_layout(
             options.size_basis,
             hidden_branches,
             parent.node_id,
-            &mut zero_weight_nodes,
+            (parent.depth == 0).then_some((&mut zero_weight_nodes, options.max_sectors)),
         )?;
         if children.is_empty() {
             continue;
@@ -805,7 +809,7 @@ fn collect_children(
     size_basis: SizeBasis,
     hidden_branches: &HiddenBranches,
     parent: NodeId,
-    zero_weight_nodes: &mut Vec<NodeId>,
+    mut zero_weight_sink: Option<(&mut Vec<NodeId>, usize)>,
 ) -> Result<Vec<ChildCandidate>, LayoutError> {
     let children =
         snapshot.children(parent).map_err(|_| LayoutError::InvalidTreeLink { parent })?;
@@ -813,7 +817,11 @@ fn collect_children(
     for (node_id, record) in children {
         let (weight, unknown_entries) = selected_size(record, size_basis);
         if weight == 0 {
-            zero_weight_nodes.push(node_id);
+            if let Some((sink, cap)) = zero_weight_sink.as_mut()
+                && sink.len() < *cap
+            {
+                sink.push(node_id);
+            }
         } else {
             candidates.push(ChildCandidate {
                 node_id,
@@ -1157,6 +1165,33 @@ mod tests {
         assert_eq!(sector_for(&layout, leaf).depth, 1);
         assert!(!layout.sectors().iter().any(|sector| sector.node_id == Some(root)));
         assert!(!layout.sectors().iter().any(|sector| sector.node_id == Some(outside)));
+    }
+
+    #[test]
+    fn zero_weight_list_is_scoped_to_the_zoom_root_and_capped() {
+        let mut builder = TreeBuilder::new(GenerationId::new(31));
+        let root = builder.add_root(NodeSpec::root("root")).unwrap();
+        let branch = builder.add_child(root, NodeSpec::directory("branch")).unwrap();
+        let _weight = builder.add_child(branch, file("weight", 5, 5)).unwrap();
+        let deep_zero = builder.add_child(branch, file("deep-zero", 0, 0)).unwrap();
+        let mut root_zeros = Vec::new();
+        for index in 0..6 {
+            root_zeros.push(builder.add_child(root, file(&format!("zero-{index}"), 0, 0)).unwrap());
+        }
+        let snapshot = builder.freeze().unwrap();
+
+        let mut capped = options(root);
+        capped.max_sectors = 4;
+        let layout = compute_layout(&snapshot, capped, &HiddenBranches::new()).unwrap();
+        assert_eq!(layout.zero_weight_nodes().len(), 4, "capped by max_sectors");
+        assert!(layout.zero_weight_nodes().iter().all(|node| root_zeros.contains(node)));
+        assert!(
+            !layout.zero_weight_nodes().contains(&deep_zero),
+            "children below the zoom root are not recorded"
+        );
+
+        let zoomed = compute_layout(&snapshot, options(branch), &HiddenBranches::new()).unwrap();
+        assert_eq!(zoomed.zero_weight_nodes(), &[deep_zero]);
     }
 
     #[test]
