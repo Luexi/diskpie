@@ -178,21 +178,16 @@ enum Notice {
 /// `DialogEvent` is converted into this before anything else looks at it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PickerEvent {
-    Selected {
-        request_id: u64,
-        path: PathBuf,
-    },
-    Cancelled {
-        request_id: u64,
-    },
+    /// The user chose a folder. `cleanup_failed` marks a dialog whose
+    /// post-session privacy cleanup failed; the selection still stands and the
+    /// failure is only recorded.
+    Selected { request_id: u64, path: PathBuf, cleanup_failed: bool },
+    /// The user dismissed the dialog; `cleanup_failed` as for `Selected`.
+    Cancelled { request_id: u64, cleanup_failed: bool },
     /// The dialog could not complete. `class` is derived from the adapter's
     /// typed failure stage; `degraded` marks a dialog that did complete but
     /// whose privacy cleanup failed afterwards.
-    Failed {
-        request_id: u64,
-        class: ErrorClass,
-        degraded: bool,
-    },
+    Failed { request_id: u64, class: ErrorClass, degraded: bool },
 }
 
 impl PickerEvent {
@@ -200,7 +195,7 @@ impl PickerEvent {
     pub const fn request_id(&self) -> u64 {
         match self {
             Self::Selected { request_id, .. }
-            | Self::Cancelled { request_id }
+            | Self::Cancelled { request_id, .. }
             | Self::Failed { request_id, .. } => *request_id,
         }
     }
@@ -484,6 +479,15 @@ impl DiskPieShell {
             return;
         }
         self.flow.dialog_finished(request_id);
+        if matches!(
+            event,
+            PickerEvent::Selected { cleanup_failed: true, .. }
+                | PickerEvent::Cancelled { cleanup_failed: true, .. }
+        ) {
+            // The dialog completed; only its privacy cleanup failed. Record
+            // the degraded outcome without changing what the user did.
+            self.diagnostics.emit(shell_failed_event(request_id, ErrorClass::Io, true));
+        }
         match event {
             PickerEvent::Selected { path, .. } => self.request_scan_paths(vec![path]),
             PickerEvent::Cancelled { .. } => {
@@ -2084,8 +2088,12 @@ const LOCATION_SEPARATOR: &str = " · ";
 fn picker_event(event: DialogEvent) -> PickerEvent {
     let request_id = event.request_id().get();
     match event {
-        DialogEvent::Selected { path, .. } => PickerEvent::Selected { request_id, path },
-        DialogEvent::Cancelled { .. } => PickerEvent::Cancelled { request_id },
+        DialogEvent::Selected { path, cleanup_hresult, .. } => {
+            PickerEvent::Selected { request_id, path, cleanup_failed: cleanup_hresult.is_some() }
+        }
+        DialogEvent::Cancelled { cleanup_hresult, .. } => {
+            PickerEvent::Cancelled { request_id, cleanup_failed: cleanup_hresult.is_some() }
+        }
         DialogEvent::Failed { error, .. } => PickerEvent::Failed {
             request_id,
             class: dialog_error_class(&error),
@@ -2964,15 +2972,19 @@ mod tests {
         // A dismissed dialog restores the phase text; a stale event is ignored.
         shell.flow.dialog_submitted(2);
         shell.notice = Notice::Message(MessageId::Choosing);
-        shell.handle_picker_event(PickerEvent::Cancelled { request_id: 1 });
+        shell.handle_picker_event(PickerEvent::Cancelled { request_id: 1, cleanup_failed: false });
         assert_eq!(shell.scan_state(), ScanUi::Choosing, "stale event must not close the dialog");
-        shell.handle_picker_event(PickerEvent::Cancelled { request_id: 2 });
+        shell.handle_picker_event(PickerEvent::Cancelled { request_id: 2, cleanup_failed: true });
         assert_eq!(shell.scan_state(), ScanUi::Complete);
         assert_eq!(shell.notice, Notice::Message(MessageId::Complete));
 
         // A selection goes through the resolver and starts generation 2.
         shell.flow.dialog_submitted(3);
-        shell.handle_picker_event(PickerEvent::Selected { request_id: 3, path: fixture_root() });
+        shell.handle_picker_event(PickerEvent::Selected {
+            request_id: 3,
+            path: fixture_root(),
+            cleanup_failed: false,
+        });
         assert_eq!(shell.scan_state(), ScanUi::Resolving);
         pump_until(&mut shell, &ctx, "the second scan to complete", |shell| {
             shell.scan_state() == ScanUi::Complete

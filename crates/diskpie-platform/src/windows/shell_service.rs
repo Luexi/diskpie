@@ -466,22 +466,41 @@ impl Error for DialogError {}
 /// Terminal, owned result of a Shell request.
 #[derive(Clone, Eq, PartialEq)]
 pub enum DialogEvent {
-    Selected { request_id: DialogRequestId, path: PathBuf },
-    Cancelled { request_id: DialogRequestId },
-    Failed { request_id: DialogRequestId, error: DialogError },
+    /// The user chose a folder. `cleanup_hresult` is set when the dialog's
+    /// post-session privacy cleanup (`ClearClientData`) failed afterwards;
+    /// the selection itself stands.
+    Selected {
+        request_id: DialogRequestId,
+        path: PathBuf,
+        cleanup_hresult: Option<i32>,
+    },
+    /// The user dismissed the dialog. `cleanup_hresult` has the same meaning
+    /// as for `Selected`; a failed cleanup never turns a dismissal into a
+    /// failure.
+    Cancelled {
+        request_id: DialogRequestId,
+        cleanup_hresult: Option<i32>,
+    },
+    Failed {
+        request_id: DialogRequestId,
+        error: DialogError,
+    },
 }
 
 impl fmt::Debug for DialogEvent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Selected { request_id, .. } => formatter
+            Self::Selected { request_id, cleanup_hresult, .. } => formatter
                 .debug_struct("Selected")
                 .field("request_id", request_id)
                 .field("path_present", &true)
+                .field("cleanup_failed", &cleanup_hresult.is_some())
                 .finish(),
-            Self::Cancelled { request_id } => {
-                formatter.debug_struct("Cancelled").field("request_id", request_id).finish()
-            }
+            Self::Cancelled { request_id, cleanup_hresult } => formatter
+                .debug_struct("Cancelled")
+                .field("request_id", request_id)
+                .field("cleanup_failed", &cleanup_hresult.is_some())
+                .finish(),
             Self::Failed { request_id, error } => formatter
                 .debug_struct("Failed")
                 .field("request_id", request_id)
@@ -496,7 +515,7 @@ impl DialogEvent {
     pub const fn request_id(&self) -> DialogRequestId {
         match self {
             Self::Selected { request_id, .. }
-            | Self::Cancelled { request_id }
+            | Self::Cancelled { request_id, .. }
             | Self::Failed { request_id, .. } => *request_id,
         }
     }
@@ -1478,8 +1497,12 @@ fn execute_request(queued: QueuedRequest) -> ShellEvent {
     match request {
         ShellRequest::PickFolder(request) => {
             ShellEvent::Dialog(match show_folder_dialog(request.owner) {
-                Ok(DialogOutcome::Selected(path)) => DialogEvent::Selected { request_id: id, path },
-                Ok(DialogOutcome::Cancelled) => DialogEvent::Cancelled { request_id: id },
+                Ok((DialogOutcome::Selected(path), cleanup_hresult)) => {
+                    DialogEvent::Selected { request_id: id, path, cleanup_hresult }
+                }
+                Ok((DialogOutcome::Cancelled, cleanup_hresult)) => {
+                    DialogEvent::Cancelled { request_id: id, cleanup_hresult }
+                }
                 Err(error) => DialogEvent::Failed { request_id: id, error },
             })
         }
@@ -1545,7 +1568,9 @@ fn cancelled_before_start_event(meta: RequestMeta) -> ShellEvent {
     let request_id = meta.id;
     let not_run = DispatchOutcome::not_run(DispatchStage::CancelledBeforeDispatch);
     match meta.kind {
-        ShellRequestKind::PickFolder => ShellEvent::Dialog(DialogEvent::Cancelled { request_id }),
+        ShellRequestKind::PickFolder => {
+            ShellEvent::Dialog(DialogEvent::Cancelled { request_id, cleanup_hresult: None })
+        }
         ShellRequestKind::Open => ShellEvent::Open { request_id, outcome: not_run },
         ShellRequestKind::Reveal => ShellEvent::Reveal { request_id, outcome: not_run },
         ShellRequestKind::InstalledApps => {
@@ -1695,7 +1720,7 @@ enum DialogOutcome {
     Cancelled,
 }
 
-fn show_folder_dialog(owner: OwnerWindow) -> Result<DialogOutcome, DialogError> {
+fn show_folder_dialog(owner: OwnerWindow) -> Result<(DialogOutcome, Option<i32>), DialogError> {
     // SAFETY: COM is initialized as an STA on this thread. `dialog` never
     // leaves this function/thread and its projection releases it on return.
     let dialog: IFileOpenDialog =
@@ -1744,7 +1769,7 @@ where
     fn finish(
         mut self,
         outcome: Result<DialogOutcome, DialogError>,
-    ) -> Result<DialogOutcome, DialogError> {
+    ) -> Result<(DialogOutcome, Option<i32>), DialogError> {
         let cleanup = (self.cleanup)();
         self.armed = false;
         merge_dialog_cleanup(outcome, cleanup)
@@ -1763,15 +1788,20 @@ where
     }
 }
 
+/// Combines the dialog outcome with the result of its privacy cleanup.
+///
+/// A completed dialog keeps its outcome: the user's selection or dismissal is
+/// a fact the cleanup cannot undo, so a failed `ClearClientData` travels
+/// beside it as `cleanup_hresult` for diagnostics instead of replacing it.
+/// A failed dialog keeps its primary error and records the cleanup failure
+/// on it.
 fn merge_dialog_cleanup(
     outcome: Result<DialogOutcome, DialogError>,
     cleanup: Result<(), i32>,
-) -> Result<DialogOutcome, DialogError> {
+) -> Result<(DialogOutcome, Option<i32>), DialogError> {
     match (outcome, cleanup) {
-        (Ok(outcome), Ok(())) => Ok(outcome),
-        (Ok(_), Err(cleanup_hresult)) => {
-            Err(DialogError::from_hresult(DialogErrorStage::ClearClientData, cleanup_hresult))
-        }
+        (Ok(outcome), Ok(())) => Ok((outcome, None)),
+        (Ok(outcome), Err(cleanup_hresult)) => Ok((outcome, Some(cleanup_hresult))),
         (Err(error), Ok(())) => Err(error),
         (Err(error), Err(cleanup_hresult)) => Err(error.with_cleanup_hresult(cleanup_hresult)),
     }
@@ -1926,6 +1956,7 @@ mod tests {
             CompletedRequest {
                 event: ShellEvent::Dialog(DialogEvent::Cancelled {
                     request_id: DialogRequestId(1),
+                    cleanup_hresult: None,
                 }),
                 was_modal: true,
             },
@@ -1938,7 +1969,10 @@ mod tests {
         let completed = event_rx.try_recv().expect("completion is queued");
         assert_eq!(
             deliver_completed_request(&shared, completed),
-            ShellEvent::Dialog(DialogEvent::Cancelled { request_id: DialogRequestId(1) })
+            ShellEvent::Dialog(DialogEvent::Cancelled {
+                request_id: DialogRequestId(1),
+                cleanup_hresult: None
+            })
         );
         assert!(!shared.modal_outstanding.load(Ordering::Acquire));
         assert_eq!(try_enqueue_request(&request_tx, &shared.modal_outstanding, queued(3)), Ok(()));
@@ -2065,7 +2099,12 @@ mod tests {
         );
         assert_eq!(
             merge_dialog_cleanup(Ok(DialogOutcome::Cancelled), Err(cleanup_hresult)),
-            Err(DialogError::from_hresult(DialogErrorStage::ClearClientData, cleanup_hresult))
+            Ok((DialogOutcome::Cancelled, Some(cleanup_hresult))),
+            "a dismissed dialog stays dismissed; the cleanup failure rides alongside"
+        );
+        assert_eq!(
+            merge_dialog_cleanup(Ok(DialogOutcome::Cancelled), Ok(())),
+            Ok((DialogOutcome::Cancelled, None))
         );
     }
 
@@ -2076,7 +2115,10 @@ mod tests {
             normal_calls.set(normal_calls.get() + 1);
             Ok(())
         });
-        assert_eq!(guard.finish(Ok(DialogOutcome::Cancelled)), Ok(DialogOutcome::Cancelled));
+        assert_eq!(
+            guard.finish(Ok(DialogOutcome::Cancelled)),
+            Ok((DialogOutcome::Cancelled, None))
+        );
         assert_eq!(normal_calls.get(), 1);
 
         let unwind_calls = Cell::new(0_u8);
@@ -2096,11 +2138,13 @@ mod tests {
         let event = DialogEvent::Selected {
             request_id: DialogRequestId(41),
             path: PathBuf::from(r"C:\private\customer-name"),
+            cleanup_hresult: Some(HRESULT::from_win32(5).0),
         };
 
         let rendered = format!("{event:?}");
         assert!(rendered.contains("request_id"));
         assert!(rendered.contains("path_present: true"));
+        assert!(rendered.contains("cleanup_failed: true"));
         assert!(!rendered.contains("private"));
         assert!(!rendered.contains("customer-name"));
     }
