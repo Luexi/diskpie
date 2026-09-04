@@ -140,7 +140,6 @@ fn options(worker_count: usize) -> ScanOptions {
         batch_entries: 2,
         result_capacity: 4,
         event_capacity: 32,
-        cancellation_check_interval: 1,
         flush_interval: Duration::from_secs(10),
         backpressure_park: Duration::from_millis(1),
         coordinator_poll: Duration::from_millis(1),
