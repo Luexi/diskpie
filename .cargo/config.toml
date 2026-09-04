@@ -1,0 +1,11 @@
+# Release CRT linkage adopted by ADR 0011 (addendum 2026-09-03): link the MSVC
+# C runtime statically so the portable diskpie.exe imports no VCRUNTIME*,
+# MSVCP*, or api-ms-win-crt-* DLL and needs no Visual C++ Redistributable.
+#
+# Cargo replaces (never merges) these flags whenever RUSTFLAGS or
+# CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS is set, so any workflow that
+# sets either must re-include "-C target-feature=+crt-static"; the release
+# import-list gate is the backstop. Do not add --remap-path-prefix here: it
+# needs an absolute checkout path and belongs to the release workflow (ADR 0012).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
