@@ -5,9 +5,13 @@
 //! HWND wrappers are constructed and destroyed on that thread. Only owned,
 //! plain-data requests and events cross the channel boundary.
 //!
-//! This first slice implements the folder picker. Future Shell actions can be
-//! added to [`ShellRequest`] while retaining the apartment, queue, message-pump,
-//! and shutdown machinery in this module.
+//! [`ShellRequest`] covers the folder picker, open/reveal/Installed Apps
+//! activation, the advisory Recycle Bin query, and the destructive recycle,
+//! permanent-delete, and empty-bin actions. Destructive variants can only be
+//! built from a consumed ADR 0008 capability. Every request has one terminal
+//! [`ShellEvent`]; the native work itself lives in [`super::shell_actions`].
+//! A queued request can be cancelled with [`ShellService::cancel`]; the same
+//! flag is read cooperatively by the file-operation progress sink.
 //!
 //! Shutdown is bounded. [`ShellService::request_shutdown`] never waits,
 //! [`ShellService::finish`] waits at most a caller-supplied deadline, and
@@ -18,6 +22,16 @@
 //! service fails closed: the claim is never released and no further Shell STA
 //! can start in this process.
 
+use super::shell_actions::{
+    DeleteJob, DispatchOutcome, DispatchStage, NativeShell, RecycleBinQueryOutcome,
+    empty_recycle_bin, open_installed_apps, open_item, query_recycle_bin, reveal_item, run_delete,
+};
+use diskpie_app::actions::{
+    Confirmed, DeleteMode, DeleteRequest, DestructiveOutcome, EmptyBinOutcome,
+    EmptyRecycleBinRequest, FailureStage, OpenItem, PendingObligation, RecycleBinScope,
+    RecycleRequest, RevealItem, StronglyConfirmed, TargetKind,
+};
+use diskpie_core::FileIdentity;
 use std::{
     error::Error,
     ffi::{OsString, c_void},
@@ -105,9 +119,12 @@ fn process_registry() -> Arc<ShellInstanceRegistry> {
     Arc::clone(PROCESS_REGISTRY.get_or_init(|| Arc::new(ShellInstanceRegistry::new())))
 }
 
-/// Correlates a request with exactly one terminal dialog event.
+/// Correlates a request with exactly one terminal [`ShellEvent`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DialogRequestId(u64);
+
+/// Alias reflecting that every Shell request kind shares the identifier space.
+pub type ShellRequestId = DialogRequestId;
 
 impl DialogRequestId {
     /// Returns the process-local numeric request identifier.
@@ -151,18 +168,235 @@ pub struct FolderDialogRequest {
     pub owner: OwnerWindow,
 }
 
-/// Work accepted by the dedicated Shell STA.
+/// Activate one real item with the fixed `open` verb.
+#[derive(Eq, PartialEq)]
+pub struct OpenRequest {
+    owner: OwnerWindow,
+    path: PathBuf,
+}
+
+impl fmt::Debug for OpenRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpenRequest")
+            .field("owner", &self.owner)
+            .field("path_present", &true)
+            .finish()
+    }
+}
+
+/// Reveal one real item in its parent Explorer window.
+#[derive(Eq, PartialEq)]
+pub struct RevealRequest {
+    path: PathBuf,
+}
+
+impl fmt::Debug for RevealRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("RevealRequest").field("path_present", &true).finish()
+    }
+}
+
+/// Open the modern Installed Apps settings page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InstalledAppsRequest {
+    pub owner: OwnerWindow,
+}
+
+/// Non-destructive advisory Recycle Bin estimate for one scope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecycleBinQueryRequest {
+    pub scope: RecycleBinScope,
+}
+
+/// Recycle or permanently delete one confirmed target.
+///
+/// Only [`ShellRequest::recycle`] and [`ShellRequest::delete_permanently`]
+/// build this from a consumed capability; it carries exactly what the STA
+/// needs and nothing the UI could forge.
+#[derive(Eq, PartialEq)]
+pub struct DeleteShellRequest {
+    owner: OwnerWindow,
+    path: PathBuf,
+    kind: TargetKind,
+    identity: Option<FileIdentity>,
+    mode: DeleteMode,
+}
+
+impl DeleteShellRequest {
+    #[must_use]
+    pub const fn kind(&self) -> TargetKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> Option<FileIdentity> {
+        self.identity
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> DeleteMode {
+        self.mode
+    }
+}
+
+impl fmt::Debug for DeleteShellRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeleteShellRequest")
+            .field("owner", &self.owner)
+            .field("kind", &self.kind)
+            .field("identity", &self.identity)
+            .field("mode", &self.mode)
+            .field("path_present", &true)
+            .finish()
+    }
+}
+
+/// Empty exactly the strongly confirmed Recycle Bin scope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmptyBinShellRequest {
+    owner: OwnerWindow,
+    scope: RecycleBinScope,
+}
+
+impl EmptyBinShellRequest {
+    #[must_use]
+    pub const fn scope(&self) -> &RecycleBinScope {
+        &self.scope
+    }
+}
+
+/// Payload-free request identity used for terminal-event mapping.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ShellRequestKind {
+    PickFolder,
+    Open,
+    Reveal,
+    InstalledApps,
+    QueryRecycleBin,
+    Recycle,
+    DeletePermanently,
+    EmptyRecycleBin,
+}
+
+/// Work accepted by the dedicated Shell STA.
+///
+/// The type is deliberately neither `Clone` nor `Copy`: a destructive request
+/// exists exactly once, like the capability it was built from.
+#[derive(Debug, Eq, PartialEq)]
 pub enum ShellRequest {
     /// Select one existing filesystem folder or drive root.
     PickFolder(FolderDialogRequest),
+    Open(OpenRequest),
+    Reveal(RevealRequest),
+    InstalledApps(InstalledAppsRequest),
+    QueryRecycleBin(RecycleBinQueryRequest),
+    Recycle(DeleteShellRequest),
+    DeletePermanently(DeleteShellRequest),
+    EmptyRecycleBin(EmptyBinShellRequest),
 }
 
 impl ShellRequest {
-    const fn is_modal(self) -> bool {
+    /// Builds an open request from a target validated for opening.
+    #[must_use]
+    pub fn open(owner: OwnerWindow, item: &OpenItem) -> Self {
+        Self::Open(OpenRequest { owner, path: item.target().path().to_path_buf() })
+    }
+
+    /// Builds a reveal request from a target validated for revealing.
+    #[must_use]
+    pub fn reveal(item: &RevealItem) -> Self {
+        Self::Reveal(RevealRequest { path: item.target().path().to_path_buf() })
+    }
+
+    /// Builds the fixed Installed Apps activation.
+    #[must_use]
+    pub const fn installed_apps(owner: OwnerWindow) -> Self {
+        Self::InstalledApps(InstalledAppsRequest { owner })
+    }
+
+    /// Builds the non-destructive advisory Recycle Bin query.
+    #[must_use]
+    pub const fn query_recycle_bin(scope: RecycleBinScope) -> Self {
+        Self::QueryRecycleBin(RecycleBinQueryRequest { scope })
+    }
+
+    /// Consumes a recycle capability; the obligation must be settled afterwards.
+    #[must_use]
+    pub fn recycle(
+        owner: OwnerWindow,
+        capability: Confirmed<RecycleRequest>,
+    ) -> (Self, PendingObligation) {
+        let (request, obligation) = capability.consume();
+        let target = request.target();
+        let request = DeleteShellRequest {
+            owner,
+            path: target.path().to_path_buf(),
+            kind: target.kind(),
+            identity: target.identity(),
+            mode: DeleteMode::Recycle,
+        };
+        (Self::Recycle(request), obligation)
+    }
+
+    /// Consumes a strong deletion capability; the obligation must be settled afterwards.
+    #[must_use]
+    pub fn delete_permanently(
+        owner: OwnerWindow,
+        capability: StronglyConfirmed<DeleteRequest>,
+    ) -> (Self, PendingObligation) {
+        let (request, obligation) = capability.consume();
+        let target = request.target();
+        let request = DeleteShellRequest {
+            owner,
+            path: target.path().to_path_buf(),
+            kind: target.kind(),
+            identity: target.identity(),
+            mode: DeleteMode::Permanent,
+        };
+        (Self::DeletePermanently(request), obligation)
+    }
+
+    /// Consumes a strong empty-bin capability; the obligation must be settled afterwards.
+    #[must_use]
+    pub fn empty_recycle_bin(
+        owner: OwnerWindow,
+        capability: StronglyConfirmed<EmptyRecycleBinRequest>,
+    ) -> (Self, PendingObligation) {
+        let (request, obligation) = capability.consume();
+        let request = EmptyBinShellRequest { owner, scope: request.scope().clone() };
+        (Self::EmptyRecycleBin(request), obligation)
+    }
+
+    /// Returns the payload-free request kind.
+    #[must_use]
+    pub const fn kind(&self) -> ShellRequestKind {
         match self {
-            Self::PickFolder(_) => true,
+            Self::PickFolder(_) => ShellRequestKind::PickFolder,
+            Self::Open(_) => ShellRequestKind::Open,
+            Self::Reveal(_) => ShellRequestKind::Reveal,
+            Self::InstalledApps(_) => ShellRequestKind::InstalledApps,
+            Self::QueryRecycleBin(_) => ShellRequestKind::QueryRecycleBin,
+            Self::Recycle(_) => ShellRequestKind::Recycle,
+            Self::DeletePermanently(_) => ShellRequestKind::DeletePermanently,
+            Self::EmptyRecycleBin(_) => ShellRequestKind::EmptyRecycleBin,
         }
+    }
+
+    /// Whether at most one such request may be outstanding at a time.
+    ///
+    /// The folder picker is a visible modal. Destructive operations are
+    /// serialized the same way: one outstanding mutation, and its result must
+    /// be delivered before the next one can be accepted.
+    const fn is_modal(&self) -> bool {
+        matches!(
+            self.kind(),
+            ShellRequestKind::PickFolder
+                | ShellRequestKind::Recycle
+                | ShellRequestKind::DeletePermanently
+                | ShellRequestKind::EmptyRecycleBin
+        )
     }
 }
 
@@ -264,6 +498,39 @@ impl DialogEvent {
             Self::Selected { request_id, .. }
             | Self::Cancelled { request_id }
             | Self::Failed { request_id, .. } => *request_id,
+        }
+    }
+}
+
+/// Terminal, owned result of any Shell request.
+///
+/// Open, reveal, and Installed Apps report `Dispatched`, never completion.
+/// Destructive outcomes follow the ADR 0008 result model from
+/// `diskpie_app::actions` and carry the per-item callback evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ShellEvent {
+    Dialog(DialogEvent),
+    Open { request_id: DialogRequestId, outcome: DispatchOutcome },
+    Reveal { request_id: DialogRequestId, outcome: DispatchOutcome },
+    InstalledApps { request_id: DialogRequestId, outcome: DispatchOutcome },
+    RecycleBinQuery { request_id: DialogRequestId, outcome: RecycleBinQueryOutcome },
+    Recycle { request_id: DialogRequestId, outcome: DestructiveOutcome },
+    DeletePermanently { request_id: DialogRequestId, outcome: DestructiveOutcome },
+    EmptyRecycleBin { request_id: DialogRequestId, outcome: EmptyBinOutcome },
+}
+
+impl ShellEvent {
+    /// Returns the request ID shared by every terminal outcome.
+    pub const fn request_id(&self) -> DialogRequestId {
+        match self {
+            Self::Dialog(event) => event.request_id(),
+            Self::Open { request_id, .. }
+            | Self::Reveal { request_id, .. }
+            | Self::InstalledApps { request_id, .. }
+            | Self::RecycleBinQuery { request_id, .. }
+            | Self::Recycle { request_id, .. }
+            | Self::DeletePermanently { request_id, .. }
+            | Self::EmptyRecycleBin { request_id, .. } => *request_id,
         }
     }
 }
@@ -426,15 +693,31 @@ impl ShellServiceConfig {
     }
 }
 
-#[derive(Clone, Copy)]
 struct QueuedRequest {
     id: DialogRequestId,
     request: ShellRequest,
+    /// Request-local cancellation flag shared with [`ShellService::cancel`].
+    cancel: Arc<AtomicBool>,
+}
+
+impl QueuedRequest {
+    fn meta(&self) -> RequestMeta {
+        RequestMeta { id: self.id, kind: self.request.kind(), was_modal: self.request.is_modal() }
+    }
+}
+
+/// Payload-free request facts needed to emit a terminal event after the
+/// request itself has been moved into its handler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RequestMeta {
+    id: DialogRequestId,
+    kind: ShellRequestKind,
+    was_modal: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 struct CompletedRequest {
-    event: DialogEvent,
+    event: ShellEvent,
     // The UI releases this reservation only while delivering the event. That
     // keeps both visible dialogs and unread modal results bounded to one.
     was_modal: bool,
@@ -681,6 +964,9 @@ pub struct ShellService {
     shared: Arc<SharedState>,
     registry: Arc<ShellInstanceRegistry>,
     next_request_id: AtomicU64,
+    /// Cancellation flags of accepted requests whose terminal event has not
+    /// been delivered yet; bounded by the queue capacity plus one in flight.
+    cancellations: Mutex<Vec<(DialogRequestId, Arc<AtomicBool>)>>,
     worker: Option<JoinHandle<()>>,
     instance_claim: Option<ServiceInstanceClaim>,
     /// `Some(panicked)` once this handle joined its worker itself.
@@ -734,6 +1020,7 @@ impl ShellService {
                 shared,
                 registry,
                 next_request_id: AtomicU64::new(1),
+                cancellations: Mutex::new(Vec::new()),
                 worker: Some(worker),
                 instance_claim: Some(instance_claim),
                 joined: None,
@@ -752,13 +1039,47 @@ impl ShellService {
     /// Attempts to enqueue work without waiting for queue capacity.
     pub fn submit(&self, request: ShellRequest) -> Result<DialogRequestId, SubmitError> {
         let id = DialogRequestId(self.next_request_id.fetch_add(1, Ordering::Relaxed));
-        try_accept_request(&self.request_tx, &self.shared, QueuedRequest { id, request })?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        try_accept_request(
+            &self.request_tx,
+            &self.shared,
+            QueuedRequest { id, request, cancel: Arc::clone(&cancel) },
+        )?;
+        self.with_cancellations(|entries| entries.push((id, cancel)));
 
         // Signalling is an optimization backed by a short health timeout in
         // the message-aware wait. Once `try_send` succeeds the request remains
         // accepted even if an anomalous SetEvent call fails.
         let _ = self.shared.wake.signal();
         Ok(id)
+    }
+
+    /// Requests cancellation of an accepted request without waiting.
+    ///
+    /// A request that has not started yet is reliably skipped and reports
+    /// `CancelledBeforeMutation` (or a `CancelledBeforeDispatch` failure).
+    /// A file operation that is already running observes the flag in its next
+    /// `PreDeleteItem` callback; interruption inside one recursive item or
+    /// after `SHEmptyRecycleBinW` dispatch is not promised. Returns whether
+    /// the request was still outstanding.
+    pub fn cancel(&self, id: DialogRequestId) -> bool {
+        self.with_cancellations(|entries| {
+            entries.iter().find(|(entry, _)| *entry == id).is_some_and(|(_, flag)| {
+                flag.store(true, Ordering::Release);
+                true
+            })
+        })
+    }
+
+    fn with_cancellations<R>(
+        &self,
+        update: impl FnOnce(&mut Vec<(DialogRequestId, Arc<AtomicBool>)>) -> R,
+    ) -> R {
+        // The handle is `!Sync`, so this lock is never contended; it only
+        // guards against a poisoned state after a panic in the caller.
+        let mut entries =
+            self.cancellations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        update(&mut entries)
     }
 
     /// Convenience wrapper for the currently implemented request kind.
@@ -770,9 +1091,14 @@ impl ShellService {
     ///
     /// A modal request remains outstanding until this method delivers its
     /// terminal event, bounding unread modal results as well as visible dialogs.
-    pub fn try_recv(&self) -> Result<Option<DialogEvent>, TryReceiveError> {
+    pub fn try_recv(&self) -> Result<Option<ShellEvent>, TryReceiveError> {
         match self.event_rx.try_recv() {
-            Ok(completed) => Ok(Some(deliver_completed_request(&self.shared, completed))),
+            Ok(completed) => {
+                let event = deliver_completed_request(&self.shared, completed);
+                let id = event.request_id();
+                self.with_cancellations(|entries| entries.retain(|(entry, _)| *entry != id));
+                Ok(Some(event))
+            }
             Err(MpscTryRecvError::Empty) => Ok(None),
             Err(MpscTryRecvError::Disconnected) => Err(TryReceiveError::ServiceStopped),
         }
@@ -1045,12 +1371,13 @@ fn worker_loop(
 
         match request_rx.try_recv() {
             Ok(queued) => {
+                let meta = queued.meta();
                 if shared.shutdown_requested.load(Ordering::Acquire) {
-                    fail_request(queued, event_tx, shared, DialogError::service_shutdown());
+                    fail_request(meta, event_tx, shared, DialogError::service_shutdown());
                     behaviour.observe_shutdown();
                     return DialogError::service_shutdown();
                 }
-                if let Err(error) = guard_request_execution(queued, event_tx, shared, || {
+                if let Err(error) = guard_request_execution(meta, event_tx, shared, || {
                     process_request(queued, event_tx, shared);
                 }) {
                     return error;
@@ -1130,22 +1457,158 @@ fn process_request(
     event_tx: &std::sync::mpsc::Sender<CompletedRequest>,
     shared: &SharedState,
 ) {
-    let was_modal = queued.request.is_modal();
-    let event = match queued.request {
-        ShellRequest::PickFolder(request) => match show_folder_dialog(request.owner) {
-            Ok(DialogOutcome::Selected(path)) => {
-                DialogEvent::Selected { request_id: queued.id, path }
-            }
-            Ok(DialogOutcome::Cancelled) => DialogEvent::Cancelled { request_id: queued.id },
-            Err(error) => DialogEvent::Failed { request_id: queued.id, error },
-        },
-    };
+    let meta = queued.meta();
+    let event = execute_request(queued);
+    send_completed_request(event_tx, shared, CompletedRequest { event, was_modal: meta.was_modal });
+}
 
-    send_completed_request(event_tx, shared, CompletedRequest { event, was_modal });
+/// Runs one request on the STA and produces its terminal event.
+///
+/// A request whose cancellation flag is already set never touches the Shell.
+fn execute_request(queued: QueuedRequest) -> ShellEvent {
+    let meta = queued.meta();
+    let QueuedRequest { id, request, cancel } = queued;
+    if cancel.load(Ordering::Acquire) {
+        return cancelled_before_start_event(meta);
+    }
+    match request {
+        ShellRequest::PickFolder(request) => {
+            ShellEvent::Dialog(match show_folder_dialog(request.owner) {
+                Ok(DialogOutcome::Selected(path)) => DialogEvent::Selected { request_id: id, path },
+                Ok(DialogOutcome::Cancelled) => DialogEvent::Cancelled { request_id: id },
+                Err(error) => DialogEvent::Failed { request_id: id, error },
+            })
+        }
+        ShellRequest::Open(request) => ShellEvent::Open {
+            request_id: id,
+            outcome: open_item(&mut NativeShell, request.owner, &request.path),
+        },
+        ShellRequest::Reveal(request) => ShellEvent::Reveal {
+            request_id: id,
+            outcome: reveal_item(&mut NativeShell, &request.path),
+        },
+        ShellRequest::InstalledApps(request) => ShellEvent::InstalledApps {
+            request_id: id,
+            outcome: open_installed_apps(&mut NativeShell, request.owner),
+        },
+        ShellRequest::QueryRecycleBin(request) => ShellEvent::RecycleBinQuery {
+            request_id: id,
+            outcome: match query_recycle_bin(&request.scope) {
+                Ok(estimate) => RecycleBinQueryOutcome::Estimated(estimate),
+                Err(hresult) => RecycleBinQueryOutcome::Failed { hresult: Some(hresult) },
+            },
+        },
+        ShellRequest::Recycle(request) => {
+            ShellEvent::Recycle { request_id: id, outcome: run_delete_request(&request, &cancel) }
+        }
+        ShellRequest::DeletePermanently(request) => ShellEvent::DeletePermanently {
+            request_id: id,
+            outcome: run_delete_request(&request, &cancel),
+        },
+        ShellRequest::EmptyRecycleBin(request) => ShellEvent::EmptyRecycleBin {
+            request_id: id,
+            outcome: empty_recycle_bin(request.owner, &request.scope, &cancel),
+        },
+    }
+}
+
+fn run_delete_request(
+    request: &DeleteShellRequest,
+    cancel: &Arc<AtomicBool>,
+) -> DestructiveOutcome {
+    run_delete(&DeleteJob {
+        owner: request.owner,
+        path: &request.path,
+        kind: request.kind,
+        identity: request.identity,
+        mode: request.mode,
+        cancel,
+    })
+}
+
+/// Terminal event for a request cancelled before the STA started it.
+fn cancelled_before_start_event(meta: RequestMeta) -> ShellEvent {
+    let request_id = meta.id;
+    let not_run = DispatchOutcome::not_run(DispatchStage::CancelledBeforeDispatch);
+    match meta.kind {
+        ShellRequestKind::PickFolder => ShellEvent::Dialog(DialogEvent::Cancelled { request_id }),
+        ShellRequestKind::Open => ShellEvent::Open { request_id, outcome: not_run },
+        ShellRequestKind::Reveal => ShellEvent::Reveal { request_id, outcome: not_run },
+        ShellRequestKind::InstalledApps => {
+            ShellEvent::InstalledApps { request_id, outcome: not_run }
+        }
+        ShellRequestKind::QueryRecycleBin => ShellEvent::RecycleBinQuery {
+            request_id,
+            outcome: RecycleBinQueryOutcome::NotRun(DispatchStage::CancelledBeforeDispatch),
+        },
+        ShellRequestKind::Recycle => {
+            ShellEvent::Recycle { request_id, outcome: DestructiveOutcome::CancelledBeforeMutation }
+        }
+        ShellRequestKind::DeletePermanently => ShellEvent::DeletePermanently {
+            request_id,
+            outcome: DestructiveOutcome::CancelledBeforeMutation,
+        },
+        ShellRequestKind::EmptyRecycleBin => ShellEvent::EmptyRecycleBin {
+            request_id,
+            outcome: EmptyBinOutcome::CancelledBeforeMutation,
+        },
+    }
+}
+
+/// Terminal event for a request the STA could not run at all.
+///
+/// A worker panic during a destructive request is reported as
+/// `UnknownMayHaveMutated`; every other failure to run is a cancellation
+/// before mutation because the request never reached the Shell.
+fn failed_request_event(meta: RequestMeta, error: DialogError) -> ShellEvent {
+    let request_id = meta.id;
+    let panicked = error.stage == DialogErrorStage::WorkerPanicked;
+    let stage =
+        if panicked { DispatchStage::WorkerPanicked } else { DispatchStage::ServiceShutdown };
+    let not_run = DispatchOutcome::not_run(stage);
+    let destructive = if panicked {
+        DestructiveOutcome::UnknownMayHaveMutated {
+            stage: FailureStage::WorkerPanicked,
+            code: None,
+        }
+    } else {
+        DestructiveOutcome::CancelledBeforeMutation
+    };
+    match meta.kind {
+        ShellRequestKind::PickFolder => {
+            ShellEvent::Dialog(DialogEvent::Failed { request_id, error })
+        }
+        ShellRequestKind::Open => ShellEvent::Open { request_id, outcome: not_run },
+        ShellRequestKind::Reveal => ShellEvent::Reveal { request_id, outcome: not_run },
+        ShellRequestKind::InstalledApps => {
+            ShellEvent::InstalledApps { request_id, outcome: not_run }
+        }
+        ShellRequestKind::QueryRecycleBin => ShellEvent::RecycleBinQuery {
+            request_id,
+            outcome: RecycleBinQueryOutcome::NotRun(stage),
+        },
+        ShellRequestKind::Recycle => ShellEvent::Recycle { request_id, outcome: destructive },
+        ShellRequestKind::DeletePermanently => {
+            ShellEvent::DeletePermanently { request_id, outcome: destructive }
+        }
+        ShellRequestKind::EmptyRecycleBin => ShellEvent::EmptyRecycleBin {
+            request_id,
+            outcome: if panicked {
+                EmptyBinOutcome::UnknownMayHaveMutated {
+                    stage: FailureStage::WorkerPanicked,
+                    code: None,
+                    before: None,
+                    after: None,
+                }
+            } else {
+                EmptyBinOutcome::CancelledBeforeMutation
+            },
+        },
+    }
 }
 
 fn guard_request_execution<F>(
-    queued: QueuedRequest,
+    meta: RequestMeta,
     event_tx: &std::sync::mpsc::Sender<CompletedRequest>,
     shared: &SharedState,
     execute: F,
@@ -1157,20 +1620,18 @@ where
         return Ok(());
     }
     let error = DialogError::worker_panicked();
-    fail_request(queued, event_tx, shared, error);
+    fail_request(meta, event_tx, shared, error);
     Err(error)
 }
 
 fn fail_request(
-    queued: QueuedRequest,
+    meta: RequestMeta,
     event_tx: &std::sync::mpsc::Sender<CompletedRequest>,
     shared: &SharedState,
     error: DialogError,
 ) {
-    let completed = CompletedRequest {
-        event: DialogEvent::Failed { request_id: queued.id, error },
-        was_modal: queued.request.is_modal(),
-    };
+    let completed =
+        CompletedRequest { event: failed_request_event(meta, error), was_modal: meta.was_modal };
     send_completed_request(event_tx, shared, completed);
 }
 
@@ -1181,7 +1642,7 @@ fn fail_queued_requests(
     error: DialogError,
 ) {
     while let Ok(queued) = request_rx.try_recv() {
-        fail_request(queued, event_tx, shared, error);
+        fail_request(queued.meta(), event_tx, shared, error);
     }
 }
 
@@ -1207,7 +1668,7 @@ fn send_completed_request(
     }
 }
 
-fn deliver_completed_request(shared: &SharedState, completed: CompletedRequest) -> DialogEvent {
+fn deliver_completed_request(shared: &SharedState, completed: CompletedRequest) -> ShellEvent {
     if completed.was_modal {
         shared.modal_outstanding.store(false, Ordering::Release);
     }
@@ -1389,6 +1850,7 @@ mod tests {
         QueuedRequest {
             id: DialogRequestId(id),
             request: ShellRequest::PickFolder(FolderDialogRequest { owner: owner() }),
+            cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1448,7 +1910,9 @@ mod tests {
             &event_tx,
             &shared,
             CompletedRequest {
-                event: DialogEvent::Cancelled { request_id: DialogRequestId(1) },
+                event: ShellEvent::Dialog(DialogEvent::Cancelled {
+                    request_id: DialogRequestId(1),
+                }),
                 was_modal: true,
             },
         );
@@ -1460,7 +1924,7 @@ mod tests {
         let completed = event_rx.try_recv().expect("completion is queued");
         assert_eq!(
             deliver_completed_request(&shared, completed),
-            DialogEvent::Cancelled { request_id: DialogRequestId(1) }
+            ShellEvent::Dialog(DialogEvent::Cancelled { request_id: DialogRequestId(1) })
         );
         assert!(!shared.modal_outstanding.load(Ordering::Acquire));
         assert_eq!(try_enqueue_request(&request_tx, &shared.modal_outstanding, queued(3)), Ok(()));
@@ -1496,7 +1960,7 @@ mod tests {
         let completed = event_rx.try_recv().expect("accepted request receives a terminal event");
         assert!(matches!(
             deliver_completed_request(&shared, completed),
-            DialogEvent::Failed { request_id: DialogRequestId(9), .. }
+            ShellEvent::Dialog(DialogEvent::Failed { request_id: DialogRequestId(9), .. })
         ));
         assert_eq!(
             try_accept_request(&request_tx, &shared, queued(10)),
@@ -1511,7 +1975,7 @@ mod tests {
         let (event_tx, event_rx) = channel();
         shared.modal_outstanding.store(true, Ordering::Release);
 
-        let error = guard_request_execution(queued(11), &event_tx, &shared, || {
+        let error = guard_request_execution(queued(11).meta(), &event_tx, &shared, || {
             panic!("injected Shell request panic");
         })
         .expect_err("the panic is converted to a typed terminal failure");
@@ -1521,7 +1985,7 @@ mod tests {
         let completed = event_rx.try_recv().expect("panic result is queued");
         assert_eq!(
             deliver_completed_request(&shared, completed),
-            DialogEvent::Failed { request_id: DialogRequestId(11), error }
+            ShellEvent::Dialog(DialogEvent::Failed { request_id: DialogRequestId(11), error })
         );
         assert!(!shared.modal_outstanding.load(Ordering::Acquire));
         assert_eq!(event_rx.try_recv(), Err(MpscTryRecvError::Empty));
@@ -1542,10 +2006,10 @@ mod tests {
         let completed = event_rx.try_recv().expect("shutdown result remains queued");
         assert_eq!(
             deliver_completed_request(&shared, completed),
-            DialogEvent::Failed {
+            ShellEvent::Dialog(DialogEvent::Failed {
                 request_id: DialogRequestId(7),
                 error: DialogError::service_shutdown(),
-            }
+            })
         );
         assert!(!shared.modal_outstanding.load(Ordering::Acquire));
     }
@@ -1632,6 +2096,7 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<ShellRequest>();
         assert_send::<DialogEvent>();
+        assert_send::<ShellEvent>();
         assert_send::<DialogError>();
     }
 
@@ -1897,5 +2362,482 @@ mod tests {
         let second_reaper: *const ShellReaper = registry.reaper().expect("reaper persists");
         assert!(std::ptr::eq(first_reaper, second_reaper));
         drop(second);
+    }
+
+    // Shell action tests below. Everything that runs by default is
+    // non-destructive: it validates identity, exercises cancellation, and
+    // maps terminal events. Fixture-mutating tests are gated behind
+    // `DISKPIE_DESTRUCTIVE_FIXTURES=1` and act only on files they created
+    // inside their own temporary directory.
+
+    use super::super::shell_actions::read_file_identity;
+    use diskpie_app::actions::{
+        ActionOutcome, ActionPurpose, ConfirmationFlow, DeleteRequest, DestructiveOutcome,
+        EmptyBinOutcome, IdentityAssurance, ItemEffect, PostActionObligation, RecycleBinScope,
+        StronglyConfirmed, TargetChangeReason, TargetValidator,
+    };
+    use diskpie_core::{
+        EntryKind, GenerationId, NodeId, NodeSpec, OwnMetrics, ReparseKind, TreeBuilder,
+        TreeSnapshot,
+    };
+    use std::{ffi::OsStr, fs, path::Path};
+
+    const DESTRUCTIVE_FIXTURES_ENV: &str = "DISKPIE_DESTRUCTIVE_FIXTURES";
+    const EVENT_DEADLINE: Duration = Duration::from_secs(20);
+    static ACTION_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct ActionFixture(PathBuf);
+
+    impl ActionFixture {
+        fn new(label: &str) -> Self {
+            let sequence = ACTION_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("diskpie-shell-service-{label}-{}-{sequence}", std::process::id()));
+            std::fs::create_dir(&path).expect("create isolated test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ActionFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn destructive_fixtures_enabled(test: &str) -> bool {
+        let enabled = std::env::var_os(DESTRUCTIVE_FIXTURES_ENV).is_some_and(|value| value == "1");
+        if !enabled {
+            println!(
+                "skipping {test}: set {DESTRUCTIVE_FIXTURES_ENV}=1 to run fixture-mutating Shell tests"
+            );
+        }
+        enabled
+    }
+
+    /// One real child under a scan root at `root`, exactly as the scanner would record it.
+    fn child_snapshot(
+        root: &Path,
+        child: &OsStr,
+        kind: EntryKind,
+        identity: Option<diskpie_core::FileIdentity>,
+    ) -> (TreeSnapshot, NodeId) {
+        let mut builder = TreeBuilder::new(GenerationId::new(1));
+        let root_node = builder.add_root(NodeSpec::root(root.as_os_str())).expect("root");
+        let spec = NodeSpec::new(child, kind, OwnMetrics::ZERO_BY_POLICY);
+        let spec = match identity {
+            Some(identity) => spec.with_file_identity(identity),
+            None => spec,
+        };
+        let child_node = builder.add_child(root_node, spec).expect("child");
+        (builder.freeze().expect("snapshot"), child_node)
+    }
+
+    fn validated_target(
+        snapshot: &TreeSnapshot,
+        node: NodeId,
+    ) -> diskpie_app::actions::FilesystemTarget {
+        let executable = PathBuf::from(r"C:\zqx\bin\diskpie.exe");
+        TargetValidator::new(snapshot, Some(&executable))
+            .validate(node, GenerationId::new(1), false, ActionPurpose::Destructive)
+            .expect("temporary fixture is a valid destructive target")
+    }
+
+    fn confirmed_recycle(
+        snapshot: &TreeSnapshot,
+        node: NodeId,
+    ) -> diskpie_app::actions::Confirmed<diskpie_app::actions::RecycleRequest> {
+        let mut flow = ConfirmationFlow::new();
+        flow.begin_recycle(validated_target(snapshot, node)).expect("begin");
+        flow.accept_review().expect("accept");
+        flow.take_recycle().expect("capability")
+    }
+
+    fn strongly_confirmed_delete(
+        snapshot: &TreeSnapshot,
+        node: NodeId,
+    ) -> StronglyConfirmed<DeleteRequest> {
+        let mut flow = ConfirmationFlow::new();
+        flow.begin_delete(validated_target(snapshot, node)).expect("begin");
+        flow.accept_review().expect("accept");
+        flow.set_typed_word("DELETE").expect("type");
+        flow.confirm_word().expect("confirm");
+        flow.take_delete().expect("capability")
+    }
+
+    fn wait_for_event(service: &ShellService) -> ShellEvent {
+        let started = Instant::now();
+        loop {
+            if let Some(event) = service.try_recv().expect("service alive") {
+                return event;
+            }
+            assert!(started.elapsed() < EVENT_DEADLINE, "no terminal event within the deadline");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn swapped_target_reports_target_changed_through_the_live_service_without_mutation() {
+        let fixture = ActionFixture::new("swap");
+        let file = fixture.path().join("confirmed.bin");
+        fs::write(&file, b"original").expect("write fixture");
+        let identity = read_file_identity(&file).expect("identity");
+        let (snapshot, node) = child_snapshot(
+            fixture.path(),
+            OsStr::new("confirmed.bin"),
+            EntryKind::File,
+            Some(identity),
+        );
+        let capability = confirmed_recycle(&snapshot, node);
+        assert_eq!(capability.request().target().path(), file.as_path());
+
+        // The confirmation is now stale: the path is reused by a different object.
+        fs::remove_file(&file).expect("remove fixture");
+        fs::write(&file, b"swapped-in").expect("recreate fixture");
+
+        let registry = private_registry();
+        let service = start_in(&registry, WorkerBehaviour::Native);
+        let (request, obligation) = ShellRequest::recycle(owner(), capability);
+        let id = service.submit(request).expect("accepted");
+        assert_eq!(service.submit_folder(owner()), Err(SubmitError::ModalOutstanding));
+
+        let event = wait_for_event(&service);
+        assert_eq!(
+            event,
+            ShellEvent::Recycle {
+                request_id: id,
+                outcome: DestructiveOutcome::TargetChanged {
+                    reason: TargetChangeReason::IdentityMismatch
+                },
+            }
+        );
+        assert_eq!(fs::read(&file).expect("fixture intact"), b"swapped-in");
+        assert!(!service.cancel(id), "a delivered request is no longer outstanding");
+
+        let report =
+            obligation.settle(ActionOutcome::Filesystem(DestructiveOutcome::TargetChanged {
+                reason: TargetChangeReason::IdentityMismatch,
+            }));
+        assert!(matches!(
+            report.obligation,
+            PostActionObligation::RescanParent { parent, .. } if parent == NodeId::from_raw(0)
+        ));
+        assert!(!report.requires_halt());
+        assert_eq!(
+            service.finish(Duration::from_secs(5)),
+            ShellServiceFinish::Exited { panicked: false }
+        );
+    }
+
+    #[test]
+    fn precancelled_requests_never_reach_the_shell() {
+        let fixture = ActionFixture::new("precancel");
+        let file = fixture.path().join("keep.bin");
+        fs::write(&file, b"keep").expect("write fixture");
+        let identity = read_file_identity(&file).expect("identity");
+        let (snapshot, node) =
+            child_snapshot(fixture.path(), OsStr::new("keep.bin"), EntryKind::File, Some(identity));
+        let (request, _obligation) =
+            ShellRequest::delete_permanently(owner(), strongly_confirmed_delete(&snapshot, node));
+
+        let queued = QueuedRequest {
+            id: DialogRequestId(5),
+            request,
+            cancel: Arc::new(AtomicBool::new(true)),
+        };
+        assert_eq!(
+            execute_request(queued),
+            ShellEvent::DeletePermanently {
+                request_id: DialogRequestId(5),
+                outcome: DestructiveOutcome::CancelledBeforeMutation,
+            }
+        );
+        assert_eq!(fs::read(&file).expect("fixture intact"), b"keep");
+
+        let bin = ShellRequest::query_recycle_bin(RecycleBinScope::AllDrives);
+        let queued = QueuedRequest {
+            id: DialogRequestId(6),
+            request: bin,
+            cancel: Arc::new(AtomicBool::new(true)),
+        };
+        assert_eq!(
+            execute_request(queued),
+            ShellEvent::RecycleBinQuery {
+                request_id: DialogRequestId(6),
+                outcome: RecycleBinQueryOutcome::NotRun(DispatchStage::CancelledBeforeDispatch),
+            }
+        );
+    }
+
+    #[test]
+    fn terminal_event_mapping_covers_every_request_kind() {
+        let kinds = [
+            ShellRequestKind::PickFolder,
+            ShellRequestKind::Open,
+            ShellRequestKind::Reveal,
+            ShellRequestKind::InstalledApps,
+            ShellRequestKind::QueryRecycleBin,
+            ShellRequestKind::Recycle,
+            ShellRequestKind::DeletePermanently,
+            ShellRequestKind::EmptyRecycleBin,
+        ];
+        for kind in kinds {
+            let meta = RequestMeta { id: DialogRequestId(3), kind, was_modal: false };
+            let cancelled = cancelled_before_start_event(meta);
+            assert_eq!(cancelled.request_id(), DialogRequestId(3));
+            let shutdown = failed_request_event(meta, DialogError::service_shutdown());
+            let panicked = failed_request_event(meta, DialogError::worker_panicked());
+            match kind {
+                ShellRequestKind::PickFolder => {
+                    assert!(matches!(cancelled, ShellEvent::Dialog(DialogEvent::Cancelled { .. })));
+                    assert!(matches!(shutdown, ShellEvent::Dialog(DialogEvent::Failed { .. })));
+                }
+                ShellRequestKind::Open
+                | ShellRequestKind::Reveal
+                | ShellRequestKind::InstalledApps => {
+                    for (event, stage) in [
+                        (cancelled, DispatchStage::CancelledBeforeDispatch),
+                        (shutdown, DispatchStage::ServiceShutdown),
+                        (panicked, DispatchStage::WorkerPanicked),
+                    ] {
+                        let outcome = match event {
+                            ShellEvent::Open { outcome, .. }
+                            | ShellEvent::Reveal { outcome, .. }
+                            | ShellEvent::InstalledApps { outcome, .. } => outcome,
+                            other => panic!("unexpected event {other:?}"),
+                        };
+                        assert_eq!(outcome, DispatchOutcome::Failed { stage, hresult: None });
+                    }
+                }
+                ShellRequestKind::QueryRecycleBin => {
+                    assert!(matches!(
+                        shutdown,
+                        ShellEvent::RecycleBinQuery {
+                            outcome: RecycleBinQueryOutcome::NotRun(DispatchStage::ServiceShutdown),
+                            ..
+                        }
+                    ));
+                }
+                ShellRequestKind::Recycle | ShellRequestKind::DeletePermanently => {
+                    let outcome = |event: ShellEvent| match event {
+                        ShellEvent::Recycle { outcome, .. }
+                        | ShellEvent::DeletePermanently { outcome, .. } => outcome,
+                        other => panic!("unexpected event {other:?}"),
+                    };
+                    assert_eq!(outcome(cancelled), DestructiveOutcome::CancelledBeforeMutation);
+                    assert_eq!(outcome(shutdown), DestructiveOutcome::CancelledBeforeMutation);
+                    assert_eq!(
+                        outcome(panicked),
+                        DestructiveOutcome::UnknownMayHaveMutated {
+                            stage: diskpie_app::actions::FailureStage::WorkerPanicked,
+                            code: None
+                        }
+                    );
+                }
+                ShellRequestKind::EmptyRecycleBin => {
+                    assert!(matches!(
+                        cancelled,
+                        ShellEvent::EmptyRecycleBin {
+                            outcome: EmptyBinOutcome::CancelledBeforeMutation,
+                            ..
+                        }
+                    ));
+                    assert!(matches!(
+                        panicked,
+                        ShellEvent::EmptyRecycleBin {
+                            outcome: EmptyBinOutcome::UnknownMayHaveMutated { .. },
+                            ..
+                        }
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn destructive_requests_are_serialized_and_redact_paths() {
+        let fixture = ActionFixture::new("redact");
+        let file = fixture.path().join("secret-name.bin");
+        fs::write(&file, b"x").expect("write fixture");
+        let (snapshot, node) =
+            child_snapshot(fixture.path(), OsStr::new("secret-name.bin"), EntryKind::File, None);
+        let (request, _obligation) =
+            ShellRequest::recycle(owner(), confirmed_recycle(&snapshot, node));
+        assert!(request.is_modal());
+        assert_eq!(request.kind(), ShellRequestKind::Recycle);
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains("secret-name"), "{rendered}");
+        assert!(rendered.contains("path_present: true"));
+        drop(request);
+        assert!(file.exists(), "building a request never touches the filesystem");
+    }
+
+    #[test]
+    fn cancel_registry_tracks_outstanding_requests_only() {
+        let registry = private_registry();
+        let service = start_in(&registry, WorkerBehaviour::Native);
+        assert!(!service.cancel(DialogRequestId(999)));
+        let id = service
+            .submit(ShellRequest::query_recycle_bin(RecycleBinScope::AllDrives))
+            .expect("accepted");
+        // Cancellation reaches the flag whether or not the STA already ran it.
+        let outstanding = service.cancel(id);
+        let event = wait_for_event(&service);
+        assert!(outstanding);
+        match event {
+            ShellEvent::RecycleBinQuery { request_id, outcome } => {
+                assert_eq!(request_id, id);
+                assert!(matches!(
+                    outcome,
+                    RecycleBinQueryOutcome::Estimated(_)
+                        | RecycleBinQueryOutcome::Failed { .. }
+                        | RecycleBinQueryOutcome::NotRun(DispatchStage::CancelledBeforeDispatch)
+                ));
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+        assert!(!service.cancel(id), "delivery releases the cancellation entry");
+        assert_eq!(
+            service.finish(Duration::from_secs(5)),
+            ShellServiceFinish::Exited { panicked: false }
+        );
+    }
+
+    #[test]
+    fn gated_recycle_of_a_temp_file_produces_recycle_bin_evidence() {
+        if !destructive_fixtures_enabled(
+            "gated_recycle_of_a_temp_file_produces_recycle_bin_evidence",
+        ) {
+            return;
+        }
+        let fixture = ActionFixture::new("recycle");
+        let file = fixture.path().join("recycle-me.bin");
+        fs::write(&file, b"recycle").expect("write fixture");
+        let identity = read_file_identity(&file).expect("identity");
+        let (snapshot, node) = child_snapshot(
+            fixture.path(),
+            OsStr::new("recycle-me.bin"),
+            EntryKind::File,
+            Some(identity),
+        );
+        let registry = private_registry();
+        let service = start_in(&registry, WorkerBehaviour::Native);
+        let (request, _obligation) =
+            ShellRequest::recycle(owner(), confirmed_recycle(&snapshot, node));
+        let id = service.submit(request).expect("accepted");
+
+        let event = wait_for_event(&service);
+        let ShellEvent::Recycle { request_id, outcome } = event else {
+            panic!("unexpected event {event:?}");
+        };
+        assert_eq!(request_id, id);
+        match outcome {
+            DestructiveOutcome::Completed { items, assurance } => {
+                assert_eq!(assurance, IdentityAssurance::Exact);
+                assert_eq!(items.len(), 1);
+                assert!(matches!(items[0].effect, ItemEffect::Recycled { .. }), "{items:?}");
+                assert!(!file.exists(), "the fixture moved to the Recycle Bin");
+            }
+            other => panic!("recycle did not complete with Recycle Bin evidence: {other:?}"),
+        }
+        assert_eq!(
+            service.finish(Duration::from_secs(5)),
+            ShellServiceFinish::Exited { panicked: false }
+        );
+    }
+
+    #[test]
+    fn gated_permanent_delete_of_a_temp_file_completes_without_recycle_evidence() {
+        if !destructive_fixtures_enabled(
+            "gated_permanent_delete_of_a_temp_file_completes_without_recycle_evidence",
+        ) {
+            return;
+        }
+        let fixture = ActionFixture::new("delete");
+        let file = fixture.path().join("delete-me.bin");
+        fs::write(&file, b"delete").expect("write fixture");
+        let identity = read_file_identity(&file).expect("identity");
+        let (snapshot, node) = child_snapshot(
+            fixture.path(),
+            OsStr::new("delete-me.bin"),
+            EntryKind::File,
+            Some(identity),
+        );
+        let registry = private_registry();
+        let service = start_in(&registry, WorkerBehaviour::Native);
+        let (request, _obligation) =
+            ShellRequest::delete_permanently(owner(), strongly_confirmed_delete(&snapshot, node));
+        let id = service.submit(request).expect("accepted");
+
+        let event = wait_for_event(&service);
+        let ShellEvent::DeletePermanently { request_id, outcome } = event else {
+            panic!("unexpected event {event:?}");
+        };
+        assert_eq!(request_id, id);
+        // The copy engine reports a success HRESULT such as
+        // COPYENGINE_S_DONT_PROCESS_CHILDREN (0x00270008), not necessarily S_OK.
+        let DestructiveOutcome::Completed { items, assurance } = outcome else {
+            panic!("permanent deletion did not complete: {outcome:?}");
+        };
+        assert_eq!(assurance, IdentityAssurance::Exact);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].code >= 0, "{items:?}");
+        assert_eq!(items[0].effect, ItemEffect::PermanentlyDeleted);
+        assert!(!file.exists());
+        assert_eq!(
+            service.finish(Duration::from_secs(5)),
+            ShellServiceFinish::Exited { panicked: false }
+        );
+    }
+
+    #[test]
+    fn gated_deleting_a_directory_link_leaves_the_external_sentinel_intact() {
+        if !destructive_fixtures_enabled(
+            "gated_deleting_a_directory_link_leaves_the_external_sentinel_intact",
+        ) {
+            return;
+        }
+        let outside = ActionFixture::new("sentinel");
+        let sentinel = outside.path().join("sentinel.txt");
+        fs::write(&sentinel, b"survive").expect("write sentinel");
+        let fixture = ActionFixture::new("link");
+        let link = fixture.path().join("link");
+        if let Err(error) = std::os::windows::fs::symlink_dir(outside.path(), &link) {
+            println!("skipping: directory symlink creation is unavailable ({})", error.kind());
+            return;
+        }
+        let (snapshot, node) = child_snapshot(
+            fixture.path(),
+            OsStr::new("link"),
+            EntryKind::ReparsePoint(ReparseKind::Directory),
+            None,
+        );
+        let registry = private_registry();
+        let service = start_in(&registry, WorkerBehaviour::Native);
+        let (request, _obligation) =
+            ShellRequest::delete_permanently(owner(), strongly_confirmed_delete(&snapshot, node));
+        let id = service.submit(request).expect("accepted");
+
+        let event = wait_for_event(&service);
+        let ShellEvent::DeletePermanently { request_id, outcome } = event else {
+            panic!("unexpected event {event:?}");
+        };
+        assert_eq!(request_id, id);
+        assert!(
+            matches!(
+                outcome,
+                DestructiveOutcome::Completed { assurance: IdentityAssurance::KindOnly, .. }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(fs::read(&sentinel).expect("sentinel survives"), b"survive");
+        assert!(fs::symlink_metadata(&link).is_err(), "the link object itself was removed");
+        assert_eq!(
+            service.finish(Duration::from_secs(5)),
+            ShellServiceFinish::Exited { panicked: false }
+        );
     }
 }
