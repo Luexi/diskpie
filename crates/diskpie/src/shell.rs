@@ -3,6 +3,7 @@
 use std::{
     f32::consts::{FRAC_PI_2, TAU},
     path::PathBuf,
+    sync::{Arc, Mutex},
 };
 
 use eframe::egui::{
@@ -13,6 +14,9 @@ use eframe::egui::{
 use diskpie_app::{
     format::format_path_for_display,
     i18n::{I18n, I18nError, Locale, MessageId},
+    settings::{
+        SettingsSession, SizePreference, UiLocale as SettingsLocale, UiTheme as SettingsTheme,
+    },
 };
 
 use crate::theme;
@@ -48,6 +52,23 @@ pub struct DiskPieShell {
     metric: SizeMetric,
     notice: MessageId,
     startup_path: Option<PathBuf>,
+    settings: SettingsSession,
+    settings_exit: SettingsExit,
+}
+
+/// Single handoff from the dropped eframe application to the composition root.
+#[derive(Clone, Default)]
+pub(crate) struct SettingsExit(Arc<Mutex<Option<SettingsSession>>>);
+
+impl SettingsExit {
+    #[must_use]
+    pub(crate) fn take(&self) -> Option<SettingsSession> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
+    }
+
+    fn publish(&self, session: SettingsSession) {
+        *self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(session);
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -60,20 +81,34 @@ impl DiskPieShell {
     pub fn new(
         creation: &eframe::CreationContext<'_>,
         startup_path: Option<PathBuf>,
+        optional_services_unavailable: bool,
+        settings: SettingsSession,
+        settings_exit: SettingsExit,
     ) -> Result<Self, I18nError> {
         theme::install(&creation.egui_ctx);
-        creation.egui_ctx.set_theme(ThemePreference::System);
-        let locale = Locale::EnglishUnitedStates;
+        let locale = locale_from_setting(settings.settings().locale);
+        let theme_preference = theme_from_setting(settings.settings().theme);
+        let metric = metric_from_setting(settings.settings().size_preference);
+        creation.egui_ctx.set_theme(theme_preference);
+        if let Some(scale) = settings.settings().ui_scale {
+            creation.egui_ctx.set_zoom_factor(scale);
+        }
         let i18n = I18n::new(locale)?;
         let strings = UiStrings::new(&i18n);
         Ok(Self {
             i18n,
             strings,
             locale,
-            theme_preference: ThemePreference::System,
-            metric: SizeMetric::Allocated,
-            notice: MessageId::StatusReady,
+            theme_preference,
+            metric,
+            notice: if optional_services_unavailable || settings.warning().is_some() {
+                MessageId::OptionalServicesUnavailable
+            } else {
+                MessageId::StatusReady
+            },
             startup_path,
+            settings,
+            settings_exit,
         })
     }
 
@@ -196,6 +231,16 @@ impl DiskPieShell {
                 });
             },
         );
+    }
+
+    fn synchronize_settings(&mut self) {
+        let mut updated = self.settings.settings().clone();
+        updated.locale = setting_from_locale(self.locale);
+        updated.theme = setting_from_theme(self.theme_preference);
+        updated.size_preference = setting_from_metric(self.metric);
+        if updated != *self.settings.settings() {
+            self.settings.replace(updated);
+        }
     }
 
     fn inspector(&self, ui: &mut egui::Ui) {
@@ -354,12 +399,63 @@ impl eframe::App for DiskPieShell {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.command_rail(ui);
         self.telemetry_rail(ui);
+        self.synchronize_settings();
         self.status_rail(ui);
         self.workspace(ui);
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         visuals.panel_fill.to_normalized_gamma_f32()
+    }
+}
+
+impl Drop for DiskPieShell {
+    fn drop(&mut self) {
+        self.settings_exit.publish(self.settings.clone());
+    }
+}
+
+const fn locale_from_setting(locale: SettingsLocale) -> Locale {
+    match locale {
+        SettingsLocale::EnglishUnitedStates => Locale::EnglishUnitedStates,
+        SettingsLocale::SpanishMexico => Locale::SpanishMexico,
+    }
+}
+
+const fn setting_from_locale(locale: Locale) -> SettingsLocale {
+    match locale {
+        Locale::EnglishUnitedStates => SettingsLocale::EnglishUnitedStates,
+        Locale::SpanishMexico => SettingsLocale::SpanishMexico,
+    }
+}
+
+const fn theme_from_setting(theme: SettingsTheme) -> ThemePreference {
+    match theme {
+        SettingsTheme::System => ThemePreference::System,
+        SettingsTheme::Dark => ThemePreference::Dark,
+        SettingsTheme::Light => ThemePreference::Light,
+    }
+}
+
+const fn setting_from_theme(theme: ThemePreference) -> SettingsTheme {
+    match theme {
+        ThemePreference::System => SettingsTheme::System,
+        ThemePreference::Dark => SettingsTheme::Dark,
+        ThemePreference::Light => SettingsTheme::Light,
+    }
+}
+
+const fn metric_from_setting(preference: SizePreference) -> SizeMetric {
+    match preference {
+        SizePreference::Logical => SizeMetric::Logical,
+        SizePreference::Allocated => SizeMetric::Allocated,
+    }
+}
+
+const fn setting_from_metric(metric: SizeMetric) -> SizePreference {
+    match metric {
+        SizeMetric::Logical => SizePreference::Logical,
+        SizeMetric::Allocated => SizePreference::Allocated,
     }
 }
 
@@ -414,5 +510,33 @@ mod tests {
         let strings = UiStrings::new(&i18n);
         assert_eq!(strings.get(MessageId::Theme), "Tema");
         assert_eq!(strings.get(MessageId::Safety), "Seguridad");
+    }
+
+    #[test]
+    fn preference_adapters_round_trip_every_closed_variant() {
+        for locale in [SettingsLocale::EnglishUnitedStates, SettingsLocale::SpanishMexico] {
+            assert_eq!(setting_from_locale(locale_from_setting(locale)), locale);
+        }
+        for theme in [SettingsTheme::System, SettingsTheme::Dark, SettingsTheme::Light] {
+            assert_eq!(setting_from_theme(theme_from_setting(theme)), theme);
+        }
+        for metric in [SizePreference::Logical, SizePreference::Allocated] {
+            assert_eq!(setting_from_metric(metric_from_setting(metric)), metric);
+        }
+    }
+
+    #[test]
+    fn settings_exit_handoff_survives_a_poisoned_mutex() {
+        let exit = SettingsExit::default();
+        let poisoned = exit.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poisoned.0.lock().expect("initial lock");
+            panic!("poison handoff fixture");
+        });
+        let mut store = crate::storage::SettingsDocumentStore::from_bytes(None);
+        let session = SettingsSession::load(&mut store);
+
+        exit.publish(session.clone());
+        assert_eq!(exit.take(), Some(session));
     }
 }
