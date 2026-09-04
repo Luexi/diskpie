@@ -19,6 +19,9 @@ pub enum FailureClass {
     PermissionDenied,
     /// The selected path does not exist, is not ready, or is not a directory.
     PathUnavailable,
+    /// The runtime is still releasing an earlier scan and could not accept
+    /// the launch within the retry budget.
+    Busy,
     /// Any other resolution, launch, or scan failure.
     Other,
 }
@@ -30,6 +33,7 @@ impl FailureClass {
         match self {
             Self::PermissionDenied => ErrorClass::AccessDenied,
             Self::PathUnavailable => ErrorClass::NotFound,
+            Self::Busy => ErrorClass::Busy,
             Self::Other => ErrorClass::Internal,
         }
     }
@@ -68,6 +72,7 @@ impl FailureClass {
     pub const fn from_runtime_error(error: &RuntimeError) -> Self {
         match error {
             RuntimeError::Scan(failure) => Self::from_scan_failure(failure),
+            RuntimeError::RetirementBackpressure => Self::Busy,
             _ => Self::Other,
         }
     }
@@ -157,14 +162,6 @@ fn settled_phase(phase: &SessionPhase) -> SettledPhase {
             SettledPhase::Complete
         }
     }
-}
-
-/// Terminal outcome of a native folder dialog, without its payload.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DialogOutcome {
-    Selected,
-    Cancelled,
-    Failed,
 }
 
 /// Outcome of handing a resolved launch to the runtime.
@@ -263,14 +260,17 @@ impl ScanFlow {
 
     /// Records the terminal dialog event. An event for an unknown request is
     /// ignored so a stale STA result cannot close a newer dialog.
-    pub fn dialog_finished(&mut self, request_id: u64, outcome: DialogOutcome) {
+    ///
+    /// A dialog that was dismissed or could not be shown is a picker outcome,
+    /// not a scan outcome: the previous state (earlier results included) is
+    /// restored unchanged and the shell reports the picker problem in its
+    /// status line only. Only a selection changes the flow, by way of the
+    /// resolver job the shell submits next.
+    pub fn dialog_finished(&mut self, request_id: u64) {
         if self.dialog_outstanding != Some(request_id) {
             return;
         }
         self.dialog_outstanding = None;
-        if matches!(outcome, DialogOutcome::Failed) {
-            self.failure = Some(FailureClass::Other);
-        }
     }
 
     pub const fn resolve_started(&mut self) {
@@ -346,7 +346,7 @@ mod tests {
         flow.dialog_submitted(7);
         assert_eq!(flow.state(), ScanUi::Choosing);
 
-        flow.dialog_finished(7, DialogOutcome::Selected);
+        flow.dialog_finished(7);
         flow.resolve_started();
         assert_eq!(flow.state(), ScanUi::Resolving);
 
@@ -385,7 +385,7 @@ mod tests {
         flow.observe_runtime(RuntimeObservation::Settled(SettledPhase::Complete), true);
         flow.dialog_submitted(1);
         assert_eq!(flow.state(), ScanUi::Choosing);
-        flow.dialog_finished(1, DialogOutcome::Cancelled);
+        flow.dialog_finished(1);
         assert_eq!(flow.state(), ScanUi::Complete);
     }
 
@@ -393,7 +393,7 @@ mod tests {
     fn stale_dialog_events_do_not_close_a_newer_dialog() {
         let mut flow = ScanFlow::new();
         flow.dialog_submitted(2);
-        flow.dialog_finished(1, DialogOutcome::Selected);
+        flow.dialog_finished(1);
         assert_eq!(flow.state(), ScanUi::Choosing);
         assert_eq!(flow.dialog_outstanding(), Some(2));
     }
@@ -407,16 +407,25 @@ mod tests {
 
         flow.dialog_submitted(3);
         assert_eq!(flow.state(), ScanUi::Choosing);
-        flow.dialog_finished(3, DialogOutcome::Cancelled);
+        flow.dialog_finished(3);
         assert_eq!(flow.state(), ScanUi::Empty);
     }
 
     #[test]
-    fn a_failed_dialog_is_reported_as_a_failure() {
+    fn a_failed_dialog_keeps_the_previous_results_and_state() {
         let mut flow = ScanFlow::new();
+        flow.observe_runtime(RuntimeObservation::Settled(SettledPhase::Complete), true);
         flow.dialog_submitted(4);
-        flow.dialog_finished(4, DialogOutcome::Failed);
-        assert_eq!(flow.state(), ScanUi::Failed { class: FailureClass::Other });
+        assert_eq!(flow.state(), ScanUi::Choosing);
+        // The picker failing (or being dismissed) is not a scan outcome.
+        flow.dialog_finished(4);
+        assert_eq!(flow.state(), ScanUi::Complete);
+        assert!(!flow.background_work_outstanding());
+
+        let mut empty = ScanFlow::new();
+        empty.dialog_submitted(5);
+        empty.dialog_finished(5);
+        assert_eq!(empty.state(), ScanUi::Empty);
     }
 
     #[test]
@@ -454,6 +463,11 @@ mod tests {
             FailureClass::from_runtime_error(&RuntimeError::ShuttingDown),
             FailureClass::Other
         );
+        assert_eq!(
+            FailureClass::from_runtime_error(&RuntimeError::RetirementBackpressure),
+            FailureClass::Busy
+        );
+        assert_eq!(FailureClass::Busy.error_class(), ErrorClass::Busy);
     }
 
     #[test]

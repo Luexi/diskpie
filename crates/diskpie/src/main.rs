@@ -188,12 +188,13 @@ fn finish_ui_services(
     resolver: ResolverWorker,
     bridge: DiagnosticBridge,
 ) -> (ShutdownReceipts, Option<SettingsSession>) {
-    let (session, runtime, picker) = match exit {
-        Some(exit) => (Some(exit.settings), exit.runtime, exit.picker),
-        None => (None, None, None),
+    let (session, mut runtime, picker, clock_origin) = match exit {
+        Some(exit) => (Some(exit.settings), exit.runtime, exit.picker, exit.clock_origin),
+        None => (None, None, None, Instant::now()),
     };
 
-    let runtime_shutdown_complete = runtime.as_ref().is_some_and(await_runtime_shutdown);
+    let runtime_shutdown_complete =
+        runtime.as_mut().is_some_and(|runtime| await_runtime_shutdown(runtime, clock_origin));
     // Disposal is bounded by the runtime's own contract: ownership of any
     // provider that has not returned transfers to the bounded reaper.
     drop(runtime);
@@ -221,7 +222,14 @@ fn finish_ui_services(
 }
 
 /// Polls the runtime's shutdown handoff within the service deadline.
-fn await_runtime_shutdown(runtime: &RuntimeController) -> bool {
+///
+/// Each poll also ticks the runtime with the shell's clock: shutdown
+/// completion requires the supervisor's output slots to be empty, and a
+/// terminal report that arrives after the last frame would otherwise sit
+/// there undrained until the deadline. Ticking here is not a callback and
+/// never blocks; a tick error (for example `ShuttingDown`) is expected and
+/// carries no work of its own.
+fn await_runtime_shutdown(runtime: &mut RuntimeController, clock_origin: Instant) -> bool {
     let deadline = Instant::now() + SERVICE_FINISH_TIMEOUT;
     loop {
         if runtime.is_shutdown_complete() {
@@ -230,6 +238,7 @@ fn await_runtime_shutdown(runtime: &RuntimeController) -> bool {
         if Instant::now() >= deadline {
             return false;
         }
+        let _ = runtime.tick(|| clock_origin.elapsed());
         std::thread::sleep(Duration::from_millis(5));
     }
 }
@@ -591,4 +600,42 @@ fn application_event(code: DiagnosticCode) -> DiagnosticEvent {
     let _target = event
         .push_field(DiagnosticField::Target(Target::new(OperatingSystem::Windows, architecture)));
     event
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    /// The `runtime_shutdown_complete` receipt is a real observation: a
+    /// runtime whose shutdown was requested from the frame loop hands its
+    /// ownership to background retirement within the service deadline, and
+    /// disposal after that returns without waiting on a callback.
+    #[test]
+    fn runtime_shutdown_receipt_is_true_after_a_requested_shutdown() {
+        let mut runtime = RuntimeController::new(shell::runtime_config_from_settings(
+            &diskpie_app::settings::Settings::default(),
+        ))
+        .expect("runtime starts");
+        assert!(!runtime.is_shutdown_complete(), "nothing was requested yet");
+        runtime.request_shutdown();
+        let started = Instant::now();
+        assert!(await_runtime_shutdown(&mut runtime, started));
+        assert!(started.elapsed() < SERVICE_FINISH_TIMEOUT);
+        drop(runtime);
+    }
+
+    #[test]
+    fn finishing_without_a_shell_exit_still_joins_the_root_owned_workers() {
+        let (client, resolver) =
+            resolver::start(resolver::UnsupportedBackend).expect("resolver starts");
+        let bridge = DiagnosticBridge::start(|_event| {}).expect("bridge starts");
+        client.request_stop();
+        drop(client);
+        let (receipts, session) = finish_ui_services(None, resolver, bridge);
+        assert!(session.is_none());
+        assert!(!receipts.runtime_shutdown_complete, "no runtime was handed back");
+        assert!(receipts.resolver_joined);
+        assert!(receipts.diagnostic_bridge_joined);
+        assert_eq!(receipts.diagnostic_events_dropped, 0);
+    }
 }

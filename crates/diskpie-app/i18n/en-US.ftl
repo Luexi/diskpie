@@ -112,3 +112,5 @@ list-keyboard-hint = Arrow keys move, Enter zooms, Backspace goes back.
 partial-settled = Finished with omissions
 scan-roots = Scan roots
 shortcuts = Shortcuts
+launch-backpressure = The previous scan is still releasing its resources, so the new scan could not start. Try again in a moment.
+command-busy = The view is still updating. Try again in a moment.

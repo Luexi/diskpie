@@ -159,10 +159,12 @@ pub enum MessageId {
     PartialSettled,
     ScanRoots,
     Shortcuts,
+    LaunchBackpressure,
+    CommandBusy,
 }
 
 impl MessageId {
-    pub const ALL: [Self; 111] = [
+    pub const ALL: [Self; 113] = [
         Self::AppName,
         Self::Tagline,
         Self::Back,
@@ -274,6 +276,8 @@ impl MessageId {
         Self::PartialSettled,
         Self::ScanRoots,
         Self::Shortcuts,
+        Self::LaunchBackpressure,
+        Self::CommandBusy,
     ];
 
     #[must_use]
@@ -411,6 +415,8 @@ impl MessageId {
             Self::PartialSettled => "partial-settled",
             Self::ScanRoots => "scan-roots",
             Self::Shortcuts => "shortcuts",
+            Self::LaunchBackpressure => "launch-backpressure",
+            Self::CommandBusy => "command-busy",
         }
     }
 }

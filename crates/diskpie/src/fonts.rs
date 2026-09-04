@@ -64,21 +64,22 @@ impl SystemFonts {
     }
 
     /// Appends the loaded fonts as fallbacks after every embedded face.
+    ///
+    /// Consumes the loaded bytes: they move into egui's font data so that up
+    /// to the whole byte budget is resident once, never twice.
     #[must_use]
-    pub fn apply_to(&self, mut definitions: FontDefinitions) -> FontDefinitions {
-        for font in &self.loaded {
-            let data = FontData {
-                font: Cow::Owned(font.bytes.clone()),
-                index: font.face_index,
-                tweak: Default::default(),
-            };
-            definitions.font_data.insert(font.name.clone(), Arc::new(data));
+    pub fn apply_to(self, mut definitions: FontDefinitions) -> FontDefinitions {
+        for font in self.loaded {
+            let LoadedFont { name, bytes, face_index } = font;
+            let data =
+                FontData { font: Cow::Owned(bytes), index: face_index, tweak: Default::default() };
             for family in [FontFamily::Proportional, FontFamily::Monospace] {
                 let names = definitions.families.entry(family).or_default();
-                if !names.iter().any(|name| name == &font.name) {
-                    names.push(font.name.clone());
+                if !names.iter().any(|existing| existing == &name) {
+                    names.push(name.clone());
                 }
             }
+            definitions.font_data.insert(name, Arc::new(data));
         }
         definitions
     }
@@ -186,6 +187,7 @@ mod tests {
             loaded: vec![LoadedFont { name: "system-x".to_owned(), bytes: vec![0], face_index: 0 }],
             skipped_for_budget: 0,
         };
+        assert!(!fonts.is_empty());
         let definitions = fonts.apply_to(FontDefinitions::default());
         for family in [FontFamily::Proportional, FontFamily::Monospace] {
             let names = &definitions.families[&family];
@@ -193,7 +195,6 @@ mod tests {
             assert!(names.len() > 1, "embedded fonts must stay in front");
         }
         assert!(definitions.font_data.contains_key("system-x"));
-        assert!(!fonts.is_empty());
     }
 
     #[test]

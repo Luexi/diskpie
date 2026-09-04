@@ -9,6 +9,7 @@
 //! here joins a thread.
 
 use std::{
+    collections::VecDeque,
     f32::consts::{FRAC_PI_2, TAU},
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -21,7 +22,7 @@ use eframe::egui::{
 };
 
 use diskpie_app::{
-    diagnostics::{DiagnosticCode, DiagnosticEvent, DiagnosticField, ErrorClass},
+    diagnostics::{DiagnosticCode, DiagnosticEvent, DiagnosticField, ErrorClass, Outcome},
     format::{format_iec_bytes, format_path_for_display},
     i18n::{I18n, I18nError, Locale, MessageId},
     navigation::{CommandAvailability, NavigationAction, UnavailableReason},
@@ -46,8 +47,8 @@ use crate::{
         SubmitJobError, VolumeList,
     },
     scan_ui::{
-        DialogOutcome, FailureClass, LaunchOutcome, RepaintRequest, RuntimeObservation, ScanFlow,
-        ScanUi, repaint_policy,
+        FailureClass, LaunchOutcome, RepaintRequest, RuntimeObservation, ScanFlow, ScanUi,
+        repaint_policy,
     },
     sunburst_view::{
         NodeChange, SunburstHitKind, SunburstMeshCache, SunburstMeshOptions, SunburstTooltip,
@@ -57,7 +58,9 @@ use crate::{
 };
 
 #[cfg(windows)]
-use diskpie_platform::{DialogEvent, OwnerWindow, ShellService, SubmitError};
+use diskpie_platform::{
+    DialogError, DialogErrorStage, DialogEvent, OwnerWindow, ShellService, SubmitError,
+};
 
 /// Largest-children rows offered by the synchronized list.
 const LARGEST_CHILDREN_LIMIT: usize = 200;
@@ -66,9 +69,12 @@ const SHELL_EVENT_BUDGET: usize = 4;
 /// Resolver results drained per frame.
 const RESOLVER_RESULT_BUDGET: usize = 4;
 /// Frames a launch may wait for retirement capacity before it is reported.
-const MAX_DEFERRED_LAUNCH_FRAMES: u32 = 900;
+pub const MAX_DEFERRED_LAUNCH_FRAMES: u32 = 900;
 /// Frames a navigation command may wait for a frame transition to settle.
 const MAX_DEFERRED_ACTION_FRAMES: u32 = 120;
+/// Navigation commands that may wait for a frame transition at once; older
+/// commands are kept in order and a newer one beyond the bound is refused.
+const MAX_DEFERRED_ACTIONS: usize = 8;
 /// Poll interval while a dialog or resolver job is outstanding.
 const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(33);
 
@@ -129,6 +135,10 @@ pub struct ShellExit {
     pub settings: SettingsSession,
     pub runtime: Option<RuntimeController>,
     pub picker: Option<NativeFolderPicker>,
+    /// Origin of the monotonic clock every runtime tick was posted with, so
+    /// the root can keep ticking the runtime during its bounded shutdown
+    /// wait without the clock going backwards.
+    pub clock_origin: Instant,
 }
 
 /// Single handoff from the dropped eframe application to the composition root.
@@ -161,6 +171,61 @@ struct DeferredLaunch {
 enum Notice {
     Message(MessageId),
     Text(String),
+}
+
+/// Terminal outcome of one native folder dialog, reduced to plain data so the
+/// shell's handling can be driven headlessly. The Windows adapter's
+/// `DialogEvent` is converted into this before anything else looks at it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PickerEvent {
+    Selected {
+        request_id: u64,
+        path: PathBuf,
+    },
+    Cancelled {
+        request_id: u64,
+    },
+    /// The dialog could not complete. `class` is derived from the adapter's
+    /// typed failure stage; `degraded` marks a dialog that did complete but
+    /// whose privacy cleanup failed afterwards.
+    Failed {
+        request_id: u64,
+        class: ErrorClass,
+        degraded: bool,
+    },
+}
+
+impl PickerEvent {
+    #[must_use]
+    pub const fn request_id(&self) -> u64 {
+        match self {
+            Self::Selected { request_id, .. }
+            | Self::Cancelled { request_id }
+            | Self::Failed { request_id, .. } => *request_id,
+        }
+    }
+}
+
+/// One volume row, formatted once when the listing or the locale changes.
+struct VolumeRow {
+    text: String,
+    path: PathBuf,
+    issues: Vec<String>,
+}
+
+/// Display path of the inspected node, rebuilt only when the committed
+/// revision or the subject changes rather than every frame.
+#[derive(Default)]
+struct DetailsCache {
+    key: Option<(u64, NodeId)>,
+    path: String,
+}
+
+/// Localized item-count sentence, reformatted only when the count changes.
+#[derive(Default)]
+struct ItemCountCache {
+    count: Option<u64>,
+    text: String,
 }
 
 /// Typed commands the widgets emit; dispatched after rendering borrows end.
@@ -200,10 +265,13 @@ pub struct DiskPieShell {
     diagnostics: DiagnosticSink,
     flow: ScanFlow,
     volumes: Option<VolumeList>,
+    volume_rows: Vec<VolumeRow>,
     volumes_job: Option<ResolveJobId>,
     deferred_launch: Option<DeferredLaunch>,
-    deferred_action: Option<(NavigationAction, u32)>,
+    deferred_actions: VecDeque<(NavigationAction, u32)>,
     roots_display: Vec<String>,
+    /// `roots_display` joined for the rails; rebuilt only when the roots change.
+    location: Option<String>,
     resolve_issues: Vec<String>,
     focused: Option<NodeId>,
     context_node: Option<NodeId>,
@@ -213,6 +281,8 @@ pub struct DiskPieShell {
     started: Instant,
     shutdown_requested: bool,
     list_cache: ListCache,
+    details_cache: DetailsCache,
+    item_count_cache: ItemCountCache,
     path_scratch: PathBuf,
     last_selected: Option<NodeId>,
     scroll_to_selection: bool,
@@ -253,8 +323,10 @@ impl DiskPieShell {
         exit: ExitHandoff,
     ) -> Result<Self, I18nError> {
         theme::install(ctx);
-        if !services.fonts.is_empty() {
-            ctx.set_fonts(services.fonts.apply_to(egui::FontDefinitions::default()));
+        let UiServices { runtime, picker, resolver, diagnostics, fonts } = services;
+        if !fonts.is_empty() {
+            // The font bytes move into egui; nothing keeps a second copy.
+            ctx.set_fonts(fonts.apply_to(egui::FontDefinitions::default()));
         }
         let locale = locale_from_setting(settings.settings().locale);
         let theme_preference = theme_from_setting(settings.settings().theme);
@@ -270,7 +342,6 @@ impl DiskPieShell {
         } else {
             Notice::Message(MessageId::StatusReady)
         };
-        let UiServices { runtime, picker, resolver, diagnostics, fonts: _ } = services;
         let mut shell = Self {
             i18n,
             strings,
@@ -288,10 +359,12 @@ impl DiskPieShell {
             diagnostics,
             flow: ScanFlow::new(),
             volumes: None,
+            volume_rows: Vec::new(),
             volumes_job: None,
             deferred_launch: None,
-            deferred_action: None,
+            deferred_actions: VecDeque::new(),
             roots_display: Vec::new(),
+            location: None,
             resolve_issues: Vec::new(),
             focused: None,
             context_node: None,
@@ -301,6 +374,8 @@ impl DiskPieShell {
             started: Instant::now(),
             shutdown_requested: false,
             list_cache: ListCache::default(),
+            details_cache: DetailsCache::default(),
+            item_count_cache: ItemCountCache::default(),
             path_scratch: PathBuf::new(),
             last_selected: None,
             scroll_to_selection: false,
@@ -341,12 +416,19 @@ impl DiskPieShell {
     }
 
     /// Asks every owned service to stop without waiting. Idempotent.
+    ///
+    /// A scan that is still running (or still cancelling) will never deliver
+    /// its terminal report to a later frame, so its `ScanCancelled` record is
+    /// written here with the counters observed at this moment.
     pub fn begin_shutdown(&mut self) {
         if self.shutdown_requested {
             return;
         }
         self.shutdown_requested = true;
         if let Some(runtime) = self.runtime.as_mut() {
+            if let Some(event) = interrupted_scan_event(runtime) {
+                self.diagnostics.emit(event);
+            }
             runtime.request_shutdown();
         }
         #[cfg(windows)]
@@ -363,35 +445,52 @@ impl DiskPieShell {
                 break;
             };
             match picker.try_recv() {
-                Ok(Some(event)) => self.handle_dialog_event(event),
+                Ok(Some(event)) => self.handle_picker_event(picker_event(event)),
                 Ok(None) => break,
                 Err(_stopped) => {
-                    self.picker = None;
-                    if let Some(request) = self.flow.dialog_outstanding() {
-                        self.flow.dialog_finished(request, DialogOutcome::Failed);
-                        self.notice = Notice::Message(MessageId::DialogFailed);
-                    }
+                    self.handle_picker_stopped();
                     break;
                 }
             }
         }
     }
 
-    #[cfg(windows)]
-    fn handle_dialog_event(&mut self, event: DialogEvent) {
-        let request_id = event.request_id().get();
+    /// The Shell STA stopped on its own: the picker is gone for the rest of
+    /// the session and an open dialog can never report back.
+    fn handle_picker_stopped(&mut self) {
+        self.picker = None;
+        if let Some(request_id) = self.flow.dialog_outstanding() {
+            self.handle_picker_event(PickerEvent::Failed {
+                request_id,
+                class: ErrorClass::Unsupported,
+                degraded: false,
+            });
+        }
+    }
+
+    /// Applies one terminal picker outcome. Only a selection moves the scan
+    /// flow forward; a dismissed or failed dialog leaves the previous state,
+    /// results included, exactly as it was and speaks through the status line.
+    fn handle_picker_event(&mut self, event: PickerEvent) {
+        let request_id = event.request_id();
+        if self.flow.dialog_outstanding() != Some(request_id) {
+            // A stale STA result must not close a newer dialog.
+            return;
+        }
+        self.flow.dialog_finished(request_id);
         match event {
-            DialogEvent::Selected { path, .. } => {
-                self.flow.dialog_finished(request_id, DialogOutcome::Selected);
-                self.request_scan_paths(vec![path]);
+            PickerEvent::Selected { path, .. } => self.request_scan_paths(vec![path]),
+            PickerEvent::Cancelled { .. } => {
+                if self.notice == Notice::Message(MessageId::Choosing) {
+                    self.notice = Notice::Message(match self.flow.state() {
+                        ScanUi::Empty => MessageId::StatusReady,
+                        state => phase_message(state),
+                    });
+                }
             }
-            DialogEvent::Cancelled { .. } => {
-                self.flow.dialog_finished(request_id, DialogOutcome::Cancelled);
-            }
-            DialogEvent::Failed { .. } => {
-                self.flow.dialog_finished(request_id, DialogOutcome::Failed);
+            PickerEvent::Failed { class, degraded, .. } => {
                 self.notice = Notice::Message(MessageId::DialogFailed);
-                self.diagnostics.emit(shell_failed_event(request_id, ErrorClass::Internal));
+                self.diagnostics.emit(shell_failed_event(request_id, class, degraded));
             }
         }
     }
@@ -410,10 +509,12 @@ impl DiskPieShell {
         if self.volumes_job == Some(id) {
             self.volumes_job = None;
             match outcome {
-                ResolveOutcome::Volumes(list) => self.volumes = Some(list),
+                ResolveOutcome::Volumes(list) => self.set_volumes(list),
                 ResolveOutcome::Failed(failure) => {
-                    self.volumes =
-                        Some(VolumeList { volumes: Vec::new(), errors: vec![failure.detail] });
+                    self.set_volumes(VolumeList {
+                        volumes: Vec::new(),
+                        errors: vec![failure.detail],
+                    });
                 }
                 ResolveOutcome::Launch(_) | ResolveOutcome::Abandoned => {}
             }
@@ -434,10 +535,49 @@ impl DiskPieShell {
             }
             ResolveOutcome::Volumes(list) => {
                 self.flow.resolve_finished(Ok(()));
-                self.volumes = Some(list);
+                self.set_volumes(list);
             }
             ResolveOutcome::Abandoned => self.flow.resolve_finished(Ok(())),
         }
+    }
+
+    /// Stores a volume listing and formats its rows once.
+    fn set_volumes(&mut self, list: VolumeList) {
+        self.volumes = Some(list);
+        self.refresh_volume_rows();
+    }
+
+    fn refresh_volume_rows(&mut self) {
+        let Some(list) = self.volumes.as_ref() else {
+            self.volume_rows.clear();
+            return;
+        };
+        self.volume_rows = list
+            .volumes
+            .iter()
+            .map(|volume| {
+                let mut text = volume.display.clone();
+                if let Some(label) = volume.label.as_deref().filter(|label| !label.is_empty()) {
+                    text.push_str("  ");
+                    text.push_str(label);
+                }
+                if let Some(filesystem) = volume.filesystem.as_deref() {
+                    text.push_str("  ·  ");
+                    text.push_str(filesystem);
+                }
+                if let (Some(free), Some(total)) = (volume.free_bytes, volume.total_bytes) {
+                    text.push_str("  ·  ");
+                    text.push_str(&format_iec_bytes(u128::from(free), self.locale));
+                    text.push(' ');
+                    text.push_str(self.strings.get(MessageId::Free));
+                    text.push_str("  ·  ");
+                    text.push_str(&format_iec_bytes(u128::from(total), self.locale));
+                    text.push(' ');
+                    text.push_str(self.strings.get(MessageId::Total));
+                }
+                VolumeRow { text, path: volume.path.clone(), issues: volume.issues.clone() }
+            })
+            .collect();
     }
 
     fn launch(&mut self, launch: ResolvedLaunch) {
@@ -445,6 +585,9 @@ impl DiskPieShell {
         self.try_launch(DeferredLaunch { fs, roots, cancel, displays, issues, frames: 0 });
     }
 
+    /// Hands a resolved launch to the runtime. A rejection returns the exact
+    /// provider, roots, and cancel token, which are retained for a retry on a
+    /// later frame while retirement backpressure lasts.
     fn try_launch(&mut self, launch: DeferredLaunch) {
         let DeferredLaunch { fs, roots, cancel, displays, issues, frames } = launch;
         let Some(runtime) = self.runtime.as_mut() else {
@@ -455,6 +598,7 @@ impl DiskPieShell {
         match runtime.request_scan(fs, roots, cancel) {
             Ok(receipt) => {
                 self.flow.launch_attempted(LaunchOutcome::Accepted);
+                self.location = (!displays.is_empty()).then(|| displays.join(LOCATION_SEPARATOR));
                 self.roots_display = displays;
                 self.resolve_issues = issues;
                 self.focused = None;
@@ -467,24 +611,27 @@ impl DiskPieShell {
             }
             Err(rejected) => {
                 let (error, fs, roots, cancel) = rejected.into_parts();
-                if error == RuntimeError::RetirementBackpressure
-                    && frames < MAX_DEFERRED_LAUNCH_FRAMES
-                {
-                    self.flow.launch_attempted(LaunchOutcome::Deferred);
-                    self.deferred_launch = Some(DeferredLaunch {
-                        fs,
-                        roots,
-                        cancel,
-                        displays,
-                        issues,
-                        frames: frames.saturating_add(1),
-                    });
-                } else {
-                    let class = FailureClass::from_runtime_error(&error);
-                    self.flow.launch_attempted(LaunchOutcome::Rejected(class));
-                    self.notice = Notice::Message(failure_message(class));
-                    self.diagnostics
-                        .emit(classified_event(DiagnosticCode::ScanFailed, class.error_class()));
+                let outcome = launch_rejection_outcome(&error, frames);
+                self.flow.launch_attempted(outcome);
+                match outcome {
+                    LaunchOutcome::Deferred => {
+                        self.deferred_launch = Some(DeferredLaunch {
+                            fs,
+                            roots,
+                            cancel,
+                            displays,
+                            issues,
+                            frames: frames.saturating_add(1),
+                        });
+                    }
+                    LaunchOutcome::Rejected(class) => {
+                        self.notice = Notice::Message(failure_message(class));
+                        self.diagnostics.emit(classified_event(
+                            DiagnosticCode::ScanFailed,
+                            class.error_class(),
+                        ));
+                    }
+                    LaunchOutcome::Accepted => {}
                 }
             }
         }
@@ -573,7 +720,7 @@ impl DiskPieShell {
         let Some(navigation) = runtime.navigation() else {
             return;
         };
-        if navigation.size_basis() != self.metric && self.deferred_action.is_none() {
+        if navigation.size_basis() != self.metric && self.deferred_actions.is_empty() {
             let metric = self.metric;
             self.navigate(NavigationAction::SetSizeBasis(metric));
         }
@@ -653,8 +800,12 @@ impl DiskPieShell {
                     self.notice = Notice::Message(MessageId::DialogBusy);
                 }
                 Err(SubmitError::ServiceUnavailable) => {
+                    // No request was accepted, so there is no request id to log.
                     self.notice = Notice::Message(MessageId::FolderPickerUnavailable);
-                    self.diagnostics.emit(shell_failed_event(0, ErrorClass::Unsupported));
+                    self.diagnostics.emit(classified_event(
+                        DiagnosticCode::ShellActionFailed,
+                        ErrorClass::Unsupported,
+                    ));
                 }
             }
         }
@@ -684,25 +835,8 @@ impl DiskPieShell {
             return;
         }
         match runtime.execute_navigation(command) {
-            Ok(report) => {
-                if let Some(request) = report.rescan_request() {
-                    let paths = request
-                        .full_roots()
-                        .iter()
-                        .map(|target| target.path().to_path_buf())
-                        .collect::<Vec<_>>();
-                    if paths.is_empty() {
-                        // Branch rescans have no engine path yet; availability
-                        // already reports it, this is defensive.
-                        self.notice = Notice::Message(MessageId::RescanBranchUnavailable);
-                    } else {
-                        self.request_scan_paths(paths);
-                    }
-                }
-            }
-            Err(RuntimeError::FrameTransitionPending) => {
-                self.deferred_action = Some((action, 0));
-            }
+            Ok(report) => self.consume_navigation_report(&report),
+            Err(RuntimeError::FrameTransitionPending) => self.defer_action(action),
             Err(RuntimeError::Navigation(error)) => {
                 if let diskpie_app::navigation::NavigationError::CommandUnavailable {
                     reason, ..
@@ -719,8 +853,39 @@ impl DiskPieShell {
         }
     }
 
+    /// Launches the full-root rescan a report asks for, if any.
+    fn consume_navigation_report(&mut self, report: &diskpie_app::runtime::NavigationReport) {
+        if let Some(request) = report.rescan_request() {
+            let paths = request
+                .full_roots()
+                .iter()
+                .map(|target| target.path().to_path_buf())
+                .collect::<Vec<_>>();
+            if paths.is_empty() {
+                // Branch rescans have no engine path yet; availability
+                // already reports it, this is defensive.
+                self.notice = Notice::Message(MessageId::RescanBranchUnavailable);
+            } else {
+                self.request_scan_paths(paths);
+            }
+        }
+    }
+
+    /// Queues an action refused with `FrameTransitionPending`. The queue keeps
+    /// order and is bounded; an action beyond the bound is refused visibly
+    /// instead of silently replacing an earlier one.
+    fn defer_action(&mut self, action: NavigationAction) {
+        if self.deferred_actions.len() >= MAX_DEFERRED_ACTIONS {
+            self.notice = Notice::Message(MessageId::CommandBusy);
+            return;
+        }
+        self.deferred_actions.push_back((action, 0));
+    }
+
+    /// Retries the oldest deferred action once per frame; later ones wait so
+    /// the user's order is preserved.
     fn retry_deferred_action(&mut self) {
-        let Some((action, frames)) = self.deferred_action.take() else {
+        let Some((action, frames)) = self.deferred_actions.pop_front() else {
             return;
         };
         if frames >= MAX_DEFERRED_ACTION_FRAMES {
@@ -733,20 +898,9 @@ impl DiskPieShell {
             return;
         };
         match runtime.execute_navigation(command) {
-            Ok(report) => {
-                if let Some(request) = report.rescan_request() {
-                    let paths = request
-                        .full_roots()
-                        .iter()
-                        .map(|target| target.path().to_path_buf())
-                        .collect::<Vec<_>>();
-                    if !paths.is_empty() {
-                        self.request_scan_paths(paths);
-                    }
-                }
-            }
+            Ok(report) => self.consume_navigation_report(&report),
             Err(RuntimeError::FrameTransitionPending) => {
-                self.deferred_action = Some((action, frames.saturating_add(1)));
+                self.deferred_actions.push_front((action, frames.saturating_add(1)));
             }
             Err(_error) => runtime.clear_error(),
         }
@@ -799,7 +953,54 @@ impl DiskPieShell {
             self.strings = UiStrings::new(&i18n);
             self.i18n = i18n;
             self.locale = locale;
+            // Preformatted rows and sentences carry locale-specific text.
+            self.refresh_volume_rows();
+            self.item_count_cache = ItemCountCache::default();
         }
+    }
+
+    /// Refreshes the per-frame formatted values that depend only on the
+    /// committed frame, so rendering allocates nothing when nothing changed.
+    fn refresh_frame_caches(&mut self) {
+        let entries = self
+            .runtime
+            .as_ref()
+            .and_then(RuntimeController::progress)
+            .map(SessionProgress::effective)
+            .unwrap_or_default()
+            .entries;
+        if self.item_count_cache.count != Some(entries) {
+            self.item_count_cache =
+                ItemCountCache { count: Some(entries), text: self.item_count(entries) };
+        }
+        self.refresh_details_cache();
+        self.refresh_list_cache();
+    }
+
+    fn refresh_details_cache(&mut self) {
+        let Some(runtime) = self.runtime.as_ref() else {
+            self.details_cache = DetailsCache::default();
+            return;
+        };
+        let (Some(snapshot), Some(navigation), Some(revision)) =
+            (runtime.snapshot(), runtime.navigation(), runtime.displayed_revision())
+        else {
+            self.details_cache = DetailsCache::default();
+            return;
+        };
+        let subject = navigation.selected().unwrap_or_else(|| navigation.view_root());
+        let key = (revision, subject);
+        if self.details_cache.key == Some(key) {
+            return;
+        }
+        let path = if snapshot.path_into(subject, &mut self.path_scratch).is_ok()
+            && !self.path_scratch.as_os_str().is_empty()
+        {
+            format_path_for_display(&self.path_scratch)
+        } else {
+            snapshot.node(subject).map(display_name).unwrap_or_default()
+        };
+        self.details_cache = DetailsCache { key: Some(key), path };
     }
 
     fn synchronize_settings(&mut self) {
@@ -831,12 +1032,24 @@ impl DiskPieShell {
     // Rendering
     // ----------------------------------------------------------------------
 
+    /// Shell-wide shortcuts. They yield to a focused text field (which owns
+    /// Backspace and the rest) and Escape yields to an open popup, which egui
+    /// closes with that key itself. Modifiers must match exactly so
+    /// Alt+Backspace is not mistaken for Backspace.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if text_field_has_focus(ctx) {
+            return;
+        }
         let can_cancel = self.flow.state().can_cancel();
+        let popup_open = egui::Popup::is_any_open(ctx);
         let mut commands = Vec::new();
         ctx.input_mut(|input| {
             for (modifiers, key) in SHORTCUTS {
+                if key == Key::Escape && popup_open {
+                    continue;
+                }
                 if let Some(command) = shortcut_command(modifiers, key, can_cancel)
+                    && input.modifiers.matches_exact(modifiers)
                     && input.consume_key(modifiers, key)
                 {
                     commands.push(command);
@@ -861,11 +1074,7 @@ impl DiskPieShell {
             .and_then(RuntimeController::navigation)
             .is_some_and(diskpie_app::navigation::NavigationState::is_summary_view);
         let picker_available = self.picker.is_some();
-        let location = if self.roots_display.is_empty() {
-            None
-        } else {
-            Some(self.roots_display.join(" · "))
-        };
+        let location = self.location.as_deref();
         let strings = &self.strings;
         let mut selected_locale = self.locale;
         let theme_preference = &mut self.theme_preference;
@@ -955,7 +1164,6 @@ impl DiskPieShell {
                                 egui::Label::new(
                                     RichText::new(
                                         location
-                                            .as_deref()
                                             .unwrap_or_else(|| strings.get(MessageId::NoLocation)),
                                     )
                                     .weak()
@@ -1033,7 +1241,7 @@ impl DiskPieShell {
             .and_then(RuntimeController::navigation)
             .map_or(0, diskpie_app::navigation::NavigationState::hidden_branch_count);
         let restore_all = self.availability(NavigationAction::RestoreAllBranches);
-        let items = self.item_count(counters.entries);
+        let items = self.item_count_cache.text.as_str();
         let hidden_label = if hidden > 0 {
             self.i18n
                 .hidden_group(u64::try_from(hidden).unwrap_or(u64::MAX))
@@ -1064,7 +1272,7 @@ impl DiskPieShell {
                     metric_value(ui, strings.get(MessageId::Folders), &folders);
                     metric_value(ui, strings.get(MessageId::OmittedItems), &omissions);
                     metric_value(ui, strings.get(MessageId::UnknownSize), &unknown);
-                    ui.label(RichText::new(&items).weak().monospace());
+                    ui.label(RichText::new(items).weak().monospace());
                     ui.separator();
                     let logical = ui.add(
                         egui::Button::new(strings.get(MessageId::LogicalSize))
@@ -1232,12 +1440,20 @@ impl DiskPieShell {
 
         if let ScanUi::Failed { class } = state {
             ui.add_space(8.0);
-            ui.label(RichText::new(self.strings.get(failure_message(class))).strong());
-            if let Notice::Text(text) = &self.notice {
-                ui.label(RichText::new(text).weak().monospace());
+            let explanation = failure_message(class);
+            ui.label(RichText::new(self.strings.get(explanation)).strong());
+            match &self.notice {
+                Notice::Text(text) => {
+                    ui.label(RichText::new(text).weak().monospace());
+                }
+                Notice::Message(id) if *id != explanation => {
+                    ui.label(RichText::new(self.strings.get(*id)).weak());
+                }
+                Notice::Message(_) => {}
             }
         }
-        if state == ScanUi::Choosing || self.picker.is_none() {
+        // The hint is about this session's picker, not about an open dialog.
+        if self.picker.is_none() {
             ui.add_space(8.0);
             ui.label(RichText::new(self.strings.get(MessageId::FolderPickerUnavailable)).weak());
         }
@@ -1276,34 +1492,16 @@ impl DiskPieShell {
         if list.volumes.is_empty() {
             ui.label(RichText::new(self.strings.get(MessageId::NoVolumesFound)).weak());
         }
-        for volume in &list.volumes {
-            let mut text = volume.display.clone();
-            if let Some(label) = volume.label.as_deref().filter(|label| !label.is_empty()) {
-                text.push_str("  ");
-                text.push_str(label);
-            }
-            if let Some(filesystem) = volume.filesystem.as_deref() {
-                text.push_str("  ·  ");
-                text.push_str(filesystem);
-            }
-            if let (Some(free), Some(total)) = (volume.free_bytes, volume.total_bytes) {
-                text.push_str("  ·  ");
-                text.push_str(&format_iec_bytes(u128::from(free), self.locale));
-                text.push(' ');
-                text.push_str(self.strings.get(MessageId::Free));
-                text.push_str("  ·  ");
-                text.push_str(&format_iec_bytes(u128::from(total), self.locale));
-                text.push(' ');
-                text.push_str(self.strings.get(MessageId::Total));
-            }
+        for row in &self.volume_rows {
             let response = ui.add_enabled(
                 !busy,
-                egui::Button::new(RichText::new(text).monospace()).min_size(Vec2::new(360.0, 0.0)),
+                egui::Button::new(RichText::new(row.text.as_str()).monospace())
+                    .min_size(Vec2::new(360.0, 0.0)),
             );
             if response.clicked() {
-                commands.push(ShellCommand::ScanPaths(vec![volume.path.clone()]));
+                commands.push(ShellCommand::ScanPaths(vec![row.path.clone()]));
             }
-            for issue in volume.issues.iter().take(3) {
+            for issue in row.issues.iter().take(3) {
                 ui.label(RichText::new(issue).weak().small());
             }
         }
@@ -1425,18 +1623,11 @@ impl DiskPieShell {
     fn inspector(&mut self, ui: &mut egui::Ui) {
         let mut commands = Vec::new();
         let state = self.flow.state();
-        let counters = self
-            .runtime
-            .as_ref()
-            .and_then(RuntimeController::progress)
-            .map(SessionProgress::effective)
-            .unwrap_or_default();
-        let item_count = self.item_count(counters.entries);
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.heading(self.strings.get(MessageId::LargestItems));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new(item_count).weak().monospace());
+                ui.label(RichText::new(self.item_count_cache.text.as_str()).weak().monospace());
             });
         });
         self.largest_list(ui, &mut commands);
@@ -1490,7 +1681,6 @@ impl DiskPieShell {
 
     /// Keyboard-operable, virtualized companion list synchronized with the chart.
     fn largest_list(&mut self, ui: &mut egui::Ui, commands: &mut Vec<ShellCommand>) {
-        self.refresh_list_cache();
         let Some(runtime) = self.runtime.as_ref() else {
             ui.label(RichText::new(self.strings.get(MessageId::EmptyItemsHint)).weak());
             return;
@@ -1512,8 +1702,10 @@ impl DiskPieShell {
         let strings = &self.strings;
         let locale = self.locale;
         let scroll_to_selection = std::mem::take(&mut self.scroll_to_selection);
-        let hint = strings.get(MessageId::ListKeyboardHint);
-        ui.label(RichText::new(hint).weak().small());
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(strings.get(MessageId::Shortcuts)).small());
+            ui.label(RichText::new(strings.get(MessageId::ListKeyboardHint)).weak().small());
+        });
         let row_height = ui.spacing().interact_size.y;
         let list_height = (ui.available_height() * 0.45).clamp(120.0, 420.0);
         let enter = ui.input(|input| input.key_pressed(Key::Enter));
@@ -1574,16 +1766,13 @@ impl DiskPieShell {
         let subject = navigation
             .and_then(|navigation| navigation.selected().or_else(|| Some(navigation.view_root())));
         let record = subject.and_then(|node| snapshot.and_then(|snapshot| snapshot.node(node)));
-        let path = match (snapshot, subject) {
-            (Some(snapshot), Some(node)) => snapshot
-                .path(node)
-                .ok()
-                .filter(|path| !path.as_os_str().is_empty())
-                .map(|path| format_path_for_display(&path))
-                .or_else(|| record.map(display_name)),
-            _ => None,
+        // The display path was rebuilt by `refresh_details_cache` only when
+        // the revision or the subject changed.
+        let path = if self.details_cache.key.is_some() && !self.details_cache.path.is_empty() {
+            self.details_cache.path.as_str()
+        } else {
+            strings.get(MessageId::NoSelection)
         };
-        let path = path.unwrap_or_else(|| strings.get(MessageId::NoSelection).to_owned());
         let aggregate = record.map(NodeRecord::aggregate);
         let logical = aggregate.map_or_else(
             || "—".to_owned(),
@@ -1601,7 +1790,10 @@ impl DiskPieShell {
             strings.get(phase_message(state))
         };
 
-        let mut rows: Vec<(&str, &str)> = vec![(strings.get(MessageId::CurrentPath), &path)];
+        let mut rows: Vec<(&str, &str)> = vec![(strings.get(MessageId::CurrentPath), path)];
+        if let Some(location) = self.location.as_deref() {
+            rows.push((strings.get(MessageId::ScanRoots), location));
+        }
         match (self.show_both_sizes, self.metric) {
             (true, _) => {
                 rows.push((strings.get(MessageId::LogicalSize), &logical));
@@ -1656,11 +1848,10 @@ impl DiskPieShell {
     }
 
     fn status_rail(&self, ui: &mut egui::Ui) {
-        let height = if self.previous_session_panicked || self.optional_services_unavailable {
-            56.0
-        } else {
-            34.0
-        };
+        // Both facts are shown when both hold; each adds one line.
+        let extra_lines = usize::from(self.previous_session_panicked)
+            + usize::from(self.optional_services_unavailable);
+        let height = 34.0 + 22.0 * extra_lines as f32;
         egui::Panel::bottom("status-rail").exact_size(height).show_separator_line(true).show(
             ui,
             |ui| {
@@ -1681,7 +1872,8 @@ impl DiskPieShell {
                                 )
                                 .truncate(),
                             );
-                        } else if self.optional_services_unavailable {
+                        }
+                        if self.optional_services_unavailable {
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(
@@ -1733,6 +1925,7 @@ impl eframe::App for DiskPieShell {
             self.begin_shutdown();
         }
         self.logic(&ctx);
+        self.refresh_frame_caches();
         self.handle_shortcuts(&ctx);
         self.command_rail(ui);
         self.telemetry_rail(ui);
@@ -1757,6 +1950,7 @@ impl Drop for DiskPieShell {
             settings: self.settings.clone(),
             runtime: self.runtime.take(),
             picker: self.picker.take(),
+            clock_origin: self.started,
         });
     }
 }
@@ -1830,7 +2024,90 @@ pub const fn failure_message(class: FailureClass) -> MessageId {
     match class {
         FailureClass::PermissionDenied => MessageId::PermissionDenied,
         FailureClass::PathUnavailable => MessageId::PathUnavailable,
+        FailureClass::Busy => MessageId::LaunchBackpressure,
         FailureClass::Other => MessageId::ScanFailedOther,
+    }
+}
+
+/// Pure decision for a rejected launch: retirement backpressure is retried
+/// on later frames until the frame budget is spent; every other error, and a
+/// spent budget, fails with its typed class (`Busy` for the spent budget).
+#[must_use]
+pub fn launch_rejection_outcome(error: &RuntimeError, frames: u32) -> LaunchOutcome {
+    if *error == RuntimeError::RetirementBackpressure && frames < MAX_DEFERRED_LAUNCH_FRAMES {
+        LaunchOutcome::Deferred
+    } else {
+        LaunchOutcome::Rejected(FailureClass::from_runtime_error(error))
+    }
+}
+
+/// The `ScanCancelled` record for a scan that shutdown interrupts, with the
+/// counters observed now. `None` when no generation is active or cancelling.
+#[must_use]
+pub fn interrupted_scan_event(runtime: &RuntimeController) -> Option<DiagnosticEvent> {
+    let generation = match runtime.state() {
+        RuntimeState::Active { generation, .. } | RuntimeState::Cancelling { generation, .. } => {
+            generation
+        }
+        RuntimeState::Idle
+        | RuntimeState::Settled { .. }
+        | RuntimeState::ShuttingDown { .. }
+        | RuntimeState::ShutdownComplete => return None,
+    };
+    let counters = runtime.progress().map(SessionProgress::effective).unwrap_or_default();
+    let mut event = DiagnosticEvent::new(DiagnosticCode::ScanCancelled);
+    let _generation = event.push_field(DiagnosticField::GenerationId(generation.get()));
+    let _files = event.push_field(DiagnosticField::FileCount(counters.files));
+    let _directories = event.push_field(DiagnosticField::DirectoryCount(counters.directories));
+    let _omissions = event.push_field(DiagnosticField::OmissionCount(counters.omissions));
+    Some(event)
+}
+
+/// Whether the focused widget is a text field, which then owns the keys the
+/// shell would otherwise claim as shortcuts.
+fn text_field_has_focus(ctx: &egui::Context) -> bool {
+    ctx.memory(|memory| memory.focused())
+        .is_some_and(|id| egui::widgets::text_edit::TextEditState::load(ctx, id).is_some())
+}
+
+/// Separator between several scan roots in the rails.
+const LOCATION_SEPARATOR: &str = " · ";
+
+/// Reduces the Windows adapter's terminal dialog event to plain data.
+#[cfg(windows)]
+fn picker_event(event: DialogEvent) -> PickerEvent {
+    let request_id = event.request_id().get();
+    match event {
+        DialogEvent::Selected { path, .. } => PickerEvent::Selected { request_id, path },
+        DialogEvent::Cancelled { .. } => PickerEvent::Cancelled { request_id },
+        DialogEvent::Failed { error, .. } => PickerEvent::Failed {
+            request_id,
+            class: dialog_error_class(&error),
+            degraded: error.stage == DialogErrorStage::ClearClientData,
+        },
+    }
+}
+
+/// Maps the adapter's typed failure stage to the diagnostic class so the log
+/// can tell a stopped service, a dialog that could not be created or shown,
+/// an unreadable result, and a failed privacy cleanup apart.
+#[cfg(windows)]
+pub const fn dialog_error_class(error: &DialogError) -> ErrorClass {
+    match error.stage {
+        // The STA was stopping or its worker is gone; nothing was shown.
+        DialogErrorStage::ServiceShutdown => ErrorClass::Busy,
+        DialogErrorStage::WorkerPanicked => ErrorClass::Internal,
+        // The Shell dialog object could not be created or configured.
+        DialogErrorStage::CreateDialog
+        | DialogErrorStage::GetOptions
+        | DialogErrorStage::SetOptions
+        | DialogErrorStage::SetClientGuid => ErrorClass::Unsupported,
+        // The dialog session itself failed while it was shown.
+        DialogErrorStage::Show | DialogErrorStage::MessagePump => ErrorClass::Io,
+        // A selection was made but could not be read as a filesystem path.
+        DialogErrorStage::GetResult | DialogErrorStage::GetDisplayName => ErrorClass::InvalidData,
+        // The dialog completed; only the post-dialog privacy cleanup failed.
+        DialogErrorStage::ClearClientData => ErrorClass::Io,
     }
 }
 
@@ -2047,11 +2324,14 @@ fn command_button(
     response.clicked()
 }
 
-#[cfg(windows)]
-fn shell_failed_event(request_id: u64, class: ErrorClass) -> DiagnosticEvent {
+/// `shell.action_failed` for an accepted request. `degraded` records that the
+/// dialog itself completed and only its cleanup failed.
+fn shell_failed_event(request_id: u64, class: ErrorClass, degraded: bool) -> DiagnosticEvent {
     let mut event = DiagnosticEvent::new(DiagnosticCode::ShellActionFailed);
     let _request = event.push_field(DiagnosticField::RequestId(request_id));
     let _class = event.push_field(DiagnosticField::ErrorClass(class));
+    let outcome = if degraded { Outcome::Degraded } else { Outcome::Failed };
+    let _outcome = event.push_field(DiagnosticField::Outcome(outcome));
     event
 }
 
@@ -2176,18 +2456,124 @@ mod tests {
         }
     }
 
+    /// In-memory provider: a fixed tree with an optional delay per directory
+    /// visit so a scan can be observed while it is still running.
+    struct FixtureFs {
+        root: PathBuf,
+        delay: Duration,
+    }
+
+    impl FixtureFs {
+        const BRANCHES: usize = 12;
+
+        fn entry(
+            name: &str,
+            kind: diskpie_core::EntryKind,
+            bytes: u64,
+        ) -> diskpie_scan::DirectoryItem {
+            use diskpie_core::{MetricSource, OwnMetrics, SizeMetric};
+            let metrics = if kind == diskpie_core::EntryKind::Directory {
+                OwnMetrics::ZERO_BY_POLICY
+            } else {
+                OwnMetrics::new(
+                    SizeMetric::known(bytes, MetricSource::PortableMetadata),
+                    SizeMetric::known(bytes, MetricSource::FilesystemAllocation),
+                )
+            };
+            diskpie_scan::DirectoryItem::Entry(diskpie_scan::FsEntry::new(name, kind, metrics))
+        }
+    }
+
+    impl ScanFs for FixtureFs {
+        fn visit_directory(
+            &self,
+            directory: &std::path::Path,
+            visitor: &mut dyn FnMut(diskpie_scan::DirectoryItem) -> diskpie_scan::VisitControl,
+        ) -> Result<(), diskpie_scan::FsError> {
+            use diskpie_core::EntryKind;
+            if !self.delay.is_zero() {
+                std::thread::sleep(self.delay);
+            }
+            if directory == self.root {
+                for index in 0..Self::BRANCHES {
+                    let name = format!("branch-{index}");
+                    if visitor(Self::entry(&name, EntryKind::Directory, 0))
+                        == diskpie_scan::VisitControl::Stop
+                    {
+                        return Ok(());
+                    }
+                }
+                let _ = visitor(Self::entry("readme.txt", EntryKind::File, 4_096));
+                return Ok(());
+            }
+            let name = directory.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+            let Some(index) = name.strip_prefix("branch-").and_then(|n| n.parse::<u64>().ok())
+            else {
+                return Err(diskpie_scan::FsError::new(
+                    directory,
+                    diskpie_scan::FsOperation::EnumerateDirectory,
+                    diskpie_scan::FsErrorKind::NotFound,
+                ));
+            };
+            for file in 0..4_u64 {
+                let bytes = (index + 1) * 1_024 * (file + 1);
+                let _ = visitor(Self::entry(&format!("file-{file}.bin"), EntryKind::File, bytes));
+            }
+            Ok(())
+        }
+    }
+
+    /// Backend that resolves every path to one fixture root without I/O.
+    struct FixtureBackend {
+        root: PathBuf,
+        delay: Duration,
+    }
+
+    impl ResolveBackend for FixtureBackend {
+        fn resolve_root(&self, _path: &Path) -> Result<ResolvedRoot, ResolveFailure> {
+            Ok(ResolvedRoot {
+                root: ScanRoot::new(
+                    self.root.clone(),
+                    diskpie_core::VolumeKey::new(1),
+                    diskpie_scan::StorageClass::Unknown,
+                ),
+                issues: Vec::new(),
+            })
+        }
+
+        fn discover_volumes(&self) -> VolumeList {
+            VolumeList::default()
+        }
+
+        fn filesystem(&self, _cancel: CancelToken) -> Arc<dyn ScanFs> {
+            Arc::new(FixtureFs { root: self.root.clone(), delay: self.delay })
+        }
+    }
+
+    fn fixture_root() -> PathBuf {
+        PathBuf::from(r"C:\fixture\tree")
+    }
+
     fn headless_shell(startup_path: Option<PathBuf>) -> (DiskPieShell, egui::Context) {
+        headless_shell_with(RejectingBackend, DiagnosticSink::disconnected(), startup_path)
+    }
+
+    fn headless_shell_with(
+        backend: impl ResolveBackend,
+        diagnostics: DiagnosticSink,
+        startup_path: Option<PathBuf>,
+    ) -> (DiskPieShell, egui::Context) {
         let ctx = egui::Context::default();
         let mut store = crate::storage::SettingsDocumentStore::from_bytes(None);
         let settings = SettingsSession::load(&mut store);
         let runtime = RuntimeController::new(runtime_config_from_settings(settings.settings()))
             .expect("runtime starts");
-        let (resolver, _worker) = crate::resolver::start(RejectingBackend).expect("resolver");
+        let (resolver, _worker) = crate::resolver::start(backend).expect("resolver");
         let services = UiServices {
             runtime,
             picker: None,
             resolver,
-            diagnostics: DiagnosticSink::disconnected(),
+            diagnostics,
             fonts: SystemFonts::default(),
         };
         let shell = DiskPieShell::with_context(
@@ -2211,6 +2597,52 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         shell.logic(ctx);
+    }
+
+    /// Runs logic frames until `done` holds or the deadline passes.
+    fn pump_until(
+        shell: &mut DiskPieShell,
+        ctx: &egui::Context,
+        what: &str,
+        mut done: impl FnMut(&DiskPieShell) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            shell.logic(ctx);
+            shell.refresh_frame_caches();
+            if done(shell) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what}: {:?}",
+                shell.scan_state()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// A recorder that keeps the codes of every event the shell emitted.
+    fn capturing_bridge()
+    -> (crate::diagnostic_sink::DiagnosticBridge, Arc<Mutex<Vec<DiagnosticEvent>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let bridge = crate::diagnostic_sink::DiagnosticBridge::start(move |event| {
+            recorder.lock().unwrap().push(event);
+        })
+        .expect("bridge starts");
+        (bridge, seen)
+    }
+
+    fn wait_for_code(seen: &Mutex<Vec<DiagnosticEvent>>, code: DiagnosticCode) -> DiagnosticEvent {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(event) = seen.lock().unwrap().iter().find(|event| event.code() == code) {
+                return *event;
+            }
+            assert!(Instant::now() < deadline, "diagnostic {code:?} was never recorded");
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     #[test]
@@ -2255,7 +2687,12 @@ mod tests {
         let mut store = crate::storage::SettingsDocumentStore::from_bytes(None);
         let session = SettingsSession::load(&mut store);
 
-        exit.publish(ShellExit { settings: session.clone(), runtime: None, picker: None });
+        exit.publish(ShellExit {
+            settings: session.clone(),
+            runtime: None,
+            picker: None,
+            clock_origin: Instant::now(),
+        });
         let taken = exit.take().expect("handoff present");
         assert_eq!(taken.settings, session);
         assert!(taken.runtime.is_none());
@@ -2343,31 +2780,312 @@ mod tests {
             UnavailableReason::NoRescanRoots,
             UnavailableReason::NoRealPath { node },
         ];
-        let i18n = I18n::new(Locale::EnglishUnitedStates).expect("locale");
-        let strings = UiStrings::new(&i18n);
-        for reason in reasons {
-            let id = reason_message(reason);
-            assert!(!id.requires_arguments());
-            assert!(!strings.get(id).is_empty());
-        }
-        for state in [
-            ScanUi::Empty,
-            ScanUi::Choosing,
-            ScanUi::Resolving,
-            ScanUi::Scanning,
-            ScanUi::Partial { settled: false },
-            ScanUi::Partial { settled: true },
-            ScanUi::Cancelling,
-            ScanUi::Complete,
-            ScanUi::CancelledWithResults,
-            ScanUi::Failed { class: FailureClass::Other },
-        ] {
-            assert!(!strings.get(phase_message(state)).is_empty());
+        // `UiStrings::get` falls back to the message key, so the FTL entry is
+        // checked through `I18n::text` itself, in every embedded locale.
+        let translated = |i18n: &I18n, id: MessageId| {
+            assert!(!id.requires_arguments(), "{} must be static", id.key());
+            let text = i18n
+                .text(id)
+                .unwrap_or_else(|error| panic!("{} is missing from the locale: {error}", id.key()));
+            assert!(!text.trim().is_empty(), "{} is blank", id.key());
+            assert_ne!(text.as_ref(), id.key(), "{} is untranslated", id.key());
+        };
+        for locale in Locale::ALL {
+            let i18n = I18n::new(locale).expect("locale");
+            for reason in reasons {
+                translated(&i18n, reason_message(reason));
+            }
+            for state in [
+                ScanUi::Empty,
+                ScanUi::Choosing,
+                ScanUi::Resolving,
+                ScanUi::Scanning,
+                ScanUi::Partial { settled: false },
+                ScanUi::Partial { settled: true },
+                ScanUi::Cancelling,
+                ScanUi::Complete,
+                ScanUi::CancelledWithResults,
+                ScanUi::Failed { class: FailureClass::Other },
+            ] {
+                translated(&i18n, phase_message(state));
+            }
+            for class in [
+                FailureClass::PermissionDenied,
+                FailureClass::PathUnavailable,
+                FailureClass::Busy,
+                FailureClass::Other,
+            ] {
+                translated(&i18n, failure_message(class));
+            }
+            for id in [
+                MessageId::CommandBusy,
+                MessageId::DialogFailed,
+                MessageId::FolderPickerUnavailable,
+                MessageId::ScanRoots,
+                MessageId::Shortcuts,
+            ] {
+                translated(&i18n, id);
+            }
         }
         assert_eq!(
             reason_message(UnavailableReason::HiddenStateBusy { max_delta_depth: 64 }),
             MessageId::ReasonHiddenStateBusy
         );
+    }
+
+    #[test]
+    fn launch_rejections_defer_only_backpressure_within_the_frame_budget() {
+        let backpressure = RuntimeError::RetirementBackpressure;
+        assert_eq!(launch_rejection_outcome(&backpressure, 0), LaunchOutcome::Deferred);
+        assert_eq!(
+            launch_rejection_outcome(&backpressure, MAX_DEFERRED_LAUNCH_FRAMES - 1),
+            LaunchOutcome::Deferred
+        );
+        // A spent budget is reported honestly as "busy", not as an internal error.
+        assert_eq!(
+            launch_rejection_outcome(&backpressure, MAX_DEFERRED_LAUNCH_FRAMES),
+            LaunchOutcome::Rejected(FailureClass::Busy)
+        );
+        assert_eq!(failure_message(FailureClass::Busy), MessageId::LaunchBackpressure);
+        assert_eq!(
+            launch_rejection_outcome(&RuntimeError::ShuttingDown, 0),
+            LaunchOutcome::Rejected(FailureClass::Other)
+        );
+        let denied =
+            RuntimeError::Scan(diskpie_scan::ScanFailure::Provider(diskpie_scan::FsError::new(
+                r"C:\denied",
+                diskpie_scan::FsOperation::EnumerateDirectory,
+                diskpie_scan::FsErrorKind::AccessDenied,
+            )));
+        assert_eq!(
+            launch_rejection_outcome(&denied, 0),
+            LaunchOutcome::Rejected(FailureClass::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn a_deferred_launch_keeps_the_recovered_parts_and_is_retried_next_frame() {
+        let (mut shell, ctx) = headless_shell(None);
+        settle(&mut shell, &ctx);
+        // Retirement backpressure cannot be induced through the public runtime
+        // API (the runtime crate covers that), so the retained launch is
+        // replayed directly: the exact provider, roots, and token are kept in
+        // `deferred_launch` and the next frame hands them to the runtime.
+        let fs: Arc<dyn ScanFs> =
+            Arc::new(FixtureFs { root: fixture_root(), delay: Duration::ZERO });
+        let roots = vec![ScanRoot::new(
+            fixture_root(),
+            diskpie_core::VolumeKey::new(1),
+            diskpie_scan::StorageClass::Unknown,
+        )];
+        shell.flow.launch_attempted(LaunchOutcome::Deferred);
+        shell.deferred_launch = Some(DeferredLaunch {
+            fs: Arc::clone(&fs),
+            roots,
+            cancel: CancelToken::new(),
+            displays: vec!["C:\\fixture\\tree".to_owned()],
+            issues: Vec::new(),
+            frames: 3,
+        });
+        assert_eq!(shell.scan_state(), ScanUi::Resolving);
+        assert!(shell.flow.background_work_outstanding());
+
+        shell.logic(&ctx);
+        assert!(shell.deferred_launch.is_none(), "the retry consumed the deferred launch");
+        assert_eq!(shell.location.as_deref(), Some("C:\\fixture\\tree"));
+        pump_until(&mut shell, &ctx, "the retried launch to complete", |shell| {
+            shell.scan_state() == ScanUi::Complete
+        });
+        shell.begin_shutdown();
+    }
+
+    #[test]
+    fn deferred_actions_queue_in_order_and_refuse_beyond_the_bound() {
+        let (mut shell, ctx) = headless_shell(None);
+        settle(&mut shell, &ctx);
+        for _ in 0..MAX_DEFERRED_ACTIONS {
+            shell.defer_action(NavigationAction::Back);
+        }
+        assert_eq!(shell.deferred_actions.len(), MAX_DEFERRED_ACTIONS);
+        shell.notice = Notice::Message(MessageId::StatusReady);
+        shell.defer_action(NavigationAction::Parent);
+        assert_eq!(shell.deferred_actions.len(), MAX_DEFERRED_ACTIONS);
+        assert_eq!(shell.notice, Notice::Message(MessageId::CommandBusy));
+        // Without a frame the retries drain one per frame and are dropped.
+        for _ in 0..MAX_DEFERRED_ACTIONS {
+            shell.retry_deferred_action();
+        }
+        assert!(shell.deferred_actions.is_empty());
+    }
+
+    #[test]
+    fn a_startup_path_scans_to_completion_and_a_failed_dialog_keeps_the_results() {
+        let (bridge, seen) = capturing_bridge();
+        let backend = FixtureBackend { root: fixture_root(), delay: Duration::ZERO };
+        let (mut shell, ctx) = headless_shell_with(backend, bridge.sink(), Some(fixture_root()));
+        assert_eq!(shell.scan_state(), ScanUi::Resolving);
+        pump_until(&mut shell, &ctx, "the fixture scan to complete", |shell| {
+            shell.scan_state() == ScanUi::Complete
+        });
+        let completed = wait_for_code(&seen, DiagnosticCode::ScanCompleted);
+        assert!(completed.fields().any(|field| matches!(field, DiagnosticField::FileCount(49))));
+        assert!(
+            completed.fields().any(|field| matches!(field, DiagnosticField::DirectoryCount(_)))
+        );
+        assert_eq!(shell.notice, Notice::Message(MessageId::Complete));
+        assert!(!shell.item_count_cache.text.is_empty());
+        assert!(!shell.details_cache.path.is_empty());
+        assert!(!shell.list_cache.rows.is_empty(), "largest-children rows are ranked");
+        assert!(shell.availability(NavigationAction::RescanAll).is_available());
+
+        // The picker fails: the phase stays Complete, the results stay on
+        // screen, the status line explains, and the log gets a typed record.
+        shell.flow.dialog_submitted(1);
+        assert_eq!(shell.scan_state(), ScanUi::Choosing);
+        shell.handle_picker_event(PickerEvent::Failed {
+            request_id: 1,
+            class: ErrorClass::Io,
+            degraded: true,
+        });
+        assert_eq!(shell.scan_state(), ScanUi::Complete);
+        assert_eq!(shell.notice, Notice::Message(MessageId::DialogFailed));
+        assert!(shell.runtime.as_ref().and_then(RuntimeController::snapshot).is_some());
+        let failed = wait_for_code(&seen, DiagnosticCode::ShellActionFailed);
+        assert!(failed.fields().any(|field| matches!(field, DiagnosticField::RequestId(1))));
+        assert!(failed.fields().any(|field| *field == DiagnosticField::ErrorClass(ErrorClass::Io)));
+        assert!(failed.fields().any(|field| *field == DiagnosticField::Outcome(Outcome::Degraded)));
+
+        // A dismissed dialog restores the phase text; a stale event is ignored.
+        shell.flow.dialog_submitted(2);
+        shell.notice = Notice::Message(MessageId::Choosing);
+        shell.handle_picker_event(PickerEvent::Cancelled { request_id: 1 });
+        assert_eq!(shell.scan_state(), ScanUi::Choosing, "stale event must not close the dialog");
+        shell.handle_picker_event(PickerEvent::Cancelled { request_id: 2 });
+        assert_eq!(shell.scan_state(), ScanUi::Complete);
+        assert_eq!(shell.notice, Notice::Message(MessageId::Complete));
+
+        // A selection goes through the resolver and starts generation 2.
+        shell.flow.dialog_submitted(3);
+        shell.handle_picker_event(PickerEvent::Selected { request_id: 3, path: fixture_root() });
+        assert_eq!(shell.scan_state(), ScanUi::Resolving);
+        pump_until(&mut shell, &ctx, "the second scan to complete", |shell| {
+            shell.scan_state() == ScanUi::Complete
+                && shell.runtime.as_ref().is_some_and(|runtime| {
+                    matches!(runtime.state(), RuntimeState::Settled { generation, .. } if generation.get() == 2)
+                })
+        });
+
+        // Idle: a settled frame requests nothing from egui.
+        assert_eq!(repaint_policy(false, &shell.flow), RepaintRequest::None);
+        shell.begin_shutdown();
+        drop(shell);
+        assert!(bridge.finish(Duration::from_secs(5)));
+        let codes: Vec<_> = seen.lock().unwrap().iter().map(DiagnosticEvent::code).collect();
+        assert!(!codes.contains(&DiagnosticCode::ScanCancelled), "no scan was interrupted");
+        assert!(!codes.contains(&DiagnosticCode::ScanFailed), "{codes:?}");
+    }
+
+    #[test]
+    fn closing_during_a_scan_records_scan_cancelled_before_shutdown() {
+        let (bridge, seen) = capturing_bridge();
+        let backend = FixtureBackend { root: fixture_root(), delay: Duration::from_millis(40) };
+        let (mut shell, ctx) = headless_shell_with(backend, bridge.sink(), Some(fixture_root()));
+        pump_until(&mut shell, &ctx, "the scan to become active", |shell| {
+            shell
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| matches!(runtime.state(), RuntimeState::Active { .. }))
+        });
+        assert!(matches!(
+            shell.scan_state(),
+            ScanUi::Scanning | ScanUi::Partial { settled: false }
+        ));
+
+        shell.begin_shutdown();
+        let cancelled = wait_for_code(&seen, DiagnosticCode::ScanCancelled);
+        assert!(cancelled.fields().any(|field| matches!(field, DiagnosticField::GenerationId(1))));
+        assert!(cancelled.fields().any(|field| matches!(field, DiagnosticField::FileCount(_))));
+        // Idempotent: a second request writes nothing more.
+        shell.begin_shutdown();
+        let runtime = shell.runtime.as_ref().expect("runtime still owned");
+        assert!(matches!(
+            runtime.state(),
+            RuntimeState::ShuttingDown { .. } | RuntimeState::ShutdownComplete
+        ));
+        drop(shell);
+        assert!(bridge.finish(Duration::from_secs(5)));
+        let count = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.code() == DiagnosticCode::ScanCancelled)
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn a_stopped_picker_fails_the_open_dialog_without_touching_the_scan_state() {
+        let (mut shell, ctx) = headless_shell(None);
+        settle(&mut shell, &ctx);
+        shell.flow.dialog_submitted(4);
+        shell.handle_picker_stopped();
+        assert!(shell.picker.is_none());
+        assert_eq!(shell.scan_state(), ScanUi::Empty);
+        assert_eq!(shell.notice, Notice::Message(MessageId::DialogFailed));
+        assert!(!shell.flow.background_work_outstanding());
+    }
+
+    #[test]
+    fn shell_failure_events_carry_request_class_and_outcome_only() {
+        let event = shell_failed_event(7, ErrorClass::Unsupported, false);
+        let fields: Vec<_> = event.fields().copied().collect();
+        assert_eq!(
+            fields,
+            vec![
+                DiagnosticField::RequestId(7),
+                DiagnosticField::ErrorClass(ErrorClass::Unsupported),
+                DiagnosticField::Outcome(Outcome::Failed),
+            ]
+        );
+        let interrupted = {
+            let runtime = RuntimeController::new(RuntimeConfig::default()).expect("runtime");
+            interrupted_scan_event(&runtime)
+        };
+        assert!(interrupted.is_none(), "an idle runtime has nothing to cancel");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dialog_failure_classes_follow_the_adapter_stage() {
+        let error = |stage| DialogError { stage, hresult: Some(-1), cleanup_hresult: None };
+        assert_eq!(dialog_error_class(&error(DialogErrorStage::ServiceShutdown)), ErrorClass::Busy);
+        assert_eq!(
+            dialog_error_class(&error(DialogErrorStage::WorkerPanicked)),
+            ErrorClass::Internal
+        );
+        assert_eq!(
+            dialog_error_class(&error(DialogErrorStage::CreateDialog)),
+            ErrorClass::Unsupported
+        );
+        assert_eq!(dialog_error_class(&error(DialogErrorStage::Show)), ErrorClass::Io);
+        assert_eq!(
+            dialog_error_class(&error(DialogErrorStage::GetDisplayName)),
+            ErrorClass::InvalidData
+        );
+        assert_eq!(dialog_error_class(&error(DialogErrorStage::ClearClientData)), ErrorClass::Io);
+        // The reviewer's reproduction: Esc on the dialog surfaced as a
+        // ClearClientData failure. It is logged as degraded, and it never
+        // becomes a scan phase.
+        let (mut shell, ctx) = headless_shell(None);
+        settle(&mut shell, &ctx);
+        shell.flow.dialog_submitted(1);
+        shell.handle_picker_event(PickerEvent::Failed {
+            request_id: 1,
+            class: dialog_error_class(&error(DialogErrorStage::ClearClientData)),
+            degraded: true,
+        });
+        assert_eq!(shell.scan_state(), ScanUi::Empty);
+        assert_eq!(shell.notice, Notice::Message(MessageId::DialogFailed));
     }
 
     #[test]

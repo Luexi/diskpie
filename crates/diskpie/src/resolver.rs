@@ -42,10 +42,23 @@ pub enum ResolveJob {
 }
 
 /// One validated scan root plus the non-fatal issues met while probing it.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ResolvedRoot {
     pub root: ScanRoot,
     pub issues: Vec<String>,
+}
+
+// The `Debug` forms below deliberately omit every path and display string so
+// a `{:?}` in a diagnostic can never leak a location; only counts and typed
+// classes are printed.
+impl std::fmt::Debug for ResolvedRoot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedRoot")
+            .field("storage_class", &self.root.storage_class)
+            .field("issues", &self.issues.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// A launch that the runtime can accept without further I/O.
@@ -69,7 +82,7 @@ impl std::fmt::Debug for ResolvedLaunch {
 }
 
 /// A volume the hero surface can offer without a native dialog.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct VolumeEntry {
     /// Exact native mount path used when the user chooses this volume.
     pub path: PathBuf,
@@ -84,19 +97,52 @@ pub struct VolumeEntry {
     pub issues: Vec<String>,
 }
 
+impl std::fmt::Debug for VolumeEntry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VolumeEntry")
+            .field("storage_class", &self.storage_class)
+            .field("filesystem_known", &self.filesystem.is_some())
+            .field("total_bytes", &self.total_bytes)
+            .field("free_bytes", &self.free_bytes)
+            .field("issues", &self.issues.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Result of one volume enumeration.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub struct VolumeList {
     pub volumes: Vec<VolumeEntry>,
     /// Enumeration-level errors rendered as text for the UI.
     pub errors: Vec<String>,
 }
 
+impl std::fmt::Debug for VolumeList {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VolumeList")
+            .field("volumes", &self.volumes)
+            .field("errors", &self.errors.len())
+            .finish()
+    }
+}
+
 /// Typed resolution failure plus a user-presentable detail line.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ResolveFailure {
     pub class: FailureClass,
     pub detail: String,
+}
+
+impl std::fmt::Debug for ResolveFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolveFailure")
+            .field("class", &self.class)
+            .field("detail_len", &self.detail.len())
+            .finish()
+    }
 }
 
 /// Terminal outcome of one job.

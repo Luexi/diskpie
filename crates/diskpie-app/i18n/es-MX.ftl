@@ -112,3 +112,5 @@ list-keyboard-hint = Las flechas mueven, Intro amplía y Retroceso regresa.
 partial-settled = Terminado con omisiones
 scan-roots = Raíces del análisis
 shortcuts = Atajos
+launch-backpressure = El análisis anterior todavía está liberando sus recursos, así que el nuevo análisis no pudo iniciar. Inténtalo de nuevo en un momento.
+command-busy = La vista todavía se está actualizando. Inténtalo de nuevo en un momento.

@@ -327,7 +327,15 @@ Composition-root modules in `crates/diskpie/src`:
   `Scanning`, `Partial { settled }`, `Cancelling`, `Complete`,
   `CancelledWithResults`, or `Failed { class }`. `repaint_policy` is pure: an
   idle frame requests no repaint; outstanding Shell/resolver work polls again
-  after a short delay; a busy runtime repaints continuously.
+  after a short delay; a busy runtime repaints continuously. A folder dialog
+  that is dismissed or fails is a picker outcome, not a scan outcome: the flow
+  returns to the state it had before the dialog opened (earlier results
+  included) and only the status line and the `shell.action_failed` record,
+  classed by the adapter's typed failure stage, say what happened. A launch
+  refused for retirement backpressure is retried on later frames with the
+  exact provider, roots, and cancel token the runtime handed back; a spent
+  retry budget is reported as `Failed { class: Busy }`, never as an internal
+  error.
 - `resolver.rs`: one root-owned worker thread behind a `ResolveBackend` trait.
   It canonicalizes `.`/`..` lexically after `std::path::absolute`, calls
   `resolve_scan_root`, enumerates volumes with `discover_volumes`, and builds
@@ -347,7 +355,12 @@ calls made from a callback. Every navigation action goes through
 `RuntimeController::navigation_command` and `execute_navigation`;
 `NavigationReport::rescan_request` is consumed by resolving the full roots
 again through the resolver. Branch rescans have no engine path yet and are
-shown as unavailable with an explicit reason.
+shown as unavailable with an explicit reason. Shell-wide shortcuts yield to a
+focused text field and Escape yields to an open popup; modifiers must match
+exactly. When the window closes while a generation is still active or
+cancelling, the shell writes that generation's `scan.cancelled` record with the
+counters observed at that moment before requesting runtime shutdown, because
+no later frame will drain the terminal report.
 
 Surfaces:
 
