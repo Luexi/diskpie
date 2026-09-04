@@ -192,3 +192,139 @@ Accepted tradeoffs:
 - Any request to weaken typed confirmation, allow synthetic targets, or treat
   partial mutation as success requires explicit security review and a
   superseding ADR.
+
+## Implementation note 2026-09-04: capability flow and native actions
+
+The application half of this ADR lives in `crates/diskpie-app/src/actions.rs`
+and the native half in `crates/diskpie-platform/src/windows/shell_actions.rs`,
+dispatched by the existing Shell STA in `shell_service.rs`.
+
+Application (`diskpie_app::actions`):
+
+- `TargetValidator` resolves a `NodeId` sealed with its `GenerationId` against
+  the current `TreeSnapshot`. It rejects stale generations, unknown and
+  synthetic nodes, caller-declared hidden nodes, empty paths, drive/volume/
+  share roots (item 3), the running executable, and any directory that
+  contains it. Two implementation decisions go slightly beyond the list in
+  item 3 and fail closed: the scan root itself is refused as a destructive
+  target because it has no in-snapshot parent to rescan (item 14), and a
+  destructive validation without a supplied executable path is refused rather
+  than skipping self-protection. Open and reveal validation accept the scan
+  root and do not require the executable path. Because those checks depend on
+  the purpose, `FilesystemTarget` records the `ActionPurpose` it was validated
+  for, and `ConfirmationFlow::begin_recycle`/`begin_delete` refuse any target
+  that was not validated for `Destructive`
+  (`FlowError::NotValidatedForDestruction`); an open- or reveal-validated
+  executable, its directory, the scan root, or a drive root therefore cannot
+  become a capability through the public API (amendment 2026-09-04).
+- `ConfirmationFlow` is the pure state machine: `Idle -> Reviewing ->
+  Confirmed` for recycling and `Idle -> Reviewing -> AwaitingWord ->
+  StronglyConfirmed` for permanent deletion and emptying a bin. The words are
+  the invariant ASCII `DELETE` and `EMPTY`, compared exactly with no case
+  folding or whitespace tolerance. `cancel` is available in every state.
+- `Confirmed<RecycleRequest>`, `StronglyConfirmed<DeleteRequest>`, and
+  `StronglyConfirmed<EmptyRecycleBinRequest>` have private constructors, are
+  neither `Clone` nor `Copy`, and bind kind, exact `PathBuf` or
+  `RecycleBinScope`, generation, `TargetKind`, and `Option<FileIdentity>`.
+  `ActionBinding::verify_target`/`verify_scope` name the first mismatching
+  field. `consume` yields the plain request plus a `PendingObligation`
+  (`RescanParent`, `RescanAll`, or `RescanRecycleBin`) that the runtime settles
+  into an `ActionReport`; `requires_halt` is true only for the safety
+  violation.
+- `RecycleBinScope::AllDrives` is the only value that maps to a null native
+  root; `DriveRoot::parse` accepts exactly `X:\` and rejects the empty string.
+- `TargetPresentation` carries the exact path, the friendly display, and an
+  `escaped_utf16` form produced by `escape_utf16` only when UTF-8 rendering is
+  lossy. The escape is lossless and round-trips unpaired surrogates through
+  `unescape_utf16`.
+- `classify_delete_evidence` implements item 13 over plain `DeleteEvidence`
+  and is exercised by fake-adapter tests for every outcome combination,
+  including success plus abort, missing callbacks, per-item failure, null
+  recycle item, and cancellation before and after mutation.
+- `DeleteEvidence::observation` carries the post-operation observation item 13
+  requires. Copy-engine success codes are not uniformly "removed":
+  `COPYENGINE_S_USER_IGNORED` (`0x00270005`) means skipped, and
+  `COPYENGINE_S_DONT_PROCESS_CHILDREN` (`0x00270008`) was observed for a plain
+  file delete. The adapter therefore re-opens the exact path (no reparse
+  following) after the operation; a path that still holds the same identity
+  (or, without a bound identity, the same kind) downgrades an otherwise
+  complete permanent file/link delete to `Failed` and every other case to
+  `UnknownMayHaveMutated` at stage `PostOperationObservation`. The observation
+  never upgrades an outcome (amendment 2026-09-04).
+
+Platform (`diskpie_platform`):
+
+- `ShellRequest` gained `Open`, `Reveal`, `InstalledApps`, `QueryRecycleBin`,
+  `Recycle`, `DeletePermanently`, and `EmptyRecycleBin`. The destructive
+  variants are only constructible from a consumed capability
+  (`ShellRequest::recycle`, `delete_permanently`, `empty_recycle_bin`) and the
+  request type is deliberately not `Clone`. Every request ends in exactly one
+  `ShellEvent`; `ShellService::cancel(id)` flips a request-local flag that skips
+  a queued request and is read cooperatively in `PreDeleteItem`.
+- Open uses `SHCreateItemFromParsingName`, `SHGetIDListFromObject`, and
+  `ShellExecuteExW` with verb `open`, `SEE_MASK_IDLIST | SEE_MASK_NOASYNC |
+  SEE_MASK_FLAG_NO_UI`, and the owner HWND. Reveal uses `SHParseDisplayName`
+  and `SHOpenFolderAndSelectItems`. Installed Apps activates only
+  `ms-settings:appsfeatures` and reports failure with no `appwiz.cpl`
+  fallback. The raw calls sit behind an internal `ShellPrimitives` seam so
+  marshalling is tested without launching Explorer or Settings.
+- Recycle/delete run one `IFileOperation` per request with `SetOwnerWindow`,
+  the explicit flag profile (`FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT
+  | FOF_NO_CONNECTED_ELEMENTS | FOFX_EARLYFAILURE`, plus
+  `FOFX_RECYCLEONDELETE | FOFX_ADDUNDORECORD | FOF_WANTNUKEWARNING` for
+  recycling only), and a `#[implement]`ed `IFileOperationProgressSink` that
+  records `StartOperations`, `PreDeleteItem`, `PostDeleteItem` (`hrDelete` and
+  whether `psiNewlyCreated` was non-null), and `FinishOperations`. The advise
+  cookie is an RAII guard. `GetAnyOperationsAborted` is always queried.
+- Before validation the adapter refuses, as defence in depth, any request
+  whose target kind is the scan root or whose path is a drive, volume, or share
+  root (`Failed` at stage `ForbiddenTarget`), and a delete payload re-wrapped
+  in the other destructive `ShellRequest` variant (`Failed` at stage
+  `RequestMismatch`); neither reaches a file operation.
+- Late validation (item 8) opens the exact path with zero access, full
+  sharing, `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS`, checks
+  the observed kind against the bound `TargetKind`, compares `FILE_ID_INFO`
+  with the bound identity, and closes the handle before `DeleteItem`. A missing
+  item (`ERROR_FILE_NOT_FOUND`/`ERROR_PATH_NOT_FOUND` only; an un-openable name
+  is a validation failure, not a changed target) or changed kind/identity is
+  `TargetChanged`. The scanner records no
+  identity for directories and reparse entries, so those validations report
+  `IdentityAssurance::KindOnly` in the outcome instead of `Exact`; this is the
+  weaker assurance the ADR requires to be surfaced.
+- Empty bin queries `SHQueryRecycleBinW` before and after
+  `SHEmptyRecycleBinW(owner, root_or_null, SHERB_NOCONFIRMATION |
+  SHERB_NOPROGRESSUI | SHERB_NOSOUND)`; an error with an unchanged estimate is
+  `Failed`, any other error is `UnknownMayHaveMutated`.
+- `#[implement]` expands to absolute `::windows_core::` paths, so
+  `diskpie-platform` now names `windows-core 0.62.2` directly with the same
+  feature set `windows` already resolves; the lock file gained only that edge.
+
+Tests that run by default never mutate anything: they validate identity on
+temporary fixtures, prove a swapped target yields `TargetChanged` through the
+live STA with the fixture intact (submitted in permanent mode on purpose, so a
+regression of late validation could only destroy the test's own fixture and
+never add an item to the developer's Recycle Bin), exercise pre-cancelled and
+re-wrapped requests, refuse scan/drive roots, observe gone/present/swapped
+paths, and map terminal events for every request kind. Fixture-mutating tests
+(recycle a temporary file, recycle a temporary directory tree, permanently
+delete a file, delete a directory symlink whose sentinel must survive) run
+only with `DISKPIE_DESTRUCTIVE_FIXTURES=1` and act only on files they created
+under the temporary directory. On the development machine the
+permanent-delete and symlink-sentinel tests passed (`hrDelete` was
+`COPYENGINE_S_DONT_PROCESS_CHILDREN`, a success code other than `S_OK`); the
+recycle tests were left for an explicit opt-in run because they add items to
+the user's real Recycle Bin. Emptying a bin is never tested against a real bin.
+
+Open question (2026-09-04): it is not yet verified whether the copy engine
+reports a recycled directory as a single `PostDeleteItem` carrying the new
+Recycle Bin item or as one callback per descendant. If descendants report
+success with a null `psiNewlyCreated`, the classifier raises
+`SafetyViolationUnexpectedPermanentDelete` for a folder recycle: fail-closed
+(halt plus incident) but a false alarm. The gated directory-recycle fixture is
+the test that settles it; until it has been run in a disposable profile,
+directory recycling must not be enabled in the UI.
+
+Still open: the egui binding of the flow and result presentation, the
+disposable-VM provider matrix that gates enabling Recycle per provider class
+(item 10), the directory-recycle callback shape above, and ACL-denied
+descendant fixtures for the `Partial` path.

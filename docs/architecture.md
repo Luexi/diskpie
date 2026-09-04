@@ -105,12 +105,14 @@ UI-independent application policy and orchestration:
   size basis, and rescan intent;
 - presentation indexes provide stable textual/chart-facing state;
 - settings policy parses, migrates, validates, stages, and reports bounded RON;
-- diagnostics define typed path-free events, redaction, and bounded export.
+- diagnostics define typed path-free events, redaction, and bounded export;
+- `actions` validates real targets, runs the pure ADR 0008 confirmation flow,
+  issues single-use capabilities, and defines the destructive result model.
 
 This crate may own traits implemented by the platform, but it must not name COM,
 Win32, HWND, egui, or eframe types.
 
-Primary files: `runtime.rs`, `session.rs`, `navigation.rs`,
+Primary files: `runtime.rs`, `session.rs`, `navigation.rs`, `actions.rs`,
 `layout_service.rs`, `presentation.rs`, `settings.rs`, and `diagnostics/`.
 
 ### `diskpie-platform`
@@ -120,7 +122,11 @@ project-authored unsafe code:
 
 - `filesystem.rs`: Win32 directory enumeration and metadata;
 - `volumes.rs`: volume discovery, device hints, capacity, and root resolution;
-- `shell_service.rs`: one message-pumping COM STA and folder dialog;
+- `shell_service.rs`: one message-pumping COM STA, its bounded request queue,
+  folder dialog, and per-request cancellation;
+- `shell_actions.rs`: open/reveal/Installed Apps, `IFileOperation` recycle and
+  permanent deletion with a progress sink, late identity validation, and the
+  Recycle Bin query/empty calls;
 - `project_paths.rs`: Known Folder-based application directories;
 - `diagnostic_files.rs`: retained-handle local logging, retention, export, and
   atomic marker support; and
@@ -365,13 +371,60 @@ so a second STA cannot start until the old one truly exited. If that hand-off
 is impossible the lifecycle fails closed and the claim stays held for the rest
 of the process.
 
-### Destructive actions - planned
+### Destructive actions - implemented below the UI
 
-Open, recycle, permanent delete, empty recycle bin, and Installed Apps requests
-will extend the same STA behind a UI-independent action port. A pure confirmation
-state machine binds an exact immutable native target and scan generation before
-the platform sees a mutation request. Permanent deletion has a stronger visual
-confirmation than recycling.
+Open, reveal, Installed Apps, the advisory Recycle Bin query, recycle,
+permanent delete, and empty-bin requests extend the same STA (ADR 0008,
+implementation note 2026-09-04).
+
+What exists:
+
+- `diskpie_app::actions::TargetValidator` turns a real, current `NodeId` into a
+  `FilesystemTarget` that records the purpose it was validated for; synthetic,
+  stale, and hidden nodes are rejected for every purpose, and
+  drive/volume/share-root, scan-root, running-executable, and
+  executable-containing nodes are rejected for destructive validation before
+  any dialog appears. `ConfirmationFlow` refuses to start a recycle or delete
+  from a target validated only for open or reveal.
+- `ConfirmationFlow` is the pure state machine (`Idle -> Reviewing ->
+  Confirmed` for recycling; `Idle -> Reviewing -> AwaitingWord ->
+  StronglyConfirmed` with the typed `DELETE`/`EMPTY` word otherwise). It
+  issues `Confirmed<RecycleRequest>`, `StronglyConfirmed<DeleteRequest>`, and
+  `StronglyConfirmed<EmptyRecycleBinRequest>`: private constructors, no
+  `Clone`, bound to kind, exact path or scope, generation, target kind, and
+  file identity. Consuming one yields the request and a `PendingObligation`
+  (`RescanParent`/`RescanAll`/`RescanRecycleBin`) the runtime must settle after
+  every attempt.
+- `ShellRequest::recycle`, `delete_permanently`, and `empty_recycle_bin` are the
+  only way to build a destructive Shell request, and they take the capability
+  by value. `ShellService::cancel(id)` skips a queued request reliably and is
+  honoured cooperatively in `PreDeleteItem`.
+- The STA refuses scan/drive roots and mode-mismatched payloads outright,
+  revalidates `(volume, FILE_ID_128)` through a no-follow handle immediately
+  before `DeleteItem` (`TargetChanged` on mismatch; `KindOnly` assurance when
+  the scanner captured no identity, as for directories), runs one
+  `IFileOperation` per request with explicit flags and a recording progress
+  sink, re-inspects the exact path afterwards so a skipped item is never
+  reported as removed, and classifies the evidence into `Completed`,
+  `CancelledBeforeMutation`, `Partial`, `Failed`, `UnknownMayHaveMutated`,
+  `SafetyViolationUnexpectedPermanentDelete`, or `TargetChanged`.
+- Open/reveal/Installed Apps report `Dispatched` or a typed failure stage; the
+  raw calls sit behind a small internal seam so marshalling is tested without
+  launching anything.
+
+What remains:
+
+- the egui binding: confirmation dialogs with default Cancel focus, destructive
+  styling, exact-path plus escaped-UTF-16 presentation, the typed-word field,
+  result presentation, and rescan-on-obligation in the runtime;
+- the disposable-VM provider matrix (NTFS, FAT/removable, SMB, disabled/full
+  bin, oversized items, read-only/open/ACL-denied targets) that gates enabling
+  Recycle per provider class, and ACL-denied descendant fixtures for `Partial`;
+- the directory-recycle callback shape (one `PostDeleteItem` with a Recycle
+  Bin item, or one per descendant); the gated directory fixture settles it and
+  directory recycling stays disabled in the UI until it has run;
+- empty-bin verification in a disposable profile; it is never run against a
+  developer's bin.
 
 ### Explorer integration - policy and adapter implemented, UI pending
 

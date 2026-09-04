@@ -707,6 +707,7 @@ dependencies = [
  "diskpie-core",
  "diskpie-scan",
  "windows",
+ "windows-core",
  "windows-registry",
 ]
 

@@ -15,6 +15,7 @@ pub mod windows {
     pub mod filesystem;
     pub mod project_paths;
     pub mod settings_file;
+    pub mod shell_actions;
     pub mod shell_service;
     pub mod startup_feedback;
     pub mod volumes;
@@ -44,9 +45,15 @@ pub use windows::settings_file::{
     SettingsFileErrorKind, SettingsFileOperation, SettingsFileRead, WindowsSettingsFile,
 };
 #[cfg(windows)]
+pub use windows::shell_actions::{
+    DispatchOutcome, DispatchStage, INSTALLED_APPS_URI, RecycleBinQueryOutcome, read_file_identity,
+};
+#[cfg(windows)]
 pub use windows::shell_service::{
-    DialogError, DialogErrorStage, DialogEvent, DialogRequestId, FolderDialogRequest, OwnerWindow,
-    SHELL_REAPER_CAPACITY, ShellRequest, ShellService, ShellServiceConfig, ShellServiceFinish,
+    DeleteShellRequest, DialogError, DialogErrorStage, DialogEvent, DialogRequestId,
+    EmptyBinShellRequest, FolderDialogRequest, InstalledAppsRequest, OpenRequest, OwnerWindow,
+    RecycleBinQueryRequest, RevealRequest, SHELL_REAPER_CAPACITY, ShellEvent, ShellRequest,
+    ShellRequestId, ShellRequestKind, ShellService, ShellServiceConfig, ShellServiceFinish,
     ShellServiceShutdownError, ShellServiceStartError, ShellServiceStatus, SubmitError,
     TryReceiveError,
 };

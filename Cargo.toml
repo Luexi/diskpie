@@ -50,11 +50,19 @@ windows = { version = "=0.62.2", default-features = false, features = [
     "Win32_System_Console",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    # Only because `SHELLEXECUTEINFOW.hkeyClass` is an `HKEY`; DiskPie does
+    # not read or write the registry through this feature.
+    "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# `#[implement]` expands to absolute `::windows_core::` paths, so the crate that
+# implements a COM interface must name windows-core directly. Same version and
+# feature set as the one `windows` already resolves; no new package.
+windows-core = { version = "=0.62.2", default-features = false, features = ["std"] }
 windows-registry = { version = "=0.6.1", default-features = false, features = ["std"] }
 winresource = { version = "=0.1.31", default-features = false }
 
