@@ -135,21 +135,7 @@ impl LocalDiagnostics {
 
     /// Records one closed, path-free application event.
     pub fn record(&self, event: DiagnosticEvent) {
-        match event.level() {
-            DiagnosticLevel::Error => {
-                tracing::error!(target: APPLICATION_EVENT_TARGET, event = %event);
-            }
-            DiagnosticLevel::Warn => {
-                tracing::warn!(target: APPLICATION_EVENT_TARGET, event = %event);
-            }
-            DiagnosticLevel::Info => {
-                tracing::info!(target: APPLICATION_EVENT_TARGET, event = %event);
-            }
-            DiagnosticLevel::Debug => {
-                tracing::debug!(target: APPLICATION_EVENT_TARGET, event = %event);
-            }
-            DiagnosticLevel::Off => {}
-        }
+        record_event(event);
     }
 
     /// Returns a lock-free snapshot suitable for explicit diagnostic export.
@@ -178,6 +164,27 @@ impl LocalDiagnostics {
         });
         self.guard.take();
         DiagnosticsFinishOutcome { status, counters: self.counters() }
+    }
+}
+
+/// Records one closed, path-free application event through the installed
+/// subscriber. Callable from any thread; the subscriber's queue is bounded and
+/// lossy, so this never blocks the caller.
+pub fn record_event(event: DiagnosticEvent) {
+    match event.level() {
+        DiagnosticLevel::Error => {
+            tracing::error!(target: APPLICATION_EVENT_TARGET, event = %event);
+        }
+        DiagnosticLevel::Warn => {
+            tracing::warn!(target: APPLICATION_EVENT_TARGET, event = %event);
+        }
+        DiagnosticLevel::Info => {
+            tracing::info!(target: APPLICATION_EVENT_TARGET, event = %event);
+        }
+        DiagnosticLevel::Debug => {
+            tracing::debug!(target: APPLICATION_EVENT_TARGET, event = %event);
+        }
+        DiagnosticLevel::Off => {}
     }
 }
 
