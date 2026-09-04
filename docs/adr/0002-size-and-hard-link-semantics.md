@@ -104,3 +104,28 @@ and [hard links and junctions](https://learn.microsoft.com/en-us/windows/win32/f
   `known + unknown` propagation.
 - ReFS/block-clone tests verify the value and limitation label without claiming
   exclusive physical sectors.
+
+## Evidence
+
+2026-09-04: `crates/diskpie-platform/tests/scan_integration.rs` exercised the
+Windows adapter on the local NTFS temporary volume without elevation. The
+adapter reads both values from `FILE_STANDARD_INFO` through a zero-access
+handle (`query_standard_info` in
+`crates/diskpie-platform/src/windows/filesystem.rs`) and never calls
+`GetCompressedFileSizeW`; the tests call `GetCompressedFileSizeW` only as an
+independent oracle.
+
+| Fixture | `EndOfFile` | `AllocationSize` | `GetCompressedFileSizeW` |
+| --- | ---: | ---: | ---: |
+| Sparse, 5 GiB, 64 KiB written at 4 GiB | 5,368,709,120 | 65,536 | 65,536 |
+| Sparse, 5 GiB, nothing written | 5,368,709,120 | 0 | 0 |
+| NTFS-compressed, 4 MiB repetitive text | 4,194,304 | 786,432 | 786,432 |
+
+`FILE_STANDARD_INFO.AllocationSize` reported the on-disk allocation of sparse
+and compressed files exactly, including a logical size above the 32-bit range,
+and the `u128` aggregate carried the 10 GiB two-file total without truncation.
+The constrained `GetCompressedFileSizeW` fallback permitted above is therefore
+not needed and was not implemented. The same run evidenced items 1, 2, and 4:
+three hard links to one 8 KiB file aggregated 24,576 logical bytes, 3 files,
+and 8,192 allocated bytes owned by the lexicographically smallest relative
+path (`a\three.bin`), with both aliases at zero allocated contribution.
