@@ -169,22 +169,42 @@ The marker transport is wired on Windows through
 - Every outcome is classified from post-operation identities: the sibling
   identity observed at the target name is `Committed`; an unchanged target is
   `NotCommitted` and the never-renamed sibling is deleted through its own
-  handle; errors 1176/1177 or an unprovable result are
-  `CommittedButUnverified`, which preserves every copy for the rest of the
-  session. The identity is recorded in a lock-free atomic record; a contended
-  or unverified record disables reconciliation.
+  handle. A rename that failed while the sibling handle still resolves to the
+  sibling name under the retained parent (`GetFinalPathNameByHandleW`), such
+  as a create-only rename that lost to a concurrent creator, is also
+  `NotCommitted`: the sibling provably never moved, so deleting it through
+  its handle cannot discard a copy of the marker and a stale
+  `last-panic.write` cannot block every later commit. Errors 1176/1177 or an
+  otherwise unprovable result are `CommittedButUnverified`, which preserves
+  every copy for the rest of the session. The identity is recorded in a
+  lock-free atomic record; a contended or unverified record disables
+  reconciliation and makes later commits in that session refuse the
+  session's own marker (either marker already proves the panic).
 - Reconciliation is identity-conditional: the target is re-inspected through
-  the retained parent, its bytes must validate with the session token, and the
-  mutation is applied to that inspected object (a `FileDispositionInfo` delete
-  on its handle, or a rename-by-handle over it while the inspected handle with
-  delete sharing stays open). A different identity, token, directory, reparse
+  the retained parent on a handle opened without `FILE_SHARE_DELETE`, so no
+  other opener can unlink, rename, or replace that object while its identity
+  and session token are checked. `Delete` is applied to that very object with
+  `FileDispositionInfo` on the same handle and has no race window. `Restore`
+  prepares and verifies the sibling while the pin is held, releases the pin,
+  and immediately issues the handle-relative replace rename; Windows has no
+  compare-and-rename, so a replacement raced into that single system call
+  would be superseded and reported as `RestoredPrevious`. This residual is
+  the same window ADR 0019 accepts for settings and is disclosed in the
+  capability documentation. A different identity, token, directory, reparse
   point, or hard link returns `OwnershipLost` without touching anything; any
   post-operation doubt returns `PreservedUncertain` and deletes nothing.
+- The hook path holds two nested fixed 32 Ki-unit UTF-16 stack buffers
+  (about 128 KiB) while validating handles against the retained parent, so
+  the panicking thread needs that much free stack; no heap is used.
 - Item 7 is implemented more strictly than allowed: the installed hook never
-  chains the previous hook in any build. The hook returns normally, so a
-  panic on the main thread still terminates the process through the standard
-  panic runtime; a subprocess test asserts the non-success exit status and
-  the redacted marker.
+  chains the previous hook in any build. The hook returns normally and never
+  swallows the panic. The subprocess test panics on the libtest worker thread
+  that installed the hook (`thread_role=main`), not on the process main
+  thread; it asserts the redacted marker and the non-success exit status that
+  libtest's failure accounting produces because the panic propagated.
 - The composition root mints `ShutdownQuiescenceProof` only from a
-  `DiagnosticsFinishStatus::Completed` receipt; the runtime receipt is a
-  placeholder that the scan/Shell wiring must replace with joined receipts.
+  `DiagnosticsQuiescenceReceipt`, a private-field value that
+  `LocalDiagnostics::finish` produces solely when the worker guard received
+  the worker's own completion message; a bare `DiagnosticsFinishStatus` cannot
+  mint one. The runtime receipt is a placeholder that the scan/Shell wiring
+  must replace with joined receipts.

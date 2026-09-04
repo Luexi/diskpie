@@ -431,13 +431,18 @@ The wired lifecycle is:
    is recorded as `panic.marker_found` without any inferred cause.
 5. A caught panic followed by a clean shutdown restores or removes only the
    marker whose native identity and session token still belong to this
-   session (`OwnershipReconciliation::AtomicFileIdentity`); any uncertainty
-   preserves every copy.
-6. Reconciliation consumes `ShutdownQuiescenceProof::from_receipts`, which is
-   minted only from a `DiagnosticsFinishStatus::Completed` receipt plus the
-   runtime receipt. The runtime receipt is a documented placeholder because
-   the executable composes no scan, layout, or Shell worker yet; the UI wiring
-   that starts them MUST replace it with joined receipts from those services.
+   session (`OwnershipReconciliation::AtomicFileIdentity`). The check runs on
+   a handle that denies delete sharing; removal is applied to that pinned
+   object, and restoration renames the verified sibling over it immediately
+   after the pin is released (ADR 0017 records the single-call residual).
+   Any uncertainty preserves every copy.
+6. Reconciliation consumes `ShutdownQuiescenceProof::from_receipts`, which
+   requires the `DiagnosticsQuiescenceReceipt` that only
+   `LocalDiagnostics::finish` mints from the worker's completion message,
+   plus the runtime receipt. The runtime receipt is a documented placeholder
+   because the executable composes no scan, layout, or Shell worker yet; the
+   UI wiring that starts them MUST replace it with joined receipts from those
+   services.
    Without a proof the runtime is dropped and the marker is preserved.
 
 Explicit preview and delete reuse the same session type through
