@@ -31,7 +31,7 @@ lexopt = "=0.3.2"
 raw-window-handle = "=0.6.2"
 ron = "=0.12.2"
 serde = { version = "=1.0.229", features = ["derive"] }
-thiserror = "=2.0.19"
+thiserror = "=2.0.20"
 tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = [
     "fmt",
