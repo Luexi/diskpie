@@ -7,7 +7,7 @@ machine paths, and other host-specific data so identical inputs are repeatable.
 
 License overview
 ----------------
-- MIT License (133)
+- MIT License (134)
 - Unicode License v3 (19)
 - Apache License 2.0 (12)
 - Boost Software License 1.0 (2)
@@ -2703,6 +2703,7 @@ Used by:
 - windows-interface 0.59.3
 - windows-link 0.2.1
 - windows-numerics 0.3.1
+- windows-registry 0.6.1
 - windows-result 0.4.1
 - windows-strings 0.5.1
 - windows-sys 0.52.0
