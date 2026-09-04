@@ -1,0 +1,516 @@
+name: Release
+
+# Unsigned-first reproducible release pipeline (ADR 0012).
+#
+# A version tag `vX.Y.Z` builds diskpie.exe twice from two clean checkouts at
+# different absolute paths, requires identical SHA-256 digests, assembles a
+# deterministic ZIP (proved by building it twice), records SHA256SUMS.txt, a
+# CycloneDX SBOM, and build information, attests provenance and the SBOM, and
+# uploads everything to a DRAFT GitHub release that a maintainer publishes by
+# hand after the Windows client smoke tests.
+#
+# `workflow_dispatch` is a dry run: it performs the same build, gates, and
+# packaging and uploads the workflow artifacts, but creates no attestation and
+# no release.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RELEASE_TARGET: x86_64-pc-windows-msvc
+  CARGO_CYCLONEDX_VERSION: 0.5.9
+
+jobs:
+  build:
+    name: Reproducible unsigned build
+    runs-on: windows-2022
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      asset_stem: ${{ steps.version.outputs.asset_stem }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record pinned toolchain and runner image
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup show active-toolchain
+          rustc -vV
+          cargo -vV
+          Write-Host "ImageOS=$env:ImageOS ImageVersion=$env:ImageVersion"
+          Write-Host "Windows=$([System.Environment]::OSVersion.VersionString)"
+
+      - name: Resolve and validate the release version
+        id: version
+        shell: pwsh
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $metadata = cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed" }
+          $package = $metadata.packages | Where-Object { $_.name -eq 'diskpie' }
+          if (-not $package) { throw "The diskpie package was not found in the workspace metadata." }
+          $cargoVersion = [string]$package.version
+          if ($env:REF_TYPE -eq 'tag') {
+            $tag = $env:REF_NAME
+            if ($tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$') {
+              throw "Tag '$tag' is not a vX.Y.Z release tag."
+            }
+            $tagVersion = $tag.Substring(1)
+            if ($tagVersion -ne $cargoVersion) {
+              throw "Tag version '$tagVersion' does not match the Cargo package version '$cargoVersion'."
+            }
+          } else {
+            $tag = "v$cargoVersion"
+            Write-Host "Dry run: no tag, using the Cargo package version."
+          }
+          $assetStem = "diskpie-$tag-windows-x86_64"
+          Write-Host "tag=$tag version=$cargoVersion asset_stem=$assetStem"
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "version=$cargoVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "asset_stem=$assetStem" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Derive the source identity and SOURCE_DATE_EPOCH
+        id: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $commit = (git rev-parse 'HEAD^{commit}').Trim()
+          if ($LASTEXITCODE -ne 0) { throw "git rev-parse failed" }
+          $epoch = (git show -s --format=%ct HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "git show failed" }
+          if ($epoch -notmatch '^[0-9]+$') { throw "Unexpected commit time '$epoch'." }
+          Write-Host "commit=$commit source_date_epoch=$epoch"
+          "commit=$commit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "source_date_epoch=$epoch" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "SOURCE_DATE_EPOCH=$epoch" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install pinned release tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $toolRoot = Join-Path $env:RUNNER_TEMP 'cargo-release-tools'
+          cargo install cargo-cyclonedx --version $env:CARGO_CYCLONEDX_VERSION --locked --root $toolRoot
+          if ($LASTEXITCODE -ne 0) { throw "cargo install cargo-cyclonedx failed" }
+          Join-Path $toolRoot 'bin' | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Verify release tool versions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo cyclonedx --version
+          if ($LASTEXITCODE -ne 0) { throw "cargo cyclonedx is not available" }
+
+      - name: Build twice from clean checkouts at different paths
+        id: build
+        shell: pwsh
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $target = $env:RELEASE_TARGET
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+          $cargoHome = (Resolve-Path -LiteralPath $cargoHome).Path
+          $digests = @{}
+          foreach ($label in @('build-a', 'build-b')) {
+            $checkout = Join-Path $env:RUNNER_TEMP $label
+            if (Test-Path -LiteralPath $checkout) { Remove-Item -LiteralPath $checkout -Recurse -Force }
+            git clone --quiet --no-checkout -- "$env:GITHUB_WORKSPACE" "$checkout"
+            if ($LASTEXITCODE -ne 0) { throw "git clone into $label failed" }
+            git -C "$checkout" checkout --quiet --detach "$env:SOURCE_COMMIT"
+            if ($LASTEXITCODE -ne 0) { throw "git checkout of $env:SOURCE_COMMIT in $label failed" }
+            git -C "$checkout" status --porcelain --untracked-files=all | ForEach-Object { throw "Checkout $label is not clean: $_" }
+
+            # Remap both the checkout and CARGO_HOME to fixed virtual prefixes so
+            # embedded source locations do not depend on the absolute build path.
+            # /Brepro makes link.exe derive the PE and PDB timestamps from
+            # content instead of the wall clock. rustc already passes
+            # /PDBALTPATH:%_PDB% so only the PDB file name is embedded.
+            $flags = @(
+              "--remap-path-prefix=$checkout=/diskpie",
+              "--remap-path-prefix=$cargoHome=/cargo",
+              "-Clink-arg=/Brepro"
+            )
+            $env:CARGO_ENCODED_RUSTFLAGS = $flags -join [char]0x1f
+            Write-Host "[$label] rustflags: $($flags -join ' ')"
+
+            Push-Location -LiteralPath $checkout
+            try {
+              cargo build --release -p diskpie --locked --target $target
+              if ($LASTEXITCODE -ne 0) { throw "cargo build in $label failed" }
+            } finally {
+              Pop-Location
+            }
+            $exe = Join-Path $checkout "target\$target\release\diskpie.exe"
+            if (-not (Test-Path -LiteralPath $exe)) { throw "diskpie.exe was not produced in $label" }
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant()
+            $digests[$label] = $hash
+            Write-Host "[$label] diskpie.exe sha256 = $hash"
+          }
+          Remove-Item Env:CARGO_ENCODED_RUSTFLAGS
+
+          Write-Host "build-a sha256 = $($digests['build-a'])"
+          Write-Host "build-b sha256 = $($digests['build-b'])"
+          if ($digests['build-a'] -ne $digests['build-b']) {
+            throw "Reproducibility gate failed: diskpie.exe digests differ between the two clean checkouts."
+          }
+          Write-Host "Reproducibility gate passed: both builds produced identical diskpie.exe bytes."
+          "exe_sha256=$($digests['build-a'])" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Generate the CycloneDX SBOM
+        shell: pwsh
+        env:
+          ASSET_STEM: ${{ steps.version.outputs.asset_stem }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $checkout = Join-Path $env:RUNNER_TEMP 'build-a'
+          $stage = Join-Path $env:RUNNER_TEMP 'stage'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Push-Location -LiteralPath $checkout
+          try {
+            # cargo-cyclonedx 0.5.9 rejects --override-filename together with
+            # --describe, so the generated file is located by glob and renamed.
+            cargo cyclonedx --manifest-path crates\diskpie\Cargo.toml --format json --describe binaries --spec-version 1.5 --target $env:RELEASE_TARGET --target-in-filename
+            if ($LASTEXITCODE -ne 0) { throw "cargo cyclonedx failed" }
+          } finally {
+            Pop-Location
+          }
+          $sboms = @(Get-ChildItem -LiteralPath (Join-Path $checkout 'crates\diskpie') -Filter '*.cdx.json' -File)
+          if ($sboms.Count -ne 1) { throw "Expected exactly one CycloneDX file, found $($sboms.Count)." }
+          $destination = Join-Path $stage "$env:ASSET_STEM.cdx.json"
+          $content = Get-Content -LiteralPath $sboms[0].FullName -Raw
+          # cargo-cyclonedx uses Cargo package ids as bom-refs, and workspace
+          # crates carry `path+file:///<checkout>/crates/<name>` ids. Remap the
+          # checkout to the same virtual prefix rustc used so the SBOM does not
+          # depend on, or disclose, the absolute build path.
+          $checkoutUri = ([System.Uri]$checkout).AbsoluteUri.TrimEnd('/')
+          $content = $content.Replace("path+$checkoutUri/", 'path+file:///diskpie/')
+          foreach ($leak in @($checkout, $checkout.Replace('\', '/'), $env:RUNNER_TEMP, $env:RUNNER_TEMP.Replace('\', '/'), $env:GITHUB_WORKSPACE, $env:GITHUB_WORKSPACE.Replace('\', '/'))) {
+            if ($content.Contains($leak)) { throw "The SBOM still contains a runner filesystem path." }
+          }
+          [System.IO.File]::WriteAllText($destination, $content, (New-Object System.Text.UTF8Encoding($false)))
+          Write-Host "SBOM written: $env:ASSET_STEM.cdx.json ($((Get-Item -LiteralPath $destination).Length) bytes)"
+
+      - name: Assemble the deterministic release ZIP
+        id: package
+        shell: pwsh
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          ASSET_STEM: ${{ steps.version.outputs.asset_stem }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $checkout = Join-Path $env:RUNNER_TEMP 'build-a'
+          $stage = Join-Path $env:RUNNER_TEMP 'stage'
+          $bundle = Join-Path $env:RUNNER_TEMP 'bundle'
+          New-Item -ItemType Directory -Force -Path $stage, $bundle | Out-Null
+
+          Copy-Item -LiteralPath (Join-Path $checkout "target\$env:RELEASE_TARGET\release\diskpie.exe") -Destination (Join-Path $bundle 'diskpie.exe')
+          foreach ($name in @('LICENSE-MIT', 'LICENSE-APACHE', 'THIRD-PARTY-NOTICES.md')) {
+            Copy-Item -LiteralPath (Join-Path $checkout $name) -Destination (Join-Path $bundle $name)
+          }
+
+          $readme = @(
+            "DiskPie $env:TAG for Windows 10/11 (x86-64)",
+            "",
+            "Run",
+            "---",
+            "1. Extract every file from this archive into a folder you can write to.",
+            "2. Start diskpie.exe. No installer or administrator rights are needed.",
+            "3. Pick a drive or folder to scan.",
+            "",
+            "Optional: diskpie.exe [--] [PATH] scans PATH at startup; diskpie.exe --help",
+            "prints the full command line.",
+            "",
+            "Unsigned build",
+            "--------------",
+            "This executable is not code-signed. Windows SmartScreen may warn about an",
+            "unrecognized publisher the first time it runs. Verify the download instead:",
+            "compare its SHA-256 with the SHA256SUMS.txt attached to the GitHub release,",
+            "or run 'gh attestation verify' against the release ZIP.",
+            "",
+            "Licenses",
+            "--------",
+            "DiskPie is licensed under MIT OR Apache-2.0 (LICENSE-MIT, LICENSE-APACHE).",
+            "Third-party components are listed in THIRD-PARTY-NOTICES.md.",
+            ""
+          )
+          [System.IO.File]::WriteAllText((Join-Path $bundle 'README-RUN.txt'), ($readme -join "`n"), (New-Object System.Text.UTF8Encoding($false)))
+
+          # Deterministic writer: fixed entry order, '/' separators, a fixed
+          # timestamp derived from SOURCE_DATE_EPOCH clamped to the MS-DOS range,
+          # fixed compression, zero external attributes, and no archive comment.
+          $epoch = [int64]$env:SOURCE_DATE_EPOCH
+          $stamp = [System.DateTimeOffset]::FromUnixTimeSeconds($epoch)
+          $minimum = [System.DateTimeOffset]::new(1980, 1, 1, 0, 0, 0, [System.TimeSpan]::Zero)
+          $maximum = [System.DateTimeOffset]::new(2107, 12, 31, 23, 59, 58, [System.TimeSpan]::Zero)
+          if ($stamp -lt $minimum) { $stamp = $minimum }
+          if ($stamp -gt $maximum) { $stamp = $maximum }
+          Write-Host "ZIP entry timestamp: $($stamp.ToString('u')) (SOURCE_DATE_EPOCH=$epoch)"
+
+          $entries = @('diskpie.exe', 'README-RUN.txt', 'LICENSE-MIT', 'LICENSE-APACHE', 'THIRD-PARTY-NOTICES.md')
+          foreach ($entry in $entries) {
+            (Get-Item -LiteralPath (Join-Path $bundle $entry)).LastWriteTimeUtc = $stamp.UtcDateTime
+          }
+
+          Add-Type -AssemblyName System.IO.Compression
+          function Write-DeterministicZip([string]$zipPath) {
+            if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
+            $stream = [System.IO.File]::Open($zipPath, [System.IO.FileMode]::CreateNew)
+            try {
+              $archive = [System.IO.Compression.ZipArchive]::new($stream, [System.IO.Compression.ZipArchiveMode]::Create, $false)
+              try {
+                foreach ($entry in $entries) {
+                  $zipEntry = $archive.CreateEntry($entry, [System.IO.Compression.CompressionLevel]::Optimal)
+                  $zipEntry.LastWriteTime = $stamp
+                  $zipEntry.ExternalAttributes = 0
+                  $output = $zipEntry.Open()
+                  try {
+                    $source = [System.IO.File]::OpenRead((Join-Path $bundle $entry))
+                    try { $source.CopyTo($output) } finally { $source.Dispose() }
+                  } finally {
+                    $output.Dispose()
+                  }
+                }
+              } finally {
+                $archive.Dispose()
+              }
+            } finally {
+              $stream.Dispose()
+            }
+          }
+
+          $zipName = "$env:ASSET_STEM.zip"
+          $first = Join-Path $stage $zipName
+          $second = Join-Path $env:RUNNER_TEMP "second-$zipName"
+          Write-DeterministicZip $first
+          Write-DeterministicZip $second
+          $firstHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $first).Hash.ToLowerInvariant()
+          $secondHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $second).Hash.ToLowerInvariant()
+          Write-Host "zip (first)  sha256 = $firstHash"
+          Write-Host "zip (second) sha256 = $secondHash"
+          if ($firstHash -ne $secondHash) { throw "ZIP determinism gate failed: two archives of identical inputs differ." }
+          Remove-Item -LiteralPath $second -Force
+          Write-Host "ZIP determinism gate passed."
+
+          Copy-Item -LiteralPath (Join-Path $bundle 'diskpie.exe') -Destination (Join-Path $stage 'diskpie.exe')
+          "zip_sha256=$firstHash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Record build information and SHA256SUMS
+        shell: pwsh
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          ASSET_STEM: ${{ steps.version.outputs.asset_stem }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+          EXE_SHA256: ${{ steps.build.outputs.exe_sha256 }}
+          ZIP_SHA256: ${{ steps.package.outputs.zip_sha256 }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP 'stage'
+          $rustc = (rustc -vV | Out-String).Trim()
+          $cargo = (cargo -vV | Out-String).Trim()
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $visualStudio = if (Test-Path -LiteralPath $vswhere) { (& $vswhere -latest -products '*' -property installationVersion | Out-String).Trim() } else { 'unknown' }
+          $info = [ordered]@{
+            name = 'diskpie'
+            version = $env:VERSION
+            tag = $env:TAG
+            dry_run = ($env:REF_TYPE -ne 'tag')
+            commit = $env:SOURCE_COMMIT
+            source_date_epoch = [int64]$env:SOURCE_DATE_EPOCH
+            target = $env:RELEASE_TARGET
+            profile = 'release'
+            build_command = "cargo build --release -p diskpie --locked --target $env:RELEASE_TARGET"
+            rustflags = '--remap-path-prefix=<checkout>=/diskpie --remap-path-prefix=<cargo-home>=/cargo -Clink-arg=/Brepro'
+            cargo_incremental = $env:CARGO_INCREMENTAL
+            rustc = $rustc
+            cargo = $cargo
+            runner_image = "$env:ImageOS $env:ImageVersion"
+            windows = [System.Environment]::OSVersion.VersionString
+            visual_studio = $visualStudio
+            archive_method = 'System.IO.Compression.ZipArchive, Optimal deflate, fixed entry order, SOURCE_DATE_EPOCH timestamps'
+            sbom_command = "cargo cyclonedx --manifest-path crates/diskpie/Cargo.toml --format json --describe binaries --spec-version 1.5 --target $env:RELEASE_TARGET --target-in-filename"
+            sbom_normalization = 'workspace package ids remapped from path+file:///<checkout>/ to path+file:///diskpie/'
+            signing = 'unsigned'
+            unsigned_exe_sha256 = $env:EXE_SHA256
+            zip_sha256 = $env:ZIP_SHA256
+            workflow_run = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          }
+          $buildInfo = Join-Path $stage "$env:ASSET_STEM.build-info.json"
+          [System.IO.File]::WriteAllText($buildInfo, (($info | ConvertTo-Json -Depth 4) + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+
+          $lines = @()
+          foreach ($file in @("$env:ASSET_STEM.zip", 'diskpie.exe', "$env:ASSET_STEM.cdx.json", "$env:ASSET_STEM.build-info.json")) {
+            $path = Join-Path $stage $file
+            if (-not (Test-Path -LiteralPath $path)) { throw "Missing release asset $file" }
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
+            $lines += "$hash *$file"
+          }
+          [System.IO.File]::WriteAllText((Join-Path $stage 'SHA256SUMS.txt'), (($lines -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+          Get-Content -LiteralPath (Join-Path $stage 'SHA256SUMS.txt')
+          Get-Content -LiteralPath $buildInfo
+
+      - name: Upload release assets as workflow artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/stage/*
+          if-no-files-found: error
+          retention-days: 14
+
+  attest:
+    name: Attest provenance and SBOM
+    needs: build
+    if: ${{ github.ref_type == 'tag' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/stage
+
+      - name: Verify downloaded assets against SHA256SUMS.txt
+        shell: bash
+        working-directory: ${{ runner.temp }}/stage
+        run: |
+          set -euo pipefail
+          cat SHA256SUMS.txt
+          sha256sum --check --strict SHA256SUMS.txt
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/stage/SHA256SUMS.txt
+
+      - name: Attest the CycloneDX SBOM
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: ${{ runner.temp }}/stage/${{ needs.build.outputs.asset_stem }}.zip
+          sbom-path: ${{ runner.temp }}/stage/${{ needs.build.outputs.asset_stem }}.cdx.json
+
+  publish:
+    name: Create the draft release
+    needs: [build, attest]
+    if: ${{ github.ref_type == 'tag' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source for release notes
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/stage
+
+      - name: Verify downloaded assets against SHA256SUMS.txt
+        shell: bash
+        working-directory: ${{ runner.temp }}/stage
+        run: |
+          set -euo pipefail
+          sha256sum --check --strict SHA256SUMS.txt
+
+      - name: Prepare release notes from CHANGELOG.md
+        shell: bash
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          TAG: ${{ needs.build.outputs.tag }}
+          ASSET_STEM: ${{ needs.build.outputs.asset_stem }}
+        run: |
+          set -euo pipefail
+          notes="${RUNNER_TEMP}/release-notes.md"
+          section="$(awk -v version="${VERSION}" '
+            /^## / {
+              if (found) { exit }
+              if (index($0, "## [" version "]") == 1) { found = 1; next }
+            }
+            found { print }
+          ' CHANGELOG.md)"
+          if [ -n "$(printf '%s' "${section}" | tr -d '[:space:]')" ]; then
+            printf '%s\n' "${section}" > "${notes}"
+            echo "Using the CHANGELOG.md section for ${VERSION}."
+          else
+            {
+              echo "**Maintainer action required:** CHANGELOG.md has no \`## [${VERSION}]\` section."
+              echo "Replace this placeholder with the release notes before publishing the draft."
+              echo
+            } > "${notes}"
+            echo "::warning::CHANGELOG.md has no section for ${VERSION}; the draft carries a placeholder."
+          fi
+          {
+            echo
+            echo "## Download and verification"
+            echo
+            echo "- \`${ASSET_STEM}.zip\` is the canonical download: \`diskpie.exe\`, run instructions, both project licenses, and third-party notices."
+            echo "- This build is **not code-signed**. Windows SmartScreen may warn about an unrecognized publisher."
+            echo "- Compare SHA-256 digests with \`SHA256SUMS.txt\`, then verify provenance:"
+            echo
+            echo '```text'
+            echo "gh attestation verify ${ASSET_STEM}.zip --repo ${GITHUB_REPOSITORY} --source-ref refs/tags/${TAG}"
+            echo '```'
+            echo
+            echo "- \`${ASSET_STEM}.cdx.json\` is the CycloneDX SBOM for the shipped target; \`${ASSET_STEM}.build-info.json\` records the build environment and unsigned digests."
+          } >> "${notes}"
+          cat "${notes}"
+
+      - name: Create the draft release and upload assets
+        shell: bash
+        working-directory: ${{ runner.temp }}/stage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+          ASSET_STEM: ${{ needs.build.outputs.asset_stem }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+            echo "::error::A release for ${TAG} already exists. Delete the stale draft before re-running."
+            exit 1
+          fi
+          gh release create "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft \
+            --verify-tag \
+            --title "DiskPie ${TAG}" \
+            --notes-file "${RUNNER_TEMP}/release-notes.md"
+          gh release upload "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            "${ASSET_STEM}.zip" \
+            "${ASSET_STEM}.cdx.json" \
+            "${ASSET_STEM}.build-info.json" \
+            "SHA256SUMS.txt"
+          echo "Draft release ${TAG} created. It stays a draft until a maintainer publishes it after the Windows client smoke tests."

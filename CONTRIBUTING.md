@@ -36,6 +36,21 @@ Windows-specific behavior still requires a Windows 10 or 11 verification pass.
 - Update requirements, architecture, user documentation, and translations when
   behavior changes.
 
+## Third-party notices
+
+`THIRD-PARTY-NOTICES.md` is generated from `Cargo.lock` for the shipped
+`x86_64-pc-windows-msvc` target and ships inside every release ZIP. Regenerate
+and commit it whenever `Cargo.lock`, `about.toml`, or `about.hbs` changes:
+
+```powershell
+cargo install --locked --version 0.9.1 --features cli cargo-about
+cargo about generate --locked --fail about.hbs -o THIRD-PARTY-NOTICES.md
+```
+
+The `License notices` job in `.github/workflows/security.yml` regenerates the
+file with the same pinned `cargo-about` and fails with a diff when the
+committed copy is stale.
+
 ## Required checks
 
 Run before opening a pull request:
