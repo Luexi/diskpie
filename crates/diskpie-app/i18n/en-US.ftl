@@ -64,6 +64,7 @@ confirm-delete-phrase = Type DELETE to enable permanent deletion.
 confirm-empty-recycle-bin-title = Empty the Recycle Bin for this computer?
 permission-denied = Access was denied. The item was omitted and the rest of the scan will continue.
 path-unavailable = The path is no longer available.
+optional-services-unavailable = Some optional settings or diagnostic services are unavailable; scanning remains enabled.
 diagnostics-exported = Diagnostic information was exported to { $path }
 item-count = { $count ->
     [one] 1 item

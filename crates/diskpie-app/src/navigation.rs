@@ -18,11 +18,13 @@ use std::{
     ffi::OsString,
     fmt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 /// Default maximum number of prior view roots retained for Back navigation.
 pub const DEFAULT_HISTORY_LIMIT: usize = 128;
+/// Maximum number of persistent hidden-branch edits retained above one materialized base.
+pub const MAX_HIDDEN_EDIT_DEPTH: usize = 64;
 
 /// A UI-agnostic action understood by [`NavigationState`].
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -220,6 +222,11 @@ pub enum UnavailableReason {
     },
     /// No hidden branches exist to restore.
     NoHiddenBranches,
+    /// The bounded hidden-state delta is waiting for background materialization.
+    HiddenStateBusy {
+        /// Maximum retained delta depth.
+        max_delta_depth: usize,
+    },
     /// A hidden branch or one of its ancestors cannot be activated or zoomed.
     HiddenTarget {
         /// Rejected hidden node or descendant.
@@ -432,6 +439,188 @@ impl fmt::Display for NavigationError {
 
 impl Error for NavigationError {}
 
+/// Persistent hidden-branch edits that materialize only on a background consumer.
+///
+/// At most [`MAX_HIDDEN_EDIT_DEPTH`] delta nodes are retained above one materialized
+/// base, so membership performs at most `MAX_HIDDEN_EDIT_DEPTH + 1` probes. At the
+/// ceiling a cached background materialization is rebased in O(1), or a new edit is
+/// rejected with [`UnavailableReason::HiddenStateBusy`].
+#[derive(Clone)]
+pub struct HiddenBranchesPlan {
+    inner: Arc<HiddenBranchesPlanInner>,
+}
+
+struct HiddenBranchesPlanInner {
+    node: HiddenBranchesPlanNode,
+    len: usize,
+    depth: usize,
+    materialized: OnceLock<Arc<HiddenBranches>>,
+}
+
+enum HiddenBranchesPlanNode {
+    Base(Arc<HiddenBranches>),
+    Set { previous: Arc<HiddenBranchesPlanInner>, node: NodeId, hidden: bool },
+}
+
+impl fmt::Debug for HiddenBranchesPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HiddenBranchesPlan")
+            .field("len", &self.len())
+            .field("delta_depth", &self.depth())
+            .finish()
+    }
+}
+
+impl HiddenBranchesPlan {
+    fn from_materialized(hidden: Arc<HiddenBranches>) -> Self {
+        let materialized = OnceLock::new();
+        let _ = materialized.set(Arc::clone(&hidden));
+        Self {
+            inner: Arc::new(HiddenBranchesPlanInner {
+                len: hidden.len(),
+                depth: 0,
+                node: HiddenBranchesPlanNode::Base(hidden),
+                materialized,
+            }),
+        }
+    }
+
+    fn empty() -> Self {
+        Self::from_materialized(Arc::new(HiddenBranches::new()))
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.inner.len
+    }
+
+    fn depth(&self) -> usize {
+        self.inner.depth
+    }
+
+    #[cfg(test)]
+    pub(crate) fn identity(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn contains(&self, target: NodeId) -> bool {
+        self.lookup(target).0
+    }
+
+    fn lookup(&self, target: NodeId) -> (bool, usize) {
+        let mut current = self.inner.as_ref();
+        let mut steps = 0;
+        loop {
+            steps += 1;
+            match &current.node {
+                HiddenBranchesPlanNode::Base(hidden) => {
+                    debug_assert!(steps <= MAX_HIDDEN_EDIT_DEPTH + 1);
+                    return (hidden.contains(target), steps);
+                }
+                HiddenBranchesPlanNode::Set { previous, node, hidden } => {
+                    if *node == target {
+                        debug_assert!(steps <= MAX_HIDDEN_EDIT_DEPTH);
+                        return (*hidden, steps);
+                    }
+                    current = previous.as_ref();
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn lookup_steps(&self, target: NodeId) -> usize {
+        self.lookup(target).1
+    }
+
+    #[cfg(test)]
+    fn retained_node_count(&self) -> usize {
+        self.depth() + 1
+    }
+
+    fn can_append_edit(&self) -> bool {
+        self.depth() < MAX_HIDDEN_EDIT_DEPTH || self.inner.materialized.get().is_some()
+    }
+
+    fn prepare_edit(&mut self) -> bool {
+        if self.depth() < MAX_HIDDEN_EDIT_DEPTH {
+            return true;
+        }
+        let Some(materialized) = self.inner.materialized.get() else {
+            return false;
+        };
+        *self = Self::from_materialized(Arc::clone(materialized));
+        true
+    }
+
+    fn set(&mut self, node: NodeId, hidden: bool) -> bool {
+        let was_hidden = self.contains(node);
+        if was_hidden == hidden {
+            return true;
+        }
+        if !self.prepare_edit() {
+            return false;
+        }
+        let len = if hidden { self.len() + 1 } else { self.len() - 1 };
+        self.inner = Arc::new(HiddenBranchesPlanInner {
+            node: HiddenBranchesPlanNode::Set { previous: Arc::clone(&self.inner), node, hidden },
+            len,
+            depth: self.depth() + 1,
+            materialized: OnceLock::new(),
+        });
+        true
+    }
+
+    fn toggle(&mut self, node: NodeId) -> bool {
+        self.set(node, !self.contains(node))
+    }
+
+    fn clear(&mut self) {
+        if self.is_empty() {
+            return;
+        }
+        *self = Self::empty();
+    }
+
+    fn materialized(&self) -> &Arc<HiddenBranches> {
+        self.inner.materialized.get_or_init(|| {
+            let mut edits = Vec::new();
+            let mut current = self.inner.as_ref();
+            let mut hidden = loop {
+                match &current.node {
+                    HiddenBranchesPlanNode::Base(hidden) => break hidden.as_ref().clone(),
+                    HiddenBranchesPlanNode::Set { previous, node, hidden } => {
+                        edits.push((*node, *hidden));
+                        current = previous.as_ref();
+                    }
+                }
+            };
+            for (node, should_hide) in edits.into_iter().rev() {
+                if should_hide {
+                    hidden.hide(node);
+                } else {
+                    hidden.restore(node);
+                }
+            }
+            Arc::new(hidden)
+        })
+    }
+
+    pub(crate) fn materialize(&self) -> Arc<HiddenBranches> {
+        Arc::clone(self.materialized())
+    }
+}
+
+impl From<Arc<HiddenBranches>> for HiddenBranchesPlan {
+    fn from(hidden: Arc<HiddenBranches>) -> Self {
+        Self::from_materialized(hidden)
+    }
+}
+
 /// Pure navigation state for one immutable snapshot revision.
 #[derive(Clone, Debug)]
 pub struct NavigationState {
@@ -440,7 +629,7 @@ pub struct NavigationState {
     selected: Option<NodeId>,
     history: VecDeque<NodeId>,
     history_limit: usize,
-    hidden: HiddenBranches,
+    hidden: HiddenBranchesPlan,
     size_basis: SizeBasis,
 }
 
@@ -465,7 +654,7 @@ impl NavigationState {
             selected: None,
             history: VecDeque::with_capacity(history_limit.min(DEFAULT_HISTORY_LIMIT)),
             history_limit,
-            hidden: HiddenBranches::new(),
+            hidden: HiddenBranchesPlan::empty(),
             size_basis: SizeBasis::Logical,
         })
     }
@@ -515,10 +704,23 @@ impl NavigationState {
         self.size_basis
     }
 
-    /// Returns the immutable hidden-branch set consumed by the sunburst engine.
+    /// Returns the number of explicitly hidden branches without materializing the set.
     #[must_use]
-    pub const fn hidden_branches(&self) -> &HiddenBranches {
-        &self.hidden
+    pub fn hidden_branch_count(&self) -> usize {
+        self.hidden.len()
+    }
+
+    /// Returns whether `node` is explicitly hidden without allocating.
+    #[must_use]
+    pub fn is_hidden(&self, node: NodeId) -> bool {
+        self.hidden.contains(node)
+    }
+
+    /// Clones the persistent hidden-branch plan for a background layout consumer.
+    /// The plan itself never materializes or copies the hidden set on the caller.
+    #[must_use]
+    pub fn hidden_branches_plan(&self) -> HiddenBranchesPlan {
+        self.hidden.clone()
     }
 
     /// Returns the configured maximum number of Back entries.
@@ -623,15 +825,36 @@ impl NavigationState {
                 }
             }
             NavigationAction::HideBranch(node) => {
-                self.hidden.hide(node);
+                if !self.hidden.set(node, true) {
+                    return Err(NavigationError::CommandUnavailable {
+                        command: CommandKind::HideBranch,
+                        reason: UnavailableReason::HiddenStateBusy {
+                            max_delta_depth: MAX_HIDDEN_EDIT_DEPTH,
+                        },
+                    });
+                }
                 CommandOutcome::Applied(NavigationChange::HiddenBranches)
             }
             NavigationAction::RestoreBranch(node) => {
-                self.hidden.restore(node);
+                if !self.hidden.set(node, false) {
+                    return Err(NavigationError::CommandUnavailable {
+                        command: CommandKind::RestoreBranch,
+                        reason: UnavailableReason::HiddenStateBusy {
+                            max_delta_depth: MAX_HIDDEN_EDIT_DEPTH,
+                        },
+                    });
+                }
                 CommandOutcome::Applied(NavigationChange::HiddenBranches)
             }
             NavigationAction::ToggleBranch(node) => {
-                self.hidden.toggle(node);
+                if !self.hidden.toggle(node) {
+                    return Err(NavigationError::CommandUnavailable {
+                        command: CommandKind::ToggleBranch,
+                        reason: UnavailableReason::HiddenStateBusy {
+                            max_delta_depth: MAX_HIDDEN_EDIT_DEPTH,
+                        },
+                    });
+                }
                 CommandOutcome::Applied(NavigationChange::HiddenBranches)
             }
             NavigationAction::RestoreAllBranches => {
@@ -688,8 +911,8 @@ impl NavigationState {
             .iter()
             .filter_map(|node| Anchor::capture(&self.snapshot, *node))
             .collect::<Vec<_>>();
-        let hidden_anchors = self
-            .hidden
+        let hidden = self.hidden.materialize();
+        let hidden_anchors = hidden
             .iter()
             .filter_map(|node| Anchor::capture(&self.snapshot, node))
             .collect::<Vec<_>>();
@@ -735,7 +958,7 @@ impl NavigationState {
         self.view_root = view_root;
         self.selected = selected;
         self.history = history;
-        self.hidden = hidden;
+        self.hidden = HiddenBranchesPlan::from_materialized(Arc::new(hidden));
 
         Ok(ReplacementReport {
             generation: replacement_generation,
@@ -778,16 +1001,22 @@ impl NavigationState {
             NavigationAction::ShowSummary => {
                 self.summary_for_current_view().is_none().then_some(UnavailableReason::NoSummary)
             }
-            NavigationAction::HideBranch(node) => self.hide_reason(node),
-            NavigationAction::RestoreBranch(node) => self.real_target_reason(node).or_else(|| {
-                (!self.hidden.contains(node)).then_some(UnavailableReason::NotHidden { node })
-            }),
+            NavigationAction::HideBranch(node) => {
+                self.hide_reason(node).or_else(|| self.hidden_edit_busy_reason())
+            }
+            NavigationAction::RestoreBranch(node) => self
+                .real_target_reason(node)
+                .or_else(|| {
+                    (!self.hidden.contains(node)).then_some(UnavailableReason::NotHidden { node })
+                })
+                .or_else(|| self.hidden_edit_busy_reason()),
             NavigationAction::ToggleBranch(node) => {
-                if self.hidden.contains(node) {
+                let reason = if self.hidden.contains(node) {
                     self.real_target_reason(node)
                 } else {
                     self.hide_reason(node)
-                }
+                };
+                reason.or_else(|| self.hidden_edit_busy_reason())
             }
             NavigationAction::RestoreAllBranches => {
                 self.hidden.is_empty().then_some(UnavailableReason::NoHiddenBranches)
@@ -808,6 +1037,12 @@ impl NavigationState {
         };
         (record.kind() == EntryKind::SyntheticGroup)
             .then_some(UnavailableReason::SyntheticTarget { node })
+    }
+
+    fn hidden_edit_busy_reason(&self) -> Option<UnavailableReason> {
+        (!self.hidden.can_append_edit()).then_some(UnavailableReason::HiddenStateBusy {
+            max_delta_depth: MAX_HIDDEN_EDIT_DEPTH,
+        })
     }
 
     fn navigable_reason(&self, node: NodeId) -> Option<UnavailableReason> {
@@ -1334,11 +1569,141 @@ mod tests {
     }
 
     #[test]
+    fn hidden_mutations_append_persistent_edits_without_copying_the_base_set() {
+        let fixture = fixture(8);
+        let state = NavigationState::new(fixture.snapshot).expect("navigation");
+        let mut metric_clone = state.clone();
+        assert_eq!(state.hidden.identity(), metric_clone.hidden.identity());
+
+        apply(&mut metric_clone, NavigationAction::SetSizeBasis(SizeBasis::Allocated));
+        assert_eq!(state.hidden.identity(), metric_clone.hidden.identity());
+
+        let mut hidden_clone = metric_clone.clone();
+        apply(&mut hidden_clone, NavigationAction::HideBranch(fixture.nested));
+        assert_ne!(metric_clone.hidden.identity(), hidden_clone.hidden.identity());
+        match &hidden_clone.hidden.inner.node {
+            HiddenBranchesPlanNode::Set { previous, node, hidden } => {
+                assert!(Arc::ptr_eq(previous, &metric_clone.hidden.inner));
+                assert_eq!(*node, fixture.nested);
+                assert!(*hidden);
+            }
+            HiddenBranchesPlanNode::Base(_) => {
+                panic!("hide must append one persistent edit")
+            }
+        }
+        assert_eq!(metric_clone.hidden_branch_count(), 0);
+        assert!(hidden_clone.is_hidden(fixture.nested));
+    }
+
+    #[test]
+    fn restore_all_is_a_constant_size_persistent_edit() {
+        let fixture = fixture(18);
+        let mut state = NavigationState::new(fixture.snapshot).expect("navigation");
+        let mut hidden = HiddenBranches::new();
+        for raw in 0..10_000 {
+            hidden.hide(NodeId::from_raw(raw));
+        }
+        state.hidden = HiddenBranchesPlan::from_materialized(Arc::new(hidden));
+        let prior = Arc::downgrade(&state.hidden.inner);
+
+        apply(&mut state, NavigationAction::RestoreAllBranches);
+
+        assert!(state.hidden.is_empty());
+        assert_eq!(state.hidden.depth(), 0);
+        assert!(prior.upgrade().is_none(), "clear retained its predecessor chain");
+        match &state.hidden.inner.node {
+            HiddenBranchesPlanNode::Base(hidden) => assert!(hidden.is_empty()),
+            HiddenBranchesPlanNode::Set { .. } => {
+                panic!("restore all must replace the delta with an empty base")
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_hidden_cycles_keep_depth_lookup_and_retained_nodes_bounded() {
+        let fixture = fixture(28);
+        let mut state = NavigationState::new(fixture.snapshot).expect("navigation");
+        let absent = NodeId::from_raw(u32::MAX);
+        let mut maximum_depth = 0;
+        let mut maximum_lookup_steps = 0;
+        let mut maximum_retained_nodes = 0;
+        let mut background_rebases = 0;
+
+        for index in 0..1_024 {
+            let action = if index % 2 == 0 {
+                NavigationAction::HideBranch(fixture.nested)
+            } else {
+                NavigationAction::RestoreBranch(fixture.nested)
+            };
+            let command = state.command(action);
+            if matches!(
+                state.availability(command),
+                CommandAvailability::Unavailable(UnavailableReason::HiddenStateBusy { .. })
+            ) {
+                background_rebases += 1;
+                let plan = state.hidden_branches_plan();
+                std::thread::spawn(move || plan.materialize())
+                    .join()
+                    .expect("background materialization");
+                assert_eq!(state.availability(command), CommandAvailability::Available);
+            }
+            apply(&mut state, action);
+            maximum_depth = maximum_depth.max(state.hidden.depth());
+            maximum_lookup_steps = maximum_lookup_steps.max(state.hidden.lookup_steps(absent));
+            maximum_retained_nodes = maximum_retained_nodes.max(state.hidden.retained_node_count());
+        }
+
+        assert!(background_rebases > 1, "the repeated test never exercised cached rebasing");
+        assert_eq!(maximum_depth, MAX_HIDDEN_EDIT_DEPTH);
+        assert_eq!(maximum_lookup_steps, MAX_HIDDEN_EDIT_DEPTH + 1);
+        assert_eq!(maximum_retained_nodes, MAX_HIDDEN_EDIT_DEPTH + 1);
+    }
+
+    #[test]
+    fn hidden_edit_ceiling_returns_typed_busy_until_background_materialization_is_ready() {
+        let fixture = fixture(29);
+        let mut state = NavigationState::new(fixture.snapshot).expect("navigation");
+        for _ in 0..(MAX_HIDDEN_EDIT_DEPTH / 2) {
+            apply(&mut state, NavigationAction::HideBranch(fixture.nested));
+            apply(&mut state, NavigationAction::RestoreBranch(fixture.nested));
+        }
+        assert_eq!(state.hidden.depth(), MAX_HIDDEN_EDIT_DEPTH);
+        assert_eq!(state.hidden.retained_node_count(), MAX_HIDDEN_EDIT_DEPTH + 1);
+        assert_eq!(
+            state.hidden.lookup_steps(NodeId::from_raw(u32::MAX)),
+            MAX_HIDDEN_EDIT_DEPTH + 1
+        );
+        let command = state.command(NavigationAction::HideBranch(fixture.nested));
+        assert_eq!(
+            state.availability(command),
+            CommandAvailability::Unavailable(UnavailableReason::HiddenStateBusy {
+                max_delta_depth: MAX_HIDDEN_EDIT_DEPTH,
+            })
+        );
+        let identity = state.hidden.identity();
+        assert!(matches!(
+            state.execute(command),
+            Err(NavigationError::CommandUnavailable {
+                reason: UnavailableReason::HiddenStateBusy { .. },
+                ..
+            })
+        ));
+        assert_eq!(state.hidden.identity(), identity, "busy rejection mutated hidden state");
+
+        let plan = state.hidden_branches_plan();
+        std::thread::spawn(move || plan.materialize()).join().expect("background materialization");
+        assert_eq!(state.availability(command), CommandAvailability::Available);
+        apply(&mut state, NavigationAction::HideBranch(fixture.nested));
+        assert_eq!(state.hidden.depth(), 1, "cached state was not rebased");
+        assert!(state.is_hidden(fixture.nested));
+    }
+
+    #[test]
     fn hidden_branches_are_validated_restored_and_remapped_exactly() {
         let original = fixture(8);
         let mut state = NavigationState::new(original.snapshot).expect("navigation");
         apply(&mut state, NavigationAction::HideBranch(original.nested));
-        assert!(state.hidden_branches().contains(original.nested));
+        assert!(state.is_hidden(original.nested));
         assert!(matches!(
             state.availability(state.command(NavigationAction::HideBranch(original.root))),
             CommandAvailability::Unavailable(
@@ -1346,9 +1711,9 @@ mod tests {
             )
         ));
         apply(&mut state, NavigationAction::RestoreBranch(original.nested));
-        assert!(state.hidden_branches().is_empty());
+        assert_eq!(state.hidden_branch_count(), 0);
         apply(&mut state, NavigationAction::ToggleBranch(original.leaf));
-        assert!(state.hidden_branches().contains(original.leaf));
+        assert!(state.is_hidden(original.leaf));
 
         let mut builder = TreeBuilder::new(GenerationId::new(9));
         let root = builder.add_root(NodeSpec::root("C:\\")).expect("root");
@@ -1362,9 +1727,11 @@ mod tests {
         let moved_leaf =
             builder.add_child(nested, file("renamed.bin", Some(identity(12)))).expect("leaf");
         state.replace_snapshot(builder.freeze().expect("replacement")).expect("replace");
-        assert_eq!(state.hidden_branches().iter().collect::<Vec<_>>(), vec![moved_leaf]);
+        assert_eq!(state.hidden.materialize().iter().collect::<Vec<_>>(), vec![moved_leaf]);
+        assert_eq!(state.hidden.depth(), 0, "snapshot replacement must compact hidden edits");
+        assert_eq!(state.hidden.lookup_steps(NodeId::from_raw(u32::MAX)), 1);
         apply(&mut state, NavigationAction::RestoreAllBranches);
-        assert!(state.hidden_branches().is_empty());
+        assert_eq!(state.hidden_branch_count(), 0);
     }
 
     #[test]

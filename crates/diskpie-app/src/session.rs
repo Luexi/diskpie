@@ -329,6 +329,8 @@ pub struct SessionReducer {
     last_snapshot_at: Option<Duration>,
     selection_anchor: Option<SelectionAnchor>,
     selected: Option<NodeId>,
+    #[cfg(test)]
+    materialization_count: std::cell::Cell<usize>,
 }
 
 impl SessionReducer {
@@ -352,6 +354,8 @@ impl SessionReducer {
             last_snapshot_at: None,
             selection_anchor: None,
             selected: None,
+            #[cfg(test)]
+            materialization_count: std::cell::Cell::new(0),
         }
     }
 
@@ -583,12 +587,31 @@ impl SessionReducer {
 
     /// Materializes and records a publication regardless of policy.
     pub fn publish_snapshot(&mut self, now: Duration) -> Result<SnapshotPublication, SessionError> {
+        self.publish_snapshot_inner(now, false)
+    }
+
+    /// Materializes the currently observed tree once with a cancelled aggregate state.
+    ///
+    /// This does not terminalize the reducer; the real coordinator terminal can still
+    /// reconcile counters after the runtime has frozen an immediately observable frame.
+    pub(crate) fn publish_cancelled_snapshot(
+        &mut self,
+        now: Duration,
+    ) -> Result<SnapshotPublication, SessionError> {
+        self.publish_snapshot_inner(now, true)
+    }
+
+    fn publish_snapshot_inner(
+        &mut self,
+        now: Duration,
+        cancelled: bool,
+    ) -> Result<SnapshotPublication, SessionError> {
         if let Some(last) = self.last_snapshot_at
             && now < last
         {
             return Err(SessionError::ClockWentBackwards);
         }
-        let snapshot = Arc::new(self.materialize_snapshot()?);
+        let snapshot = Arc::new(self.materialize_snapshot_inner(cancelled)?);
         self.refresh_selection();
         self.last_snapshot_revision = self.revision;
         self.last_snapshot_at = Some(now);
@@ -610,6 +633,12 @@ impl SessionReducer {
 
     /// Builds a snapshot without changing rate-limit bookkeeping.
     pub fn materialize_snapshot(&self) -> Result<TreeSnapshot, SessionError> {
+        self.materialize_snapshot_inner(false)
+    }
+
+    fn materialize_snapshot_inner(&self, cancelled: bool) -> Result<TreeSnapshot, SessionError> {
+        #[cfg(test)]
+        self.materialization_count.set(self.materialization_count.get().saturating_add(1));
         if matches!(&self.phase, SessionPhase::AwaitingStart) {
             return Err(SessionError::MissingStarted);
         }
@@ -645,12 +674,16 @@ impl SessionReducer {
             }
             materialized.insert(node.scan_id, actual);
         }
-        builder.set_scan_state(match &self.phase {
-            SessionPhase::Complete => ScanState::Complete,
-            SessionPhase::Cancelled => ScanState::Cancelled,
-            SessionPhase::AwaitingStart => return Err(SessionError::MissingStarted),
-            SessionPhase::Running | SessionPhase::Partial | SessionPhase::Failed(_) => {
-                ScanState::Partial
+        builder.set_scan_state(if cancelled {
+            ScanState::Cancelled
+        } else {
+            match &self.phase {
+                SessionPhase::Complete => ScanState::Complete,
+                SessionPhase::Cancelled => ScanState::Cancelled,
+                SessionPhase::AwaitingStart => return Err(SessionError::MissingStarted),
+                SessionPhase::Running | SessionPhase::Partial | SessionPhase::Failed(_) => {
+                    ScanState::Partial
+                }
             }
         });
         builder.freeze().map_err(SessionError::Core)
@@ -1452,6 +1485,49 @@ mod tests {
         let snapshot = reducer.materialize_snapshot().expect("cancelled snapshot");
         assert_eq!(snapshot.state(), ScanState::Cancelled);
         assert_eq!(snapshot.len(), 2);
+    }
+
+    #[test]
+    fn observed_cancellation_materializes_once_without_terminalizing_the_reducer() {
+        let mut reducer = SessionReducer::new(generation(31));
+        apply(&mut reducer, started(31, &[(0, "root")]));
+        apply(
+            &mut reducer,
+            batch_event(31, 0, vec![entry(1, 0, "kept", EntryKind::File)], Vec::new()),
+        );
+        let observed = reducer.materialize_snapshot().expect("observed snapshot");
+        let before = reducer.materialization_count.get();
+
+        let cancelled = reducer
+            .publish_cancelled_snapshot(Duration::from_millis(1))
+            .expect("cancelled publication");
+        assert_eq!(reducer.materialization_count.get(), before + 1);
+        assert_eq!(cancelled.snapshot.state(), ScanState::Cancelled);
+        assert_eq!(cancelled.snapshot.len(), observed.len());
+        for (actual, expected) in cancelled.snapshot.nodes().iter().zip(observed.nodes()) {
+            assert_eq!(actual.name(), expected.name());
+            assert_eq!(actual.kind(), expected.kind());
+            assert_eq!(actual.parent(), expected.parent());
+            assert_eq!(actual.own_metrics(), expected.own_metrics());
+            assert_eq!(actual.own_omissions(), expected.own_omissions());
+            assert_eq!(actual.file_identity(), expected.file_identity());
+            assert_eq!(actual.aggregate().logical(), expected.aggregate().logical());
+            assert_eq!(actual.aggregate().allocated(), expected.aggregate().allocated());
+            assert_eq!(actual.aggregate().file_count(), expected.aggregate().file_count());
+            assert_eq!(
+                actual.aggregate().directory_count(),
+                expected.aggregate().directory_count()
+            );
+            assert_eq!(actual.aggregate().omission_count(), expected.aggregate().omission_count());
+        }
+        assert_eq!(reducer.phase(), &SessionPhase::Running);
+
+        let mut real = reducer.progress().observed();
+        real.entries += 2;
+        real.files += 2;
+        apply(&mut reducer, terminal_event(31, TerminalState::Cancelled, real));
+        assert_eq!(reducer.phase(), &SessionPhase::Cancelled);
+        assert_eq!(reducer.progress().terminal_reported(), Some(real));
     }
 
     #[test]

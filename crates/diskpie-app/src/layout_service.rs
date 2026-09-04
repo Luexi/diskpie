@@ -5,11 +5,10 @@
 //! scans cannot create an unbounded layout backlog or run layout on the render
 //! thread.
 
+use crate::navigation::HiddenBranchesPlan;
 use diskpie_core::{
     GenerationId, TreeSnapshot,
-    sunburst::{
-        HiddenBranches, LayoutError, LayoutOptions, SizeBasis, SunburstLayout, compute_layout,
-    },
+    sunburst::{LayoutError, LayoutOptions, SizeBasis, SunburstLayout, compute_layout},
 };
 use std::{
     error::Error,
@@ -29,6 +28,11 @@ impl LayoutRequestId {
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn from_raw_for_test(value: u64) -> Self {
+        Self(value)
     }
 }
 
@@ -73,6 +77,8 @@ pub struct LayoutCompletion {
     pub root: diskpie_core::NodeId,
     pub size_basis: SizeBasis,
     pub result: Result<SunburstLayout, LayoutTaskError>,
+    #[cfg(test)]
+    retirement_probe: Option<RetirementProbe>,
 }
 
 /// Why a new request could not enter the one-slot mailbox.
@@ -80,6 +86,7 @@ pub struct LayoutCompletion {
 pub enum LayoutSubmitError {
     RequestIdExhausted,
     WorkerStopped,
+    RetirementBackpressure,
 }
 
 impl fmt::Display for LayoutSubmitError {
@@ -87,18 +94,83 @@ impl fmt::Display for LayoutSubmitError {
         match self {
             Self::RequestIdExhausted => formatter.write_str("layout request IDs are exhausted"),
             Self::WorkerStopped => formatter.write_str("the layout worker has stopped"),
+            Self::RetirementBackpressure => {
+                formatter.write_str("layout retirement capacity is temporarily exhausted")
+            }
         }
     }
 }
 
 impl Error for LayoutSubmitError {}
 
+/// An unaccepted layout request returned with all caller-owned inputs intact.
+pub struct LayoutSubmitRejected {
+    error: LayoutSubmitError,
+    snapshot: Arc<TreeSnapshot>,
+    options: LayoutOptions,
+    hidden: HiddenBranchesPlan,
+}
+
+impl fmt::Debug for LayoutSubmitRejected {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LayoutSubmitRejected")
+            .field("error", &self.error)
+            .field("generation", &self.snapshot.generation())
+            .field("options", &self.options)
+            .field("hidden_len", &self.hidden.len())
+            .finish()
+    }
+}
+
+impl fmt::Display for LayoutSubmitRejected {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl Error for LayoutSubmitRejected {}
+
+impl LayoutSubmitRejected {
+    #[must_use]
+    pub const fn error(&self) -> LayoutSubmitError {
+        self.error
+    }
+
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (LayoutSubmitError, Arc<TreeSnapshot>, LayoutOptions, HiddenBranchesPlan) {
+        (self.error, self.snapshot, self.options, self.hidden)
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct RetirementProbe(Arc<Mutex<Option<String>>>);
+
+#[cfg(test)]
+impl Drop for RetirementProbe {
+    fn drop(&mut self) {
+        *self.0.lock().expect("layout retirement probe lock") =
+            thread::current().name().map(str::to_owned);
+    }
+}
+
 #[derive(Debug)]
 struct LayoutJob {
     id: LayoutRequestId,
     snapshot: Arc<TreeSnapshot>,
     options: LayoutOptions,
-    hidden: HiddenBranches,
+    hidden: HiddenBranchesPlan,
+    #[cfg(test)]
+    retirement_probe: Option<RetirementProbe>,
+}
+
+#[derive(Debug, Default)]
+struct LayoutRetirement {
+    pending: Vec<LayoutJob>,
+    completed: Vec<LayoutCompletion>,
 }
 
 #[derive(Debug, Default)]
@@ -106,8 +178,13 @@ struct WorkerState {
     pending: Option<LayoutJob>,
     active: Option<LayoutRequestId>,
     completed: Option<LayoutCompletion>,
+    retired: Option<LayoutRetirement>,
     latest: Option<LayoutRequestId>,
     shutdown: bool,
+    #[cfg(test)]
+    last_submitted_hidden_ptr: Option<usize>,
+    #[cfg(test)]
+    paused: bool,
 }
 
 #[derive(Debug, Default)]
@@ -151,26 +228,73 @@ impl LayoutService {
     /// Replaces any queued or completed older request without waiting.
     ///
     /// Work already executing is allowed to finish, but its result is discarded
-    /// if this request supersedes it before publication.
-    pub fn submit(
+    /// if this request supersedes it before publication. Hidden branches stay
+    /// immutably shared with navigation rather than copying an unbounded set.
+    pub fn submit<H>(
         &mut self,
         snapshot: Arc<TreeSnapshot>,
         options: LayoutOptions,
-        hidden: HiddenBranches,
-    ) -> Result<LayoutRequestId, LayoutSubmitError> {
+        hidden: H,
+    ) -> Result<LayoutRequestId, LayoutSubmitRejected>
+    where
+        H: Into<HiddenBranchesPlan>,
+    {
+        let hidden = hidden.into();
         if self.worker.as_ref().is_none_or(JoinHandle::is_finished) {
-            return Err(LayoutSubmitError::WorkerStopped);
+            return Err(LayoutSubmitRejected {
+                error: LayoutSubmitError::WorkerStopped,
+                snapshot,
+                options,
+                hidden,
+            });
         }
-        let sequence = self.next_id.checked_add(1).ok_or(LayoutSubmitError::RequestIdExhausted)?;
+        let Some(sequence) = self.next_id.checked_add(1) else {
+            return Err(LayoutSubmitRejected {
+                error: LayoutSubmitError::RequestIdExhausted,
+                snapshot,
+                options,
+                hidden,
+            });
+        };
         let id = LayoutRequestId(sequence);
 
         let mut state = lock_state(&self.shared);
         if state.shutdown {
-            return Err(LayoutSubmitError::WorkerStopped);
+            return Err(LayoutSubmitRejected {
+                error: LayoutSubmitError::WorkerStopped,
+                snapshot,
+                options,
+                hidden,
+            });
+        }
+        let displaces_work = state.pending.is_some() || state.completed.is_some();
+        if displaces_work && state.retired.is_some() {
+            return Err(LayoutSubmitRejected {
+                error: LayoutSubmitError::RetirementBackpressure,
+                snapshot,
+                options,
+                hidden,
+            });
         }
         self.next_id = sequence;
-        state.pending = Some(LayoutJob { id, snapshot, options, hidden });
-        state.completed = None;
+        #[cfg(test)]
+        {
+            state.last_submitted_hidden_ptr = Some(hidden.identity());
+        }
+        if displaces_work {
+            state.retired = Some(LayoutRetirement {
+                pending: state.pending.take().into_iter().collect(),
+                completed: state.completed.take().into_iter().collect(),
+            });
+        }
+        state.pending = Some(LayoutJob {
+            id,
+            snapshot,
+            options,
+            hidden,
+            #[cfg(test)]
+            retirement_probe: None,
+        });
         state.latest = Some(id);
         drop(state);
         self.shared.wake.notify_one();
@@ -201,8 +325,6 @@ impl Drop for LayoutService {
         {
             let mut state = lock_state(&self.shared);
             state.shutdown = true;
-            state.pending = None;
-            state.completed = None;
         }
         self.shared.wake.notify_one();
         if let Some(worker) = self.worker.take() {
@@ -212,25 +334,53 @@ impl Drop for LayoutService {
 }
 
 fn worker_loop(shared: &Shared) {
+    enum Action {
+        Retire(LayoutRetirement),
+        Compute(LayoutJob),
+        Stop(LayoutRetirement),
+    }
+
     loop {
-        let job = {
+        let action = {
             let mut state = lock_state(shared);
-            while state.pending.is_none() && !state.shutdown {
+            while !state.shutdown
+                && ((state.pending.is_none() && state.retired.is_none()) || worker_paused(&state))
+            {
                 state = shared.wake.wait(state).unwrap_or_else(|poisoned| poisoned.into_inner());
             }
             if state.shutdown {
+                let mut retirement = state.retired.take().unwrap_or_default();
+                retirement.pending.extend(state.pending.take());
+                retirement.completed.extend(state.completed.take());
+                Action::Stop(retirement)
+            } else if let Some(retirement) = state.retired.take() {
+                Action::Retire(retirement)
+            } else {
+                let job = state.pending.take().expect("a signalled layout worker has pending work");
+                state.active = Some(job.id);
+                Action::Compute(job)
+            }
+        };
+
+        let job = match action {
+            Action::Retire(retirement) => {
+                drop(retirement);
+                continue;
+            }
+            Action::Stop(retirement) => {
+                drop(retirement);
                 return;
             }
-            let job = state.pending.take().expect("a signalled layout worker has pending work");
-            state.active = Some(job.id);
-            job
+            Action::Compute(job) => job,
         };
 
         let source_generation = job.snapshot.generation();
         let root = job.options.root;
         let size_basis = job.options.size_basis;
         let result = catch_unwind(AssertUnwindSafe(|| {
-            compute_layout(&job.snapshot, job.options, &job.hidden).map_err(LayoutTaskError::from)
+            let hidden = job.hidden.materialize();
+            compute_layout(&job.snapshot, job.options, hidden.as_ref())
+                .map_err(LayoutTaskError::from)
         }))
         .unwrap_or(Err(LayoutTaskError::WorkerPanicked));
 
@@ -242,10 +392,29 @@ fn worker_loop(shared: &Shared) {
             return;
         }
         if state.latest == Some(job.id) {
-            state.completed =
-                Some(LayoutCompletion { id: job.id, source_generation, root, size_basis, result });
+            let replaced = state.completed.replace(LayoutCompletion {
+                id: job.id,
+                source_generation,
+                root,
+                size_basis,
+                result,
+                #[cfg(test)]
+                retirement_probe: None,
+            });
+            drop(state);
+            drop(replaced);
         }
     }
+}
+
+#[cfg(test)]
+fn worker_paused(state: &WorkerState) -> bool {
+    state.paused
+}
+
+#[cfg(not(test))]
+fn worker_paused(_state: &WorkerState) -> bool {
+    false
 }
 
 fn lock_state(shared: &Shared) -> MutexGuard<'_, WorkerState> {
@@ -256,7 +425,8 @@ fn lock_state(shared: &Shared) -> MutexGuard<'_, WorkerState> {
 mod tests {
     use super::*;
     use diskpie_core::{
-        MetricSource, NodeSpec, OwnMetrics, SizeMetric, TreeBuilder, sunburst::SizeBasis,
+        MetricSource, NodeSpec, OwnMetrics, SizeMetric, TreeBuilder, sunburst::HiddenBranches,
+        sunburst::SizeBasis,
     };
     use std::{thread, time::Duration};
 
@@ -292,13 +462,16 @@ mod tests {
     fn computes_without_exposing_work_to_the_caller_thread() {
         let snapshot = snapshot(7);
         let mut service = LayoutService::new().expect("worker");
+        let hidden = HiddenBranchesPlan::from(Arc::new(HiddenBranches::new()));
+        let hidden_ptr = hidden.identity();
         let id = service
             .submit(
                 Arc::clone(&snapshot),
                 LayoutOptions::new(diskpie_core::NodeId::from_raw(0)),
-                HiddenBranches::new(),
+                hidden,
             )
             .expect("submit");
+        assert_eq!(lock_state(&service.shared).last_submitted_hidden_ptr, Some(hidden_ptr));
         let completion = wait_for_completion(&service);
 
         assert_eq!(completion.id, id);
@@ -309,6 +482,104 @@ mod tests {
     }
 
     #[test]
+    fn submit_retires_displaced_values_on_the_worker_and_returns_backpressure_owned() {
+        let pending_observed = Arc::new(Mutex::new(None));
+        let completed_observed = Arc::new(Mutex::new(None));
+        let mut service = LayoutService::new().expect("worker");
+        let old_snapshot = snapshot(40);
+        {
+            let mut state = lock_state(&service.shared);
+            state.paused = true;
+            state.pending = Some(LayoutJob {
+                id: LayoutRequestId(40),
+                snapshot: Arc::clone(&old_snapshot),
+                options: LayoutOptions::new(diskpie_core::NodeId::from_raw(0)),
+                hidden: Arc::new(HiddenBranches::new()).into(),
+                retirement_probe: Some(RetirementProbe(Arc::clone(&pending_observed))),
+            });
+            state.completed = Some(LayoutCompletion {
+                id: LayoutRequestId(39),
+                source_generation: GenerationId::new(39),
+                root: diskpie_core::NodeId::from_raw(0),
+                size_basis: SizeBasis::Logical,
+                result: Err(LayoutTaskError::WorkerPanicked),
+                retirement_probe: Some(RetirementProbe(Arc::clone(&completed_observed))),
+            });
+            state.latest = Some(LayoutRequestId(40));
+        }
+
+        let accepted = service
+            .submit(
+                snapshot(41),
+                LayoutOptions::new(diskpie_core::NodeId::from_raw(0)),
+                Arc::new(HiddenBranches::new()),
+            )
+            .expect("one retirement slot accepts the replacement");
+        {
+            let state = lock_state(&service.shared);
+            let retirement = state.retired.as_ref().expect("displaced values retained");
+            assert!(retirement.pending[0].retirement_probe.is_some());
+            assert!(retirement.completed[0].retirement_probe.is_some());
+            assert_eq!(state.pending.as_ref().map(|job| job.id), Some(accepted));
+        }
+
+        let rejected_snapshot = snapshot(42);
+        let rejected_hidden = HiddenBranchesPlan::from(Arc::new(HiddenBranches::new()));
+        let hidden_identity = rejected_hidden.identity();
+        let rejection = service
+            .submit(
+                Arc::clone(&rejected_snapshot),
+                LayoutOptions::new(diskpie_core::NodeId::from_raw(0)),
+                rejected_hidden,
+            )
+            .expect_err("a second displacement is backpressured");
+        assert_eq!(rejection.error(), LayoutSubmitError::RetirementBackpressure);
+        let (error, returned_snapshot, _, returned_hidden) = rejection.into_parts();
+        assert_eq!(error, LayoutSubmitError::RetirementBackpressure);
+        assert!(Arc::ptr_eq(&returned_snapshot, &rejected_snapshot));
+        assert_eq!(returned_hidden.identity(), hidden_identity);
+        assert_eq!(
+            lock_state(&service.shared).pending.as_ref().map(|job| job.id),
+            Some(accepted),
+            "rejection must leave the accepted pending request intact"
+        );
+        let mut returned = Vec::new();
+        for generation in 43..75 {
+            returned.push(
+                service
+                    .submit(
+                        snapshot(generation),
+                        LayoutOptions::new(diskpie_core::NodeId::from_raw(0)),
+                        Arc::new(HiddenBranches::new()),
+                    )
+                    .expect_err("retirement backpressure remains bounded"),
+            );
+        }
+        assert!(
+            returned.iter().all(|rejection| {
+                rejection.error() == LayoutSubmitError::RetirementBackpressure
+            })
+        );
+        assert_eq!(lock_state(&service.shared).pending.as_ref().map(|job| job.id), Some(accepted));
+
+        {
+            let mut state = lock_state(&service.shared);
+            state.paused = false;
+        }
+        service.shared.wake.notify_all();
+        drop(returned);
+        for observed in [&pending_observed, &completed_observed] {
+            for _ in 0..2_000 {
+                if observed.lock().expect("probe lock").is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(observed.lock().expect("probe lock").as_deref(), Some("diskpie-layout"));
+        }
+    }
+
+    #[test]
     fn latest_request_wins_even_if_an_older_result_was_ready() {
         let snapshot = snapshot(8);
         let mut service = LayoutService::new().expect("worker");
@@ -316,7 +587,7 @@ mod tests {
             .submit(
                 Arc::clone(&snapshot),
                 LayoutOptions::new(diskpie_core::NodeId::from_raw(0)),
-                HiddenBranches::new(),
+                Arc::new(HiddenBranches::new()),
             )
             .expect("first");
         while service.is_busy() {
@@ -325,7 +596,8 @@ mod tests {
 
         let mut options = LayoutOptions::new(diskpie_core::NodeId::from_raw(0));
         options.size_basis = SizeBasis::Allocated;
-        let second = service.submit(snapshot, options, HiddenBranches::new()).expect("second");
+        let second =
+            service.submit(snapshot, options, Arc::new(HiddenBranches::new())).expect("second");
         let completion = wait_for_completion(&service);
 
         assert!(second > first);
@@ -341,7 +613,9 @@ mod tests {
         let mut service = LayoutService::new().expect("worker");
         let mut options = LayoutOptions::new(diskpie_core::NodeId::from_raw(0));
         options.max_sectors = 0;
-        service.submit(snapshot, options, HiddenBranches::new()).expect("accepted request");
+        service
+            .submit(snapshot, options, Arc::new(HiddenBranches::new()))
+            .expect("accepted request");
         let completion = wait_for_completion(&service);
 
         assert!(matches!(

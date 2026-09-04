@@ -114,12 +114,13 @@ pub enum MessageId {
     ConfirmEmptyRecycleBinTitle,
     PermissionDenied,
     PathUnavailable,
+    OptionalServicesUnavailable,
     DiagnosticsExported,
     ItemCount,
 }
 
 impl MessageId {
-    pub const ALL: [Self; 68] = [
+    pub const ALL: [Self; 69] = [
         Self::AppName,
         Self::Tagline,
         Self::Back,
@@ -186,6 +187,7 @@ impl MessageId {
         Self::ConfirmEmptyRecycleBinTitle,
         Self::PermissionDenied,
         Self::PathUnavailable,
+        Self::OptionalServicesUnavailable,
         Self::DiagnosticsExported,
         Self::ItemCount,
     ];
@@ -264,6 +266,7 @@ impl MessageId {
             Self::ConfirmEmptyRecycleBinTitle => "confirm-empty-recycle-bin-title",
             Self::PermissionDenied => "permission-denied",
             Self::PathUnavailable => "path-unavailable",
+            Self::OptionalServicesUnavailable => "optional-services-unavailable",
             Self::DiagnosticsExported => "diagnostics-exported",
             Self::ItemCount => "item-count",
         }

@@ -3,7 +3,6 @@
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};
 
-pub const SETTINGS_STORAGE_KEY: &str = "diskpie.settings";
 pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
 pub const MAX_SERIALIZED_SETTINGS_BYTES: usize = 64 * 1_024;
 

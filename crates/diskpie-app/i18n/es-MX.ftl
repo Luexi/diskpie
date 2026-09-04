@@ -69,3 +69,4 @@ item-count = { $count ->
     [one] 1 elemento
    *[other] { $count } elementos
 }
+optional-services-unavailable = Algunos servicios opcionales de configuración o diagnóstico no están disponibles; el análisis sigue habilitado.
