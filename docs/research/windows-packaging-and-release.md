@@ -181,6 +181,54 @@ solution. Microsoft documents a second condition: the machine policy
 paths where required and must test with that policy both enabled and disabled.
 The manifest must never request elevation merely to scan.
 
+### Resource compiler dependency record (2026-09-03)
+
+This record satisfies the `AGENTS.md` dependency rule for the build-script
+crate that embeds the manifest, icon group, and `VERSIONINFO` above. Both
+candidates are MIT, both were checked against crates.io metadata and the
+vendored 0.1.31/3.0.11 sources on 2026-09-03, and neither has a pure-Rust
+resource compiler: on the MSVC target both invoke the Windows SDK `rc.exe`,
+which is preinstalled on the GitHub `windows-2022` image and on any machine
+with the Visual Studio C++ workload. The requirement "no external tool" is
+therefore unsatisfiable for a full resource set; the only pure-Rust option
+found, `embed-manifest`, writes a manifest resource but no icon group or
+version block, so it cannot deliver this contract alone.
+
+| Criterion | `winresource` 0.1.31 | `embed-resource` 3.0.11 |
+|---|---|---|
+| License | MIT | MIT |
+| Maintenance | Released 2026-03-16; five releases in the preceding year | Released 2026-07-02; five releases in the preceding year |
+| Unsafe footprint | Zero `unsafe` in the crate; one runtime dependency (`version_check`, already in `Cargo.lock`) once the `toml` feature is disabled | Adds `cc`, `rustc_version`, `toml`, `memchr`, `vswhom`, and `winreg`; `vswhom` and `winreg` contain FFI/registry `unsafe` |
+| External tools on MSVC | Windows SDK `rc.exe`, located through `reg query` of `HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots` (both are inbox on `windows-2022`); `RC_PATH` overrides | Windows SDK `rc.exe`, located through `vswhere`/registry; `RC` environment overrides; LLVM-RC mode needs a C preprocessor via `cc` |
+| Platform support | Windows MSVC, Windows GNU (`windres`), and Linux/macOS cross builds; the crate compiles on every host so a plain `[build-dependencies]` entry keeps `cargo check` portable | Same platforms; also compiles on every host |
+| Build and binary impact | One extra build-script crate; `Cargo.lock` grows by exactly one package; the PE grows only by the resource section | Six extra build-script packages, a `cc` probe, and toolchain discovery on each clean build; identical PE growth |
+| Local-alternative cost | Hand-writing a `.res` emitter in `build.rs` (~300 lines of PE resource layout) is possible but duplicates a tested crate | Same |
+| Lock-in and fallback | The crate only emits `resource.rc` plus `cargo:rustc-link-arg`; the manifest and property list stay project-owned, so a switch to `embed-resource` or a direct `rc.exe` call keeps every input | Lower-level API; equally replaceable |
+
+Decision: adopt `winresource = "=0.1.31"` with `default-features = false`.
+All version strings are set programmatically from `CARGO_PKG_*`, so the
+optional `toml` feature (which reads `[package.metadata.winresource]`) is not
+needed and its dependency tree stays out of the lock. `embed-resource` remains
+the documented fallback if `winresource` is abandoned or if a resource type it
+cannot express becomes necessary.
+
+Implementation notes recorded from the first embedding:
+
+- `crates/diskpie/build.rs` returns early unless `CARGO_CFG_TARGET_OS` is
+  `windows`, so the Linux portable-core job never needs an SDK.
+- `cargo:rerun-if-changed` covers `build.rs`, `diskpie.manifest`, and
+  `assets/brand/diskpie-icon.ico`.
+- The manifest is embedded as resource ID 1 (`RT_MANIFEST`) verbatim from
+  `crates/diskpie/diskpie.manifest`; `mt.exe -validate_manifest` on the
+  extracted resource reports "Parsing of manifest successful" and the only
+  differences from the source file are `mt.exe`'s canonical re-serialization
+  of self-closing tags.
+- `winresource` derives the fixed PE version as `major.minor.patch.0` from
+  `CARGO_PKG_VERSION_*`, matching the contract above.
+- `CompanyName` is populated from `CARGO_PKG_AUTHORS`, which currently names
+  the individual publisher recorded in `LICENSE-MIT`; re-check it against the
+  validated publisher identity before any signing stage is enabled.
+
 ## Portable runtime and renderer gate
 
 The portable contract is stronger than "there is one `.exe` in `target`": a
