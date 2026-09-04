@@ -354,10 +354,16 @@ interfaces and PIDLs never leave the STA. The current implementation supports a
 filesystem-only folder picker with a real owner HWND and one outstanding modal
 request.
 
-Known gap: `Drop` currently calls a synchronous join. Before UI integration,
-add nonblocking shutdown request, bounded explicit finish, and a process-wide
-bounded reaper that retains both the join handle and singleton claim until the
-worker truly exits.
+Shutdown is bounded (ADR 0007, decision note 2026-09-03). `request_shutdown`
+is nonblocking and idempotent; `finish(timeout)` is the composition root's
+explicit completion point outside the UI loop and returns a typed
+`ShellServiceFinish`; `Drop` does atomic/`Arc` work only and never joins. A
+worker that outlives the deadline is handed, with its singleton claim, to one
+precreated process-wide reaper thread with a fixed queue of
+`SHELL_REAPER_CAPACITY` entries; the reaper joins before releasing the claim,
+so a second STA cannot start until the old one truly exited. If that hand-off
+is impossible the lifecycle fails closed and the claim stays held for the rest
+of the process.
 
 ### Destructive actions - planned
 
