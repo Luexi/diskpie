@@ -300,38 +300,88 @@ has a keyboard-accessible equivalent.
 
 ## 9. UI composition
 
-The current `DiskPieShell` is a visual scaffold, not a connected product. It
-implements the original “forensic radial instrument” direction, responsive
-wide/narrow rails, theme/locale controls, and settings synchronization, but its
-chart is calibration art and actions are disabled.
-
-The planned composition is:
+`DiskPieShell` is the connected product surface. It keeps the “forensic radial
+instrument” direction, the responsive wide/narrow rails, the theme/locale
+controls, and settings synchronization, and it now owns the real handles the
+composition root prepares before the native window exists:
 
 ```mermaid
 flowchart TD
-    Start["Composition root prepares capabilities"] --> Native["eframe creates native window"]
-    Native --> Shell["DiskPieShell owns UI-only state"]
-    Shell --> Logic["Per-frame bounded logic poll"]
-    Logic --> View["Render committed immutable state"]
-    View --> Commands["Emit typed commands"]
+    Start["Composition root prepares runtime, Shell STA, resolver, diagnostic bridge, fonts"] --> Native["eframe creates native window"]
+    Native --> Shell["DiskPieShell owns UI-only state plus those handles"]
+    Shell --> Logic["Per-frame bounded logic: drain Shell events, drain resolver results, tick runtime"]
+    Logic --> Flow["ScanFlow derives one ScanUi state"]
+    Flow --> View["Render committed immutable frame"]
+    View --> Commands["Typed ShellCommand / NavigationAction"]
     Commands --> Logic
-    Shell --> Exit["Post-event-loop ownership handoff"]
-    Exit --> Finish["Bounded service finish and settings commit"]
+    Shell --> Exit["ExitHandoff after eframe drops the app"]
+    Exit --> Finish["Ordered bounded finish, typed ShutdownReceipts, settings commit, diagnostics finish"]
 ```
 
-The shell needs a safe owner HWND for native modal operations, but must not own
-COM objects. Path/volume resolution and `WindowsFileSystem` construction occur
-off the frame callback. The logic phase supplies elapsed `Duration` to the
-runtime, drains bounded events, and requests repaint only while needed.
+Composition-root modules in `crates/diskpie/src`:
 
-Required responsive surfaces:
+- `scan_ui.rs`: the headless state machine. `ScanFlow` accumulates plain
+  observations (dialog outstanding, resolver jobs, deferred launch, runtime
+  state, whether the committed snapshot belongs to the current generation) and
+  derives exactly one `ScanUi` state: `Empty`, `Choosing`, `Resolving`,
+  `Scanning`, `Partial { settled }`, `Cancelling`, `Complete`,
+  `CancelledWithResults`, or `Failed { class }`. `repaint_policy` is pure: an
+  idle frame requests no repaint; outstanding Shell/resolver work polls again
+  after a short delay; a busy runtime repaints continuously.
+- `resolver.rs`: one root-owned worker thread behind a `ResolveBackend` trait.
+  It canonicalizes `.`/`..` lexically after `std::path::absolute`, calls
+  `resolve_scan_root`, enumerates volumes with `discover_volumes`, and builds
+  the `WindowsFileSystem` with the scan's cancel token. The frame side submits
+  bounded jobs (`try_send`) and drains bounded results; the root joins the
+  worker with a deadline after the event loop.
+- `diagnostic_sink.rs`: a bounded `SyncSender<DiagnosticEvent>` clone for the
+  shell (drop-and-count when full) drained by a root-owned thread into the
+  installed tracing subscriber. Events carry only the typed fields; never paths.
+- `fonts.rs`: reads well-known Windows fallback fonts at startup (bounded to
+  64 MiB, missing files skipped) and appends them after the embedded faces.
 
-- command rail: Back, Parent, choose roots, rescan, cancel, theme, language;
-- telemetry rail: phase, progress, counts, selected size, omissions, metric;
-- radial lens: actual `SunburstView`;
-- inspection rail/list: largest children, selection details, keyboard actions;
-- status rail: errors/warnings without paths in diagnostic records; and
-- modal confirmation flows for destructive actions.
+The shell obtains the owner HWND through eframe's `HasWindowHandle` on
+`eframe::Frame` and hands the integer to `OwnerWindow::from_raw`; it owns no
+COM object. `ShellService::submit_folder` and `try_recv` are the only Shell
+calls made from a callback. Every navigation action goes through
+`RuntimeController::navigation_command` and `execute_navigation`;
+`NavigationReport::rescan_request` is consumed by resolving the full roots
+again through the resolver. Branch rescans have no engine path yet and are
+shown as unavailable with an explicit reason.
+
+Surfaces:
+
+- command rail: Back, Parent, Choose folder, Rescan, Cancel, Show summary,
+  scan-root display, theme, language; `CommandAvailability` drives enabled
+  state and `UnavailableReason` text is the disabled hover text;
+- telemetry rail: phase pill, selected size in the current basis, files,
+  folders, omissions, unknown-size count, item count, metric toggle, hidden
+  branch count with Restore all;
+- radial lens: calibration rings plus the drive list while empty, choosing, or
+  resolving; the real `SunburstView` otherwise, with a localized tooltip and a
+  context menu (hide/restore/rescan-branch; destructive and open/reveal
+  entries stay disabled);
+- inspection rail: virtualized largest-children list (`ScrollArea::show_rows`)
+  synchronized with the chart, selection details (path, logical, allocated,
+  counts, scan state, hard-link precision note), branch actions, and the
+  disabled safety section;
+- status rail: notice text, optional-services banner, previous-session
+  panic notice.
+
+Keyboard: Backspace and Alt+Left go back, Alt+Up goes to the parent, F5
+rescans, Esc cancels while a scan is active, Ctrl+O opens the folder picker;
+the chart keeps its own arrow/Enter/Escape/Shift+F10 handling.
+
+Shutdown: the shell calls `RuntimeController::request_shutdown`,
+`ShellService::request_shutdown`, and the resolver stop flag when the viewport
+close is requested (and again in `on_exit`/`Drop`); after `run_native`
+returns, `main.rs` awaits the runtime handoff, drops the runtime, calls
+`ShellService::finish(2 s)`, joins the resolver and the diagnostic bridge with
+deadlines, and returns typed `ShutdownReceipts` for the panic-marker
+quiescence proof, then publishes settings and finishes diagnostics.
+
+Not yet connected: destructive actions and their confirmation flows (Phase 5)
+and the real previous-session-panicked value (the panic-marker workstream).
 
 See [UI product direction](research/ui-product-direction.md) for typography,
 palette, accessibility, motion, and frame-performance constraints.
