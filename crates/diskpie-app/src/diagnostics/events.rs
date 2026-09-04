@@ -78,6 +78,9 @@ pub enum DiagnosticCode {
     AppStopped,
     ProjectPathsUnavailable,
     SettingsRecovered,
+    SettingsUnavailable,
+    SettingsPublished,
+    SettingsPublishFailed,
     LoggingUnavailable,
     DiagnosticQueueDropped,
     DiagnosticWriteFailed,
@@ -97,11 +100,14 @@ pub enum DiagnosticCode {
 
 impl DiagnosticCode {
     /// Complete list, used by policy and uniqueness tests.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 22] = [
         Self::AppStarted,
         Self::AppStopped,
         Self::ProjectPathsUnavailable,
         Self::SettingsRecovered,
+        Self::SettingsUnavailable,
+        Self::SettingsPublished,
+        Self::SettingsPublishFailed,
         Self::LoggingUnavailable,
         Self::DiagnosticQueueDropped,
         Self::DiagnosticWriteFailed,
@@ -126,6 +132,9 @@ impl DiagnosticCode {
             Self::AppStopped => "app.stopped",
             Self::ProjectPathsUnavailable => "project_paths.unavailable",
             Self::SettingsRecovered => "settings.recovered",
+            Self::SettingsUnavailable => "settings.unavailable",
+            Self::SettingsPublished => "settings.published",
+            Self::SettingsPublishFailed => "settings.publish_failed",
             Self::LoggingUnavailable => "diagnostics.logging_unavailable",
             Self::DiagnosticQueueDropped => "diagnostics.queue_dropped",
             Self::DiagnosticWriteFailed => "diagnostics.write_failed",
@@ -150,6 +159,8 @@ impl DiagnosticCode {
             Self::ScanFailed => DiagnosticLevel::Error,
             Self::ProjectPathsUnavailable
             | Self::SettingsRecovered
+            | Self::SettingsUnavailable
+            | Self::SettingsPublishFailed
             | Self::LoggingUnavailable
             | Self::DiagnosticQueueDropped
             | Self::DiagnosticWriteFailed
@@ -160,6 +171,7 @@ impl DiagnosticCode {
             }
             Self::AppStarted
             | Self::AppStopped
+            | Self::SettingsPublished
             | Self::ExportPrepared
             | Self::ScanRequested
             | Self::ScanStarted

@@ -70,7 +70,12 @@ impl SettingsStore for SettingsDocumentStore {
     }
 }
 
-fn decode_document(raw: &[u8]) -> SettingsRead {
+/// Classifies one bounded native document without trusting its payload.
+///
+/// The native adapter hands over bytes it has already bounded; this is the
+/// only place that turns them into a policy-level read outcome.
+#[must_use]
+pub fn decode_document(raw: &[u8]) -> SettingsRead {
     if raw.len() > MAX_SERIALIZED_SETTINGS_BYTES {
         return SettingsRead::Oversized { bytes: raw.len() };
     }
