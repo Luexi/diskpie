@@ -148,7 +148,11 @@ jobs:
             # /Brepro makes link.exe derive the PE and PDB timestamps from
             # content instead of the wall clock. rustc already passes
             # /PDBALTPATH:%_PDB% so only the PDB file name is embedded.
+            # Setting CARGO_ENCODED_RUSTFLAGS replaces the rustflags from
+            # .cargo/config.toml, so the ADR 0011 static CRT linkage must be
+            # repeated here or the exe silently regresses to a dynamic CRT.
             $flags = @(
+              "-Ctarget-feature=+crt-static",
               "--remap-path-prefix=$checkout=/diskpie",
               "--remap-path-prefix=$cargoHome=/cargo",
               "-Clink-arg=/Brepro"
@@ -178,6 +182,58 @@ jobs:
           }
           Write-Host "Reproducibility gate passed: both builds produced identical diskpie.exe bytes."
           "exe_sha256=$($digests['build-a'])" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Inspect the portable import table
+        shell: pwsh
+        run: |
+          # ADR 0011 portable-runtime gate: parse the PE import directory with
+          # no external tool and refuse any CRT or compiler runtime DLL that a
+          # clean Windows 10/11 client does not ship. This is the backstop for
+          # the +crt-static flag repeated in the build step above.
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $env:RUNNER_TEMP "build-a\target\$env:RELEASE_TARGET\release\diskpie.exe"
+          $bytes = [System.IO.File]::ReadAllBytes($exe)
+          function U16($o) { [BitConverter]::ToUInt16($bytes, $o) }
+          function U32($o) { [BitConverter]::ToUInt32($bytes, $o) }
+          $peOff = U32 0x3C
+          if ((U32 $peOff) -ne 0x00004550) { throw 'diskpie.exe is not a PE file' }
+          $numSections = U16 ($peOff + 6)
+          $optSize = U16 ($peOff + 20)
+          $opt = $peOff + 24
+          if ((U16 $opt) -ne 0x20B) { throw 'diskpie.exe is not PE32+' }
+          $importRva = U32 ($opt + 120)
+          $secTable = $opt + $optSize
+          $sections = @()
+          for ($i = 0; $i -lt $numSections; $i++) {
+            $s = $secTable + $i * 40
+            $sections += [pscustomobject]@{ Va = (U32 ($s + 12)); Size = [Math]::Max((U32 ($s + 8)), (U32 ($s + 16))); Raw = (U32 ($s + 20)) }
+          }
+          function RvaToOffset($rva) {
+            foreach ($s in $sections) { if ($rva -ge $s.Va -and $rva -lt ($s.Va + $s.Size)) { return $rva - $s.Va + $s.Raw } }
+            throw "RVA $rva is not mapped by any section"
+          }
+          $dlls = @()
+          if ($importRva -ne 0) {
+            $desc = RvaToOffset $importRva
+            while ($true) {
+              $nameRva = U32 ($desc + 12)
+              if ($nameRva -eq 0) { break }
+              $nameOff = RvaToOffset $nameRva
+              $end = $nameOff
+              while ($bytes[$end] -ne 0) { $end++ }
+              $dlls += [System.Text.Encoding]::ASCII.GetString($bytes, $nameOff, $end - $nameOff)
+              $desc += 20
+            }
+          }
+          $dlls = $dlls | Sort-Object -Unique
+          Write-Host "diskpie.exe size: $($bytes.Length) bytes"
+          Write-Host "diskpie.exe imports: $($dlls -join ', ')"
+          # ucrtbase.dll is an inbox Windows 10+ component and stays allowed.
+          $forbidden = $dlls | Where-Object { $_ -match '^(vcruntime|msvcp|api-ms-win-crt|libgcc|libstdc)' }
+          if ($forbidden) {
+            throw "Portable-runtime gate failed: diskpie.exe imports $($forbidden -join ', '). The static CRT flag was lost; see ADR 0011."
+          }
+          Write-Host 'Portable-runtime gate passed: no CRT or compiler runtime DLL is imported.'
 
       - name: Generate the CycloneDX SBOM
         shell: pwsh
@@ -344,7 +400,7 @@ jobs:
             target = $env:RELEASE_TARGET
             profile = 'release'
             build_command = "cargo build --release -p diskpie --locked --target $env:RELEASE_TARGET"
-            rustflags = '--remap-path-prefix=<checkout>=/diskpie --remap-path-prefix=<cargo-home>=/cargo -Clink-arg=/Brepro'
+            rustflags = '-Ctarget-feature=+crt-static --remap-path-prefix=<checkout>=/diskpie --remap-path-prefix=<cargo-home>=/cargo -Clink-arg=/Brepro'
             cargo_incremental = $env:CARGO_INCREMENTAL
             rustc = $rustc
             cargo = $cargo
