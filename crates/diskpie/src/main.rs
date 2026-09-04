@@ -4,20 +4,31 @@
 #![forbid(unsafe_code)]
 
 pub mod cli;
+mod diagnostic_sink;
+mod fonts;
 #[cfg(windows)]
 mod local_diagnostics;
 pub mod panic_marker;
+mod resolver;
+mod scan_ui;
 mod shell;
 pub mod storage;
 pub mod sunburst_view;
 mod theme;
 
-use std::{process::ExitCode, sync::Arc};
+use std::{
+    process::ExitCode,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use eframe::egui;
 
-use diskpie_app::settings::SettingsSession;
+use diagnostic_sink::DiagnosticBridge;
+use diskpie_app::{runtime::RuntimeController, settings::SettingsSession};
 use panic_marker::{CrashMarkerError, FinishCleanOutcome};
+use resolver::ResolverWorker;
+use shell::{ExitHandoff, ShellExit, UiServices};
 use storage::SettingsDocumentStore;
 
 #[cfg(windows)]
@@ -31,13 +42,14 @@ use diskpie_app::{
 #[cfg(windows)]
 use diskpie_platform::{
     ProjectPathFacility, ProjectPaths, SettingsCommitOutcome, SettingsFileErrorKind,
-    SettingsFileRead, WindowsSettingsFile, resolve_project_paths,
+    SettingsFileRead, ShellService, ShellServiceFinish, WindowsSettingsFile, resolve_project_paths,
 };
 #[cfg(windows)]
 use local_diagnostics::{InitialRetentionOutcome, LocalDiagnostics};
 #[cfg(windows)]
 use panic_marker::{
-    CrashMarkerErrorKind, CrashRuntime, RuntimeQuiescenceReceipt, ShutdownQuiescenceProof,
+    CrashMarkerErrorKind, CrashRuntime, RuntimeQuiescenceReceipt, RuntimeShutdownEvidence,
+    ShutdownQuiescenceProof,
 };
 
 /// What happened to this session's crash marker at exit.
@@ -55,6 +67,9 @@ enum CrashMarkerFinish {
     /// Clean-session reconciliation ran with a proof.
     Reconciled(Result<FinishCleanOutcome, CrashMarkerError>),
 }
+
+/// Bounded wait for each UI-owned service after the event loop has returned.
+const SERVICE_FINISH_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
     let startup = match cli::parse_env() {
@@ -75,7 +90,7 @@ fn main() -> ExitCode {
 
     let (result, _crash_marker_finish) = run(startup);
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(_receipts) => ExitCode::SUCCESS,
         Err(error) => {
             report_startup_failure(&format!("diskpie: application startup failed: {error}"));
             ExitCode::FAILURE
@@ -106,37 +121,220 @@ fn report_startup_failure(text: &str) {
     diskpie_platform::show_startup_failure(text);
 }
 
+/// Typed receipts of the ordered shutdown performed after the event loop.
+///
+/// The crash-marker reconciliation turns these into its shutdown-quiescence
+/// proof: a clean-shutdown marker may only be produced once every owned
+/// provider and worker has actually stopped. This struct reports the facts;
+/// [`RuntimeQuiescenceReceipt::from_shutdown`] decides whether they suffice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShutdownReceipts {
+    /// `RuntimeController::is_shutdown_complete` observed before disposal.
+    /// It does not promise that a blocked filesystem call has returned.
+    pub runtime_shutdown_complete: bool,
+    /// Scan sessions still held by background retirement when the runtime
+    /// reported shutdown complete; zero means no provider was left behind.
+    pub runtime_retiring_scans: usize,
+    /// Whether a Shell STA was started for this session at all.
+    pub shell_service_started: bool,
+    /// Outcome of `ShellService::finish`, when the shell handed the STA back.
+    #[cfg(windows)]
+    pub shell_service: Option<ShellServiceFinish>,
+    /// Whether the resolver worker thread was joined within its deadline.
+    pub resolver_joined: bool,
+    /// Whether the diagnostic bridge thread was joined within its deadline.
+    pub diagnostic_bridge_joined: bool,
+    /// Events the UI dropped because the bounded diagnostic queue was full.
+    pub diagnostic_events_dropped: u64,
+}
+
 #[cfg(windows)]
-fn run(startup: cli::StartupRequest) -> (eframe::Result, CrashMarkerFinish) {
+impl ShutdownReceipts {
+    /// Whether the Shell STA is known to have exited: either none was ever
+    /// started, or `finish` joined it within its deadline. A handed-off or
+    /// reaper-unavailable STA, and a started STA that was never handed back
+    /// for finishing, both count as still possibly alive.
+    fn shell_stopped(&self) -> bool {
+        match (self.shell_service_started, self.shell_service) {
+            (false, _) => true,
+            (true, Some(ShellServiceFinish::Exited { .. })) => true,
+            (true, _) => false,
+        }
+    }
+
+    fn runtime_quiescence(&self) -> Option<RuntimeQuiescenceReceipt> {
+        RuntimeQuiescenceReceipt::from_shutdown(RuntimeShutdownEvidence {
+            runtime_shutdown_complete: self.runtime_shutdown_complete,
+            retiring_scans: self.runtime_retiring_scans,
+            shell_stopped: self.shell_stopped(),
+            resolver_joined: self.resolver_joined,
+            bridge_joined: self.diagnostic_bridge_joined,
+        })
+    }
+}
+
+#[cfg(windows)]
+fn run(startup: cli::StartupRequest) -> (eframe::Result<ShutdownReceipts>, CrashMarkerFinish) {
     let mut services = WindowsStartupServices::prepare();
     let settings = SettingsSession::load(&mut services.settings_store);
     services.start_diagnostics(&settings);
+    let prepared = match services.prepare_ui_services(&settings) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            // No scan runtime, Shell STA, or worker was composed, so the
+            // "no runtime composed" receipt remains truthful here.
+            let crash_marker_finish = services.finish(None);
+            return (Err(error), crash_marker_finish);
+        }
+    };
+    let shell_service_started = prepared.services.picker.is_some();
+    let previous_session_panicked = services.previous_session_panicked();
 
-    let (result, session) = run_ui(startup, settings, services.optional_services_unavailable);
+    let (result, exit) = run_ui(
+        startup,
+        settings,
+        services.optional_services_unavailable,
+        previous_session_panicked,
+        prepared.services,
+    );
 
-    // Exit order: settings publication, diagnostics stop/finish, then crash
-    // marker reconciliation with the proof minted from that finish.
+    // Exit order: UI-owned services (runtime disposal, Shell STA finish,
+    // resolver and bridge joins), settings publication, diagnostics
+    // stop/finish, then crash-marker reconciliation with a proof minted from
+    // the diagnostics join and the receipts collected above.
+    let (receipts, session) =
+        finish_ui_services(exit, prepared.resolver, prepared.bridge, shell_service_started);
     services.publish_settings(session);
-    let crash_marker_finish = services.finish();
-    (result, crash_marker_finish)
+    let crash_marker_finish = services.finish(Some(receipts));
+    (result.map(|()| receipts), crash_marker_finish)
 }
 
 #[cfg(not(windows))]
-fn run(startup: cli::StartupRequest) -> (eframe::Result, CrashMarkerFinish) {
+fn run(startup: cli::StartupRequest) -> (eframe::Result<ShutdownReceipts>, CrashMarkerFinish) {
     // ADR 0019 item 10: other desktop targets stay explicitly nonpersistent
     // until they implement an equivalent adapter.
     let mut store = SettingsDocumentStore::unavailable("settings.storage.unavailable");
     let settings = SettingsSession::load(&mut store);
-    (run_ui(startup, settings, true).0, CrashMarkerFinish::NotInstalled)
+    let prepared = (|| -> eframe::Result<PreparedUiServices> {
+        let runtime =
+            RuntimeController::new(shell::runtime_config_from_settings(settings.settings()))
+                .map_err(app_creation_error)?;
+        let (resolver_client, resolver) =
+            resolver::start(resolver::UnsupportedBackend).map_err(app_creation_error)?;
+        let bridge = DiagnosticBridge::start(|_event| {}).map_err(app_creation_error)?;
+        Ok(PreparedUiServices {
+            services: UiServices {
+                runtime,
+                picker: None,
+                resolver: resolver_client,
+                diagnostics: bridge.sink(),
+                fonts: fonts::SystemFonts::default(),
+            },
+            resolver,
+            bridge,
+        })
+    })();
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => return (Err(error), CrashMarkerFinish::NotInstalled),
+    };
+    let (result, exit) = run_ui(startup, settings, true, false, prepared.services);
+    let (receipts, _session) = finish_ui_services(exit, prepared.resolver, prepared.bridge, false);
+    (result.map(|()| receipts), CrashMarkerFinish::NotInstalled)
+}
+
+fn app_creation_error(error: impl std::error::Error + Send + Sync + 'static) -> eframe::Error {
+    eframe::Error::AppCreation(Box::new(error))
+}
+
+/// Services created before the window and finished after the event loop.
+struct PreparedUiServices {
+    services: UiServices,
+    resolver: ResolverWorker,
+    bridge: DiagnosticBridge,
+}
+
+/// Ordered, bounded finish of everything the shell handed back.
+///
+/// The shell already requested runtime and Shell shutdown from inside the
+/// event loop; this only waits within documented deadlines and never from a
+/// callback. Order: runtime disposal, Shell STA finish, resolver join, then
+/// the diagnostic bridge join. Settings publication and diagnostics finish
+/// follow in the caller.
+fn finish_ui_services(
+    exit: Option<ShellExit>,
+    resolver: ResolverWorker,
+    bridge: DiagnosticBridge,
+    shell_service_started: bool,
+) -> (ShutdownReceipts, Option<SettingsSession>) {
+    let (session, mut runtime, picker, clock_origin) = match exit {
+        Some(exit) => (Some(exit.settings), exit.runtime, exit.picker, exit.clock_origin),
+        None => (None, None, None, Instant::now()),
+    };
+
+    let runtime_shutdown_complete =
+        runtime.as_mut().is_some_and(|runtime| await_runtime_shutdown(runtime, clock_origin));
+    let runtime_retiring_scans =
+        runtime.as_ref().map_or(usize::MAX, RuntimeController::retiring_scans);
+    // Disposal is bounded by the runtime's own contract: ownership of any
+    // provider that has not returned transfers to the bounded reaper.
+    drop(runtime);
+
+    #[cfg(windows)]
+    let shell_service = picker.map(|picker| picker.finish(SERVICE_FINISH_TIMEOUT));
+    #[cfg(not(windows))]
+    drop(picker);
+
+    let resolver_joined = resolver.finish(SERVICE_FINISH_TIMEOUT);
+    let diagnostic_events_dropped = bridge.dropped_events();
+    let diagnostic_bridge_joined = bridge.finish(SERVICE_FINISH_TIMEOUT);
+
+    (
+        ShutdownReceipts {
+            runtime_shutdown_complete,
+            runtime_retiring_scans,
+            shell_service_started,
+            #[cfg(windows)]
+            shell_service,
+            resolver_joined,
+            diagnostic_bridge_joined,
+            diagnostic_events_dropped,
+        },
+        session,
+    )
+}
+
+/// Polls the runtime's shutdown handoff within the service deadline.
+///
+/// Each poll also ticks the runtime with the shell's clock: shutdown
+/// completion requires the supervisor's output slots to be empty, and a
+/// terminal report that arrives after the last frame would otherwise sit
+/// there undrained until the deadline. Ticking here is not a callback and
+/// never blocks; a tick error (for example `ShuttingDown`) is expected and
+/// carries no work of its own.
+fn await_runtime_shutdown(runtime: &mut RuntimeController, clock_origin: Instant) -> bool {
+    let deadline = Instant::now() + SERVICE_FINISH_TIMEOUT;
+    loop {
+        if runtime.is_shutdown_complete() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        let _ = runtime.tick(|| clock_origin.elapsed());
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn run_ui(
     startup: cli::StartupRequest,
     settings: SettingsSession,
     optional_services_unavailable: bool,
-) -> (eframe::Result, Option<SettingsSession>) {
-    let settings_exit = shell::SettingsExit::default();
-    let settings_exit_for_ui = settings_exit.clone();
+    previous_session_panicked: bool,
+    services: UiServices,
+) -> (eframe::Result, Option<ShellExit>) {
+    let exit = ExitHandoff::default();
+    let exit_for_ui = exit.clone();
 
     let icon =
         eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/brand/diskpie-icon.png"))
@@ -173,15 +371,17 @@ fn run_ui(
                 creation,
                 startup.into_initial_path(),
                 optional_services_unavailable,
+                previous_session_panicked,
                 settings,
-                settings_exit_for_ui,
+                services,
+                exit_for_ui,
             )?))
         }),
     );
 
-    // The shell transfers policy state only after the native event loop has
-    // released it, so publication never overlaps an egui callback.
-    (result, settings_exit.take())
+    // The shell transfers policy state and service ownership only after the
+    // native event loop has released it, so nothing below overlaps a callback.
+    (result, exit.take())
 }
 
 /// Native services owned by the composition root for the process lifetime.
@@ -299,6 +499,61 @@ impl WindowsStartupServices {
         self.crash_runtime = Some(runtime);
     }
 
+    /// Whether the installed crash session retained a valid marker from a
+    /// previous run. The shell shows only that fact (ADR 0017 item 8).
+    fn previous_session_panicked(&self) -> bool {
+        self.crash_runtime
+            .as_ref()
+            .is_some_and(|runtime| matches!(runtime.prepared_previous_marker(), Ok(Some(_marker))))
+    }
+
+    /// Creates the runtime, the Shell STA, the resolver worker, the diagnostic
+    /// bridge, and the optional system fonts before the native window exists.
+    ///
+    /// A missing Shell STA only disables the native folder picker; the rest of
+    /// the application, including drive selection, keeps working.
+    fn prepare_ui_services(
+        &mut self,
+        settings: &SettingsSession,
+    ) -> eframe::Result<PreparedUiServices> {
+        let runtime =
+            RuntimeController::new(shell::runtime_config_from_settings(settings.settings()))
+                .map_err(app_creation_error)?;
+        let picker = match ShellService::start() {
+            Ok(service) => Some(service),
+            Err(_error) => {
+                self.optional_services_unavailable = true;
+                self.record(classified_event(
+                    DiagnosticCode::ShellActionFailed,
+                    ErrorClass::Unsupported,
+                ));
+                None
+            }
+        };
+        let (resolver_client, resolver) =
+            resolver::start(resolver::WindowsBackend).map_err(app_creation_error)?;
+        // The bridge thread records through the installed subscriber; the
+        // `LocalDiagnostics` owner stays with the root for the final flush.
+        let bridge = if self.diagnostics.is_some() {
+            DiagnosticBridge::start(local_diagnostics::record_event)
+        } else {
+            DiagnosticBridge::start(|_event| {})
+        }
+        .map_err(app_creation_error)?;
+        let fonts = fonts::load_windows_fallbacks();
+        Ok(PreparedUiServices {
+            services: UiServices {
+                runtime,
+                picker,
+                resolver: resolver_client,
+                diagnostics: bridge.sink(),
+                fonts,
+            },
+            resolver,
+            bridge,
+        })
+    }
+
     /// Publishes the settings session handed back by the shell through the
     /// retained-handle adapter (ADR 0019 item 8). Runs after the event loop.
     fn publish_settings(&mut self, session: Option<SettingsSession>) {
@@ -336,16 +591,18 @@ impl WindowsStartupServices {
 
     /// Reports the bounded logging health observed during the run, flushes
     /// and joins the diagnostics worker outside any UI callback, and only
-    /// then reconciles the crash marker with a proof minted from that join.
+    /// then reconciles the crash marker with a proof minted from that join
+    /// and from the UI-service shutdown receipts.
     ///
-    /// Without a completed diagnostics finish there is no proof: the runtime
-    /// is dropped, which preserves every marker state by construction. That
-    /// deliberately includes a session whose diagnostics never started: no
-    /// worker exists to join, but there is also no receipt to certify it, so
-    /// a marker from a caught worker panic stays on disk and the next start
-    /// records `panic.marker_found`. A "diagnostics never started" receipt
-    /// would be mintable without any join and is therefore not offered.
-    fn finish(self) -> CrashMarkerFinish {
+    /// Without a completed diagnostics finish, or with any UI-owned worker
+    /// that did not provably stop, there is no proof: the runtime is dropped,
+    /// which preserves every marker state by construction. That deliberately
+    /// includes a session whose diagnostics never started: no worker exists
+    /// to join, but there is also no receipt to certify it, so a marker from
+    /// a caught worker panic stays on disk and the next start records
+    /// `panic.marker_found`. `receipts` is `None` only when no scan runtime,
+    /// Shell STA, or worker was ever composed.
+    fn finish(self, receipts: Option<ShutdownReceipts>) -> CrashMarkerFinish {
         let Self { diagnostics, crash_runtime, .. } = self;
         let diagnostics_receipt = diagnostics.and_then(|diagnostics| {
             let counters = diagnostics.counters();
@@ -361,6 +618,14 @@ impl WindowsStartupServices {
                     counters.write_failures,
                 ));
             }
+            if let Some(receipts) = receipts
+                && receipts.diagnostic_events_dropped > 0
+            {
+                diagnostics.record(count_event(
+                    DiagnosticCode::DiagnosticQueueDropped,
+                    receipts.diagnostic_events_dropped,
+                ));
+            }
             diagnostics.record(application_event(DiagnosticCode::AppStopped));
             // The receipt is minted inside `LocalDiagnostics::finish` from
             // the worker's own completion message and cannot be built here.
@@ -374,10 +639,15 @@ impl WindowsStartupServices {
             drop(runtime);
             return CrashMarkerFinish::PreservedWithoutProof;
         };
-        let proof = ShutdownQuiescenceProof::from_receipts(
-            diagnostics_receipt,
-            RuntimeQuiescenceReceipt::no_runtime_composed(),
-        );
+        let runtime_receipt = match receipts {
+            None => Some(RuntimeQuiescenceReceipt::no_runtime_composed()),
+            Some(receipts) => receipts.runtime_quiescence(),
+        };
+        let Some(runtime_receipt) = runtime_receipt else {
+            drop(runtime);
+            return CrashMarkerFinish::PreservedWithoutProof;
+        };
+        let proof = ShutdownQuiescenceProof::from_receipts(diagnostics_receipt, runtime_receipt);
         CrashMarkerFinish::Reconciled(runtime.finish_clean(proof))
     }
 
@@ -523,4 +793,89 @@ fn application_event(code: DiagnosticCode) -> DiagnosticEvent {
     let _target = event
         .push_field(DiagnosticField::Target(Target::new(OperatingSystem::Windows, architecture)));
     event
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    /// The `runtime_shutdown_complete` receipt is a real observation: a
+    /// runtime whose shutdown was requested from the frame loop hands its
+    /// ownership to background retirement within the service deadline, and
+    /// disposal after that returns without waiting on a callback.
+    #[test]
+    fn runtime_shutdown_receipt_is_true_after_a_requested_shutdown() {
+        let mut runtime = RuntimeController::new(shell::runtime_config_from_settings(
+            &diskpie_app::settings::Settings::default(),
+        ))
+        .expect("runtime starts");
+        assert!(!runtime.is_shutdown_complete(), "nothing was requested yet");
+        runtime.request_shutdown();
+        let started = Instant::now();
+        assert!(await_runtime_shutdown(&mut runtime, started));
+        assert!(started.elapsed() < SERVICE_FINISH_TIMEOUT);
+        drop(runtime);
+    }
+
+    #[test]
+    fn finishing_without_a_shell_exit_still_joins_the_root_owned_workers() {
+        let (client, resolver) =
+            resolver::start(resolver::UnsupportedBackend).expect("resolver starts");
+        let bridge = DiagnosticBridge::start(|_event| {}).expect("bridge starts");
+        client.request_stop();
+        drop(client);
+        let (receipts, session) = finish_ui_services(None, resolver, bridge, false);
+        assert!(session.is_none());
+        assert!(!receipts.runtime_shutdown_complete, "no runtime was handed back");
+        assert_eq!(receipts.runtime_retiring_scans, usize::MAX, "unknown without a runtime");
+        assert!(receipts.resolver_joined);
+        assert!(receipts.diagnostic_bridge_joined);
+        assert_eq!(receipts.diagnostic_events_dropped, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn quiescence_needs_every_ui_worker_to_have_stopped() {
+        let (client, resolver) =
+            resolver::start(resolver::UnsupportedBackend).expect("resolver starts");
+        let bridge = DiagnosticBridge::start(|_event| {}).expect("bridge starts");
+        client.request_stop();
+        drop(client);
+        let (receipts, _session) = finish_ui_services(None, resolver, bridge, true);
+        assert!(!receipts.shell_stopped(), "a started STA without a finish is not stopped");
+        assert!(receipts.runtime_quiescence().is_none());
+
+        let clean = ShutdownReceipts {
+            runtime_shutdown_complete: true,
+            runtime_retiring_scans: 0,
+            shell_service_started: true,
+            shell_service: Some(ShellServiceFinish::Exited { panicked: false }),
+            resolver_joined: true,
+            diagnostic_bridge_joined: true,
+            diagnostic_events_dropped: 0,
+        };
+        assert!(clean.runtime_quiescence().is_some());
+        assert!(
+            ShutdownReceipts { shell_service_started: false, shell_service: None, ..clean }
+                .runtime_quiescence()
+                .is_some(),
+            "a session that never started the STA needs no STA receipt"
+        );
+        for degraded in [
+            ShutdownReceipts {
+                shell_service: Some(ShellServiceFinish::TimedOutHandedToReaper),
+                ..clean
+            },
+            ShutdownReceipts {
+                shell_service: Some(ShellServiceFinish::TimedOutReaperUnavailable),
+                ..clean
+            },
+            ShutdownReceipts { runtime_retiring_scans: 1, ..clean },
+            ShutdownReceipts { runtime_shutdown_complete: false, ..clean },
+            ShutdownReceipts { resolver_joined: false, ..clean },
+            ShutdownReceipts { diagnostic_bridge_joined: false, ..clean },
+        ] {
+            assert!(degraded.runtime_quiescence().is_none(), "{degraded:?}");
+        }
+    }
 }

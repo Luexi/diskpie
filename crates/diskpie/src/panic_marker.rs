@@ -1088,12 +1088,52 @@ pub(crate) struct RuntimeQuiescenceReceipt {
     _private: (),
 }
 
+/// Facts the composition root observed during its ordered shutdown.
+///
+/// Every field must hold for a receipt to exist; the struct only names them so
+/// a caller cannot pass a new kind of worker without deciding what it proves.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeShutdownEvidence {
+    /// `RuntimeController::is_shutdown_complete` was observed after a
+    /// requested shutdown, within the root's bounded wait.
+    pub(crate) runtime_shutdown_complete: bool,
+    /// Scan sessions still held by background retirement at that moment. A
+    /// retiring session may still be inside a blocking provider call, so only
+    /// zero counts as every scan worker having stopped.
+    pub(crate) retiring_scans: usize,
+    /// The Shell STA was never started, or `finish` joined it in time. A
+    /// handed-off or reaper-unavailable STA may still be running.
+    pub(crate) shell_stopped: bool,
+    /// The resolver worker thread was joined within its deadline.
+    pub(crate) resolver_joined: bool,
+    /// The diagnostic bridge thread was joined within its deadline.
+    pub(crate) bridge_joined: bool,
+}
+
 #[cfg(windows)]
 impl RuntimeQuiescenceReceipt {
     /// Evidence that no scan/layout/Shell runtime was ever started in this
-    /// process. Valid only while the executable composes none of them.
+    /// process. Valid only when startup failed before the composition root
+    /// created any of them.
     pub(crate) const fn no_runtime_composed() -> Self {
         Self { _private: () }
+    }
+
+    /// Mints the receipt only when every UI-owned worker family provably
+    /// stopped. Any timed-out join, handed-off worker, or retiring scan
+    /// session yields `None`, and the caller then preserves the marker.
+    pub(crate) const fn from_shutdown(evidence: RuntimeShutdownEvidence) -> Option<Self> {
+        if evidence.runtime_shutdown_complete
+            && evidence.retiring_scans == 0
+            && evidence.shell_stopped
+            && evidence.resolver_joined
+            && evidence.bridge_joined
+        {
+            Some(Self { _private: () })
+        } else {
+            None
+        }
     }
 }
 

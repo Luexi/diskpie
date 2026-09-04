@@ -77,6 +77,29 @@ decorative graphics.
 - Hover reconstructs at most the hovered path; idle frames allocate no full
   path table and do not copy the hidden-branch set.
 
+## Decision note 2026-09-04: system fallback fonts read at runtime
+
+The embedded Ubuntu and Hack faces cover Latin, Greek, and Cyrillic only, so
+file names in CJK, Thai, Devanagari, Arabic, Myanmar, Tibetan, or Javanese
+rendered as boxes. Rather than embedding additional font files (a new license
+surface and several megabytes in the portable executable), the composition
+root reads, at startup and before the native window exists, the following
+fonts from `%WINDIR%\Fonts` (falling back to `C:\Windows\Fonts`) when they are
+present: `segoeui.ttf`, `msyh.ttc` (face 0), `malgun.ttf`, `YuGothR.ttc`
+(face 0), `Nirmala.ttc` (face 0), `leelawad.ttf`, `ebrima.ttf`,
+`mmrtext.ttf`, `himalaya.ttf`, and `javatext.ttf`. Missing or unreadable files
+are skipped silently, the total bytes read are bounded to 64 MiB, and the
+loaded faces are appended after the embedded fonts as fallbacks for both the
+proportional and monospace families through one `Context::set_fonts` call in
+`DiskPieShell::new`. The fonts are read from the user's own Windows
+installation at runtime and are never redistributed with DiskPie.
+
+The same change adds `raw-window-handle 0.6.2` (MIT OR Apache-2.0 OR Zlib,
+already in the dependency graph through eframe and winit, no `unsafe` on the
+call path DiskPie uses) as a direct dependency of the executable, because the
+`HasWindowHandle` trait needed to read the owner HWND from `eframe::Frame` is
+not re-exported by eframe.
+
 ## Acceptance evidence
 
 - Automated reducer and renderer tests cover pointer and keyboard requests,
