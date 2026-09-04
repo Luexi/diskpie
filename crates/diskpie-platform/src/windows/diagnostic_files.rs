@@ -385,7 +385,7 @@ impl fmt::Debug for WindowsAtomicMarkerWriter {
 /// Bounded view of one fixed marker slot captured while the session was
 /// prepared. The native identity behind a present slot stays private to the
 /// session so later operations can only be identity-conditional.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub enum MarkerSlotState<'a> {
     /// The exact name was absent at preparation time.
     Missing,
@@ -394,6 +394,20 @@ pub enum MarkerSlotState<'a> {
     Present(&'a [u8]),
     /// The slot could not be inspected or read safely; it is never touched.
     Unavailable(DiagnosticFileError),
+}
+
+/// A foreign file under a marker name may contain a path, so `Debug` renders
+/// only the byte count of a present slot, never its contents.
+impl fmt::Debug for MarkerSlotState<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing => formatter.write_str("Missing"),
+            Self::Present(bytes) => {
+                formatter.debug_struct("Present").field("len", &bytes.len()).finish()
+            }
+            Self::Unavailable(error) => formatter.debug_tuple("Unavailable").field(error).finish(),
+        }
+    }
 }
 
 /// Classified result of one panic-hook commit.
@@ -446,6 +460,13 @@ const RECORD_UNVERIFIED: u8 = 3;
 /// contended so shutdown treats it as uncertain instead of trusting a torn
 /// identity. `Unverified` is sticky: once a commit could not be proven, no
 /// later commit can re-enable reconciliation.
+///
+/// A contended or unverified record also withholds the committed identity
+/// from later commits in the same session, which then fall back to the
+/// prepared inspection and refuse to replace the session's own marker with
+/// `OwnedDestination`. That is deliberate: either marker already proves the
+/// session panicked, and the refusal is visible through `Debug` as
+/// `committed_identity_recorded = false`.
 struct CommitRecord {
     phase: AtomicU8,
     contended: AtomicBool,
@@ -585,11 +606,16 @@ impl PreparedMarkerSlot {
 /// acquires a lock, or waits.
 ///
 /// Namespace changes go through `NtSetInformationFile` with
-/// `FileRenameInformationEx` relative to the retained parent (see
-/// [`RenameBuffer`]); every outcome is classified from post-operation
+/// `FileRenameInformationEx` relative to the retained parent (see the private
+/// `RenameBuffer`); every outcome is classified from post-operation
 /// identities and never inferred from a return code alone. Atomic namespace
 /// visibility is promised; directory-entry durability across power loss is
 /// deliberately not claimed.
+///
+/// The hook path validates handles against the retained parent with two
+/// nested fixed `[u16; MAX_NATIVE_PATH_UNITS]` stack buffers (about 128 KiB
+/// in total) instead of heap memory, so the panicking thread needs that much
+/// free stack; threads with unusually small stacks should not install it.
 pub struct WindowsMarkerSession {
     parent: DirectoryGuard,
     target_name: Box<[u16]>,
@@ -799,11 +825,18 @@ impl WindowsMarkerSession {
     /// Reconciles the target only while it still carries the identity this
     /// session committed and `owner_check` accepts its current bytes.
     ///
-    /// The inspected target handle (with delete sharing) is retained through
-    /// the mutation: a delete is applied to that very object through
-    /// `FileDispositionInfo`, and a restore renames a fresh verified sibling
-    /// over it relative to the retained parent. The outcome is classified
-    /// from post-operation identities; any uncertainty preserves every copy.
+    /// The target is inspected through a handle opened without delete
+    /// sharing, so no other opener can unlink, rename, or replace that object
+    /// while its identity and bytes are checked. A delete is then applied to
+    /// that very object through `FileDispositionInfo` on the same handle and
+    /// is strictly identity-conditional. A restore prepares the verified
+    /// sibling while the handle is still held, releases the handle, and
+    /// immediately renames the sibling over the target relative to the
+    /// retained parent; Windows offers no compare-and-rename, so a
+    /// replacement raced into the single system call between that release
+    /// and the rename would be superseded and reported as `RestoredPrevious`.
+    /// The outcome is classified from post-operation identities; any
+    /// uncertainty preserves every copy.
     ///
     /// A sibling preserved by this session exists only in the
     /// `CommittedButUnverified` state, which this method refuses to touch, so
@@ -828,6 +861,7 @@ impl WindowsMarkerSession {
             &self.target_path,
             &self.target_name,
             access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
             DiagnosticFileOperation::InspectDestination,
         ) {
             Ok(Some(inspected)) => inspected,
@@ -878,16 +912,16 @@ impl WindowsMarkerSession {
                     let _cleanup = sibling.delete_exact();
                     return Err(error);
                 }
+                // The inspection handle denies delete sharing, which would
+                // also block this session's own POSIX replace; releasing it
+                // here opens the documented single-call window.
+                drop(file);
                 match self.target_rename.apply(sibling.handle()) {
-                    Ok(()) => {
-                        drop(file);
-                        match self.verify_at_target(&sibling, previous.len() as u64) {
-                            Ok(_identity) => Ok(MarkerReconcileOutcome::RestoredPrevious),
-                            Err(_classification) => Ok(MarkerReconcileOutcome::PreservedUncertain),
-                        }
-                    }
+                    Ok(()) => match self.verify_at_target(&sibling, previous.len() as u64) {
+                        Ok(_identity) => Ok(MarkerReconcileOutcome::RestoredPrevious),
+                        Err(_classification) => Ok(MarkerReconcileOutcome::PreservedUncertain),
+                    },
                     Err(error) => {
-                        drop(file);
                         // The session record is deliberately left alone: the
                         // restored object is the previous marker, not one this
                         // session may reconcile again.
@@ -931,6 +965,7 @@ impl WindowsMarkerSession {
                 path,
                 name,
                 access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 DiagnosticFileOperation::InspectDestination,
             )?;
             match (slot, current) {
@@ -986,6 +1021,7 @@ impl WindowsMarkerSession {
             &self.target_path,
             &self.target_name,
             FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             operation,
         )
         .map(|inspected| inspected.map(|(file, info)| (file, info.identity)))
@@ -1020,9 +1056,13 @@ impl WindowsMarkerSession {
 
     /// Classifies a rename that reported failure without touching the
     /// session record. Observing the sibling identity at the target name is a
-    /// commit; an unchanged target (or a still-missing target) is not, and the
-    /// never-renamed sibling is deleted through its handle. Anything else
-    /// preserves the sibling as a possible only complete copy.
+    /// commit. An unchanged target (or a still-missing target) is not a
+    /// commit, and neither is a target that changed while the sibling handle
+    /// provably still resolves to the sibling name (for example a create-only
+    /// rename that lost to a concurrent creator); in both cases the
+    /// never-renamed sibling is deleted through its own handle so a stale
+    /// sibling cannot block every later commit. Anything else preserves the
+    /// sibling as a possible only complete copy.
     fn classify_failed_rename(
         &self,
         file: NativeMarkerFile,
@@ -1052,8 +1092,24 @@ impl WindowsMarkerSession {
             (_, Some((_, identity))) if identity.same_file(&file.identity()) => {
                 FailedRenameClassification::Committed(*identity)
             }
+            _ if self.sibling_still_at_its_name(&file) => {
+                let _cleanup = file.delete_exact();
+                FailedRenameClassification::NotCommitted(error)
+            }
             _ => FailedRenameClassification::Unverified(error),
         }
+    }
+
+    /// Proves through the sibling's own handle that it still carries the
+    /// fixed sibling name under the retained parent, so no rename moved it.
+    fn sibling_still_at_its_name(&self, file: &NativeMarkerFile) -> bool {
+        self.parent
+            .validate_direct_child_handle_units(
+                file.handle(),
+                &self.sibling_name,
+                DiagnosticFileOperation::ReplaceDestination,
+            )
+            .is_ok()
     }
 }
 
@@ -1095,19 +1151,22 @@ fn validate_marker_payload(contents: &[u8]) -> Result<(), DiagnosticFileError> {
 /// retained parent has not moved, then requires a regular, single-link,
 /// non-reparse direct child. `FILE_FLAG_BACKUP_SEMANTICS` lets a directory
 /// open so it is rejected as an invalid destination rather than surfacing the
-/// generic access-denied code.
+/// generic access-denied code. `share` is the sharing mode granted to other
+/// openers; withholding `FILE_SHARE_DELETE` pins the object against unlink,
+/// rename, and replacement while the handle is held.
 fn inspect_marker_slot(
     parent: &DirectoryGuard,
     path: &[u16],
     name: &[u16],
     access: u32,
+    share: FILE_SHARE_MODE,
     operation: DiagnosticFileOperation,
 ) -> Result<Option<(File, HandleInspection)>, DiagnosticFileError> {
     parent.ensure_location_stable(operation)?;
     let file = match open_native_file(
         path,
         access,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        share,
         OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
         operation,
@@ -1132,6 +1191,7 @@ fn read_marker_slot(parent: &DirectoryGuard, path: &[u16], name: &[u16]) -> Prep
         path,
         name,
         FILE_READ_DATA.0 | FILE_READ_ATTRIBUTES.0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         operation,
     ) {
         Ok(Some(inspected)) => inspected,
@@ -4574,13 +4634,65 @@ mod tests {
         let directory = TestDirectory::new("marker-session-redaction");
         let private = directory.path().join("private-customer-crashes");
         fs::create_dir(&private).expect("create private parent");
+        let (target, _sibling) = marker_paths(&private);
+        let foreign_marker = b"schema=1\npath=C:\\Users\\private-customer\\secret.txt\n";
+        fs::write(&target, foreign_marker).expect("write a foreign marker containing a path");
         let session = prepare_marker_session(&private);
+        assert_eq!(session.target_slot(), MarkerSlotState::Present(foreign_marker));
+
         let status = session.commit(&[0xFF]);
-        let rendered = format!("{session:?} {status:?}");
+        let rendered = format!("{session:?} {status:?} {:?}", session.target_slot());
+        assert!(rendered.contains("Present { len: "), "slot Debug renders only a length");
         assert!(!rendered.contains("private-customer"));
+        assert!(!rendered.contains("secret.txt"));
         assert!(!rendered.contains(&directory.path().to_string_lossy().to_string()));
-        let error = session.delete_explicit().err().map(|error| format!("{error} {error:?}"));
-        assert!(error.is_none_or(|text| !text.contains("private-customer")));
+
+        fs::remove_file(&target).expect("remove the inspected target");
+        fs::write(&target, b"swapped").expect("swap a new identity under the target name");
+        let error = session.delete_explicit().expect_err("a swapped identity is a conflict");
+        assert_eq!(error.kind, DiagnosticFileErrorKind::OwnedDestination);
+        let text = format!("{error} {error:?}");
+        assert!(!text.contains("private-customer"));
+        assert!(!text.contains(&directory.path().to_string_lossy().to_string()));
+        assert_eq!(fs::read(&target).expect("swapped file preserved"), b"swapped");
+    }
+
+    #[test]
+    fn marker_session_lost_create_only_race_removes_the_never_renamed_sibling() {
+        let directory = TestDirectory::new("marker-session-lost-race");
+        let (target, sibling) = marker_paths(directory.path());
+        let session = prepare_marker_session(directory.path());
+        assert_eq!(session.target_slot(), MarkerSlotState::Missing);
+
+        // Reproduce the state after a create-only rename lost to a concurrent
+        // creator: the verified sibling exists, a foreign entry occupies the
+        // target, and the rename reported a collision.
+        let file = session.create_verified_sibling(b"schema=race\n").expect("create sibling");
+        fs::write(&target, b"foreign").expect("concurrent creator wins the target name");
+        let collision = DiagnosticFileError::new(
+            DiagnosticFileOperation::ReplaceDestination,
+            DiagnosticFileErrorKind::AlreadyExists,
+        );
+        match session.classify_failed_rename(file, None, collision) {
+            FailedRenameClassification::NotCommitted(error) => {
+                assert_eq!(error.kind, DiagnosticFileErrorKind::AlreadyExists);
+            }
+            FailedRenameClassification::Committed(_identity) => {
+                panic!("a foreign target must not be reported as committed")
+            }
+            FailedRenameClassification::Unverified(_error) => {
+                panic!("an unmoved sibling is provably not a copy of the marker")
+            }
+        }
+        assert!(!sibling.exists(), "the never-renamed sibling is deleted through its handle");
+        assert_eq!(fs::read(&target).expect("foreign target intact"), b"foreign");
+
+        // The session is not left stuck behind a stale sibling: once the
+        // foreign entry is gone the next commit creates the marker normally.
+        fs::remove_file(&target).expect("foreign creator removes its file");
+        assert_eq!(session.commit(b"schema=retry\n"), MarkerCommitStatus::Committed);
+        assert_eq!(fs::read(&target).expect("marker committed"), b"schema=retry\n");
+        assert!(!sibling.exists());
     }
 
     #[test]
