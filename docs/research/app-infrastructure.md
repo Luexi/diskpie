@@ -218,12 +218,13 @@ last folder" feature needs a separate privacy decision and explicit opt-in.
 The initial contract is intentionally narrow:
 
 ```text
-diskpie.exe [--] [PATH]
+diskpie.exe [--scan-path PATH | [--] PATH]
 ```
 
-Zero paths opens the normal selector; one path schedules it as the initial
-scan root. More than one positional value and every unknown option are usage
-errors. `--` allows a path whose first component looks like an option. Help
+Zero paths opens the normal selector; one path, positional or through the
+`--scan-path` option that ADR 0009 writes into the Explorer verb, schedules it
+as the initial scan root. More than one path in any combination and every
+unknown option are usage errors. `--` allows a path whose first component looks like an option. Help
 and version output may be supported, but there are no subcommands, shell
 completion, environment expansion, globbing, trimming, canonicalization, or
 prefix rewriting.

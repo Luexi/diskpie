@@ -373,11 +373,23 @@ state machine binds an exact immutable native target and scan generation before
 the platform sees a mutation request. Permanent deletion has a stronger visual
 confirmation than recycling.
 
-### Explorer integration - planned
+### Explorer integration - policy and adapter implemented, UI pending
 
 Optional integration is per-user, reversible, and idempotent. DiskPie owns only
 its registry keys, does not elevate, and never overwrites foreign/conflicting
 values. See ADR 0009.
+
+`diskpie_app::explorer_integration` owns the exact key layout, `REG_SZ` value
+set, direct command template, ownership classification
+(`NotInstalled`/`OwnedCurrent`/`OwnedStale`/`Foreign`/`Ambiguous`), the
+install/repair/remove decision table, and the staged commit with rollback
+behind the `IntegrationRegistry` port. `diskpie_platform::WindowsIntegrationRegistry`
+implements the port over `windows-registry` below an injectable
+`HKEY_CURRENT_USER` root (`Software\Classes` in production, a unique
+`Software\DiskPieTest\<run id>\Classes` subtree in tests) and issues
+`SHChangeNotify(SHCNE_ASSOCCHANGED)` after mutations. The composition root
+supplies `std::env::current_exe()`; the settings UI that renders
+`ExplorerIntegrationStatus` and issues requests is not wired yet.
 
 ## 11. Settings, diagnostics, and panic recovery
 

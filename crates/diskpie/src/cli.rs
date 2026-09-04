@@ -10,19 +10,23 @@ use std::{
 use lexopt::{Arg, Parser};
 
 /// Stable command-line synopsis shared by help and sanitized usage errors.
-pub const USAGE: &str = "Usage: diskpie [--] [PATH]";
+pub const USAGE: &str = "Usage: diskpie [--scan-path PATH | [--] PATH]";
 
 /// Fixed ASCII help protocol for the intentionally small startup grammar.
 pub const HELP_TEXT: &str = concat!(
     "DiskPie - visual disk usage scanner\n\n",
-    "Usage: diskpie [--] [PATH]\n\n",
+    "Usage: diskpie [--scan-path PATH | [--] PATH]\n\n",
     "Arguments:\n",
-    "  PATH            Optional folder or drive to scan\n\n",
+    "  PATH               Optional folder or drive to scan\n\n",
     "Options:\n",
-    "  -h, --help      Show this help\n",
-    "  -V, --version   Show the version\n",
-    "  --              Treat the following value as PATH\n",
+    "  --scan-path PATH   Scan PATH; the Explorer verb form of the argument\n",
+    "  -h, --help         Show this help\n",
+    "  -V, --version      Show the version\n",
+    "  --                 Treat the following value as PATH\n",
 );
+
+/// Long option written into the Explorer verb command by ADR 0009.
+const SCAN_PATH_OPTION: &str = "scan-path";
 
 /// Fixed version protocol; it never contains filesystem or environment data.
 pub const VERSION_TEXT: &str = concat!("DiskPie ", env!("CARGO_PKG_VERSION"));
@@ -161,16 +165,17 @@ fn parse_parser(mut parser: Parser) -> Result<StartupAction, UsageError> {
                 initial_path.is_some(),
                 ordinal,
             )?,
+            Arg::Long(SCAN_PATH_OPTION) => {
+                // `value` takes the next native argument verbatim, even one
+                // that starts with a dash, so option-like paths survive.
+                let value = parser.value().map_err(|error| map_parser_error(error, ordinal))?;
+                accept_path(&mut initial_path, protocol.is_some(), value, ordinal)?;
+            }
             Arg::Short(_) | Arg::Long(_) => {
                 return Err(UsageError::new(UsageErrorCode::UnknownOption, ordinal));
             }
             Arg::Value(value) => {
-                if protocol.is_some() {
-                    return Err(UsageError::new(UsageErrorCode::ConflictingAction, ordinal));
-                }
-                if initial_path.replace(PathBuf::from(value)).is_some() {
-                    return Err(UsageError::new(UsageErrorCode::TooManyPaths, ordinal));
-                }
+                accept_path(&mut initial_path, protocol.is_some(), value, ordinal)?;
             }
         }
     }
@@ -180,6 +185,21 @@ fn parse_parser(mut parser: Parser) -> Result<StartupAction, UsageError> {
         Some(ProtocolAction::Version) => Ok(StartupAction::Version),
         None => Ok(StartupAction::Run(StartupRequest { initial_path })),
     }
+}
+
+fn accept_path(
+    initial_path: &mut Option<PathBuf>,
+    has_protocol: bool,
+    value: OsString,
+    ordinal: usize,
+) -> Result<(), UsageError> {
+    if has_protocol {
+        return Err(UsageError::new(UsageErrorCode::ConflictingAction, ordinal));
+    }
+    if initial_path.replace(PathBuf::from(value)).is_some() {
+        return Err(UsageError::new(UsageErrorCode::TooManyPaths, ordinal));
+    }
+    Ok(())
 }
 
 fn select_protocol(
@@ -233,6 +253,77 @@ mod tests {
         let action = parse_from(["diskpie", "--", "--not-an-option"])
             .expect("double dash terminates option parsing");
         assert_eq!(run_path(action), Some(PathBuf::from("--not-an-option")));
+    }
+
+    #[test]
+    fn scan_path_option_is_equivalent_to_the_positional_path() {
+        let expected = PathBuf::from(r"C:\Data with spaces\100% & ready");
+        let separate = parse_from([
+            OsString::from("diskpie"),
+            OsString::from("--scan-path"),
+            expected.clone().into_os_string(),
+        ])
+        .expect("separate option value is valid");
+        assert_eq!(run_path(separate), Some(expected.clone()));
+
+        let mut joined = OsString::from("--scan-path=");
+        joined.push(&expected);
+        let joined = parse_from([OsString::from("diskpie"), joined])
+            .expect("equals-joined option value is valid");
+        assert_eq!(run_path(joined), Some(expected));
+
+        let option_like = parse_from(["diskpie", "--scan-path", "--not-an-option"])
+            .expect("the option value is taken verbatim");
+        assert_eq!(run_path(option_like), Some(PathBuf::from("--not-an-option")));
+
+        let drive_root = parse_from(["diskpie", "--scan-path", r"C:\"]).expect("drive root");
+        assert_eq!(run_path(drive_root), Some(PathBuf::from(r"C:\")));
+    }
+
+    #[test]
+    fn scan_path_option_keeps_the_single_path_grammar() {
+        let missing = parse_from(["diskpie", "--scan-path"]).expect_err("a value is required");
+        assert_eq!(missing.code(), UsageErrorCode::MissingOptionValue);
+        assert_eq!(missing.argument_ordinal(), 1);
+
+        let doubled =
+            parse_from(["diskpie", "--scan-path", "first", "--scan-path", "second-secret"])
+                .expect_err("two option paths must fail");
+        assert_eq!(doubled.code(), UsageErrorCode::TooManyPaths);
+        assert_eq!(doubled.argument_ordinal(), 2);
+
+        let mixed = parse_from(["diskpie", "positional", "--scan-path", "second-secret"])
+            .expect_err("option plus positional must fail");
+        assert_eq!(mixed.code(), UsageErrorCode::TooManyPaths);
+        let rendered = format!("{mixed:?} {mixed}");
+        assert!(!rendered.contains("positional"));
+        assert!(!rendered.contains("second-secret"));
+
+        let after_help = parse_from(["diskpie", "--help", "--scan-path", "x"])
+            .expect_err("help plus a path conflicts");
+        assert_eq!(after_help.code(), UsageErrorCode::ConflictingAction);
+        let before_version = parse_from(["diskpie", "--scan-path", "x", "--version"])
+            .expect_err("a path plus version conflicts");
+        assert_eq!(before_version.code(), UsageErrorCode::ConflictingAction);
+
+        let terminated = parse_from(["diskpie", "--", "--scan-path"])
+            .expect("after the terminator the option text is a path");
+        assert_eq!(run_path(terminated), Some(PathBuf::from("--scan-path")));
+        assert!(HELP_TEXT.contains("--scan-path PATH"));
+        assert!(USAGE.contains("--scan-path PATH"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scan_path_option_preserves_non_scalar_utf16_units() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        let units = [b'D' as u16, b':' as u16, b'\\' as u16, 0xDC00, b'y' as u16];
+        let native = OsString::from_wide(&units);
+        let action = parse_from([OsString::from("diskpie"), OsString::from("--scan-path"), native])
+            .expect("non-scalar native option values are preserved");
+        let parsed = run_path(action).expect("path remains present");
+        assert_eq!(parsed.as_os_str().encode_wide().collect::<Vec<_>>(), units);
     }
 
     #[test]

@@ -11,6 +11,7 @@ pub use diskpie_core::PRODUCT_NAME;
 #[cfg(windows)]
 pub mod windows {
     pub mod diagnostic_files;
+    pub mod explorer_integration;
     pub mod filesystem;
     pub mod project_paths;
     pub mod settings_file;
@@ -28,6 +29,8 @@ pub use windows::diagnostic_files::{
     WindowsAtomicMarkerWriter, WindowsDailyLogHealth, WindowsDailyLogWriter, WindowsMarkerSession,
     classify_export_destination, prune_diagnostic_logs, write_diagnostic_export,
 };
+#[cfg(windows)]
+pub use windows::explorer_integration::{CLASSES_ROOT_PATH, WindowsIntegrationRegistry};
 #[cfg(windows)]
 pub use windows::filesystem::WindowsFileSystem;
 #[cfg(windows)]

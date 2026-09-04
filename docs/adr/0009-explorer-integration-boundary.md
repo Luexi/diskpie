@@ -180,3 +180,25 @@ Accepted tradeoffs:
 - A `windows-registry` limitation can trigger replacement behind
   `IntegrationRegistry`; it does not justify widening registry scope or
   weakening ownership checks.
+
+## Addendum 2026-09-04: implementation notes
+
+The portable verb is implemented as the `explorer_integration` policy in
+`diskpie-app` and the `WindowsIntegrationRegistry` adapter in
+`diskpie-platform`; the settings UI that exposes it is a separate workstream.
+Three details refine the decision without changing it:
+
+1. The `Drive` command stores `"<exe>" --scan-path "%1\"` instead of the plain
+   `"%1"`. Explorer expands `%1` to `C:\` for drives, and the Windows argv
+   rules turn `"C:\"` into `C:"`; the extra backslash makes the exact `C:\`
+   arrive. Folder verbs keep `"%1"`. Both forms are still fully quoted, use no
+   interpreter, and are verified against `CommandLineToArgvW`.
+2. Repair keeps the rename-only commit: the owned final key is renamed to a
+   `DiskPie.Scan.previous.<token>` sibling, the verified staging key is
+   renamed into place, and the previous sibling is deleted last. Rollback
+   renames the original back. Inspection reports any DiskPie-owned
+   `DiskPie.Scan.*` sibling left by a failed rollback, and Remove deletes
+   such siblings after re-checking the ownership marker; unmarked siblings
+   are never touched.
+3. Staging creates missing `Directory\shell` and `Drive\shell` ancestors and
+   rollback never removes them, consistent with item 4.
