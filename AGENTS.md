@@ -10,6 +10,11 @@ DiskPie is Windows-first, but the domain model, scanner protocol, and sunburst
 layout must remain independent of eframe and Windows APIs. Windows-specific
 code belongs behind platform adapters.
 
+Before implementing or reviewing Rust, egui, scanner, or Windows-platform
+changes, read the project skill at `.agents/skills/diskpie-rust-egui/SKILL.md`
+for Codex/agent runtimes or `.claude/skills/diskpie-rust-egui/SKILL.md` for
+Claude; both copies must remain byte-identical.
+
 ## Clean-room boundary
 
 The parent directory contains proprietary Scanner reference artifacts. Never

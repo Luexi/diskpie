@@ -15,6 +15,10 @@ still running.
 > requirements and verification status are tracked in
 > [`docs/requirements-traceability.md`](docs/requirements-traceability.md).
 
+Continuation and design context are maintained in the
+[`ROADMAP.md`](ROADMAP.md) handoff and
+[`docs/architecture.md`](docs/architecture.md) architecture guide.
+
 ## Product goals
 
 - Responsive, cancelable scans with partial results.

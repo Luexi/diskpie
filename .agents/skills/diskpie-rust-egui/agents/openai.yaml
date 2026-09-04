@@ -1,0 +1,4 @@
+interface:
+  display_name: "DiskPie Rust and egui"
+  short_description: "Preserve DiskPie Rust, egui, and Windows boundaries"
+  default_prompt: "Use $diskpie-rust-egui to implement this DiskPie change within the correct crate and safety boundaries."

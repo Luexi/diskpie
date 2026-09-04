@@ -187,14 +187,17 @@ coordinator alone applies worker batches to TreeBuilder; painting does not hold
 model locks or call the filesystem.
 
 Use eframe/egui 0.35.0 with default features disabled and enable only Glow,
-AccessKit, default fonts, and persistence. Use egui_extras 0.35.0 with defaults
+AccessKit, and default fonts. ADR 0019 supersedes this record's original use of
+eframe persistence after its missing-path fallback was verified. Use
+egui_extras 0.35.0 with defaults
 disabled for the virtualized textual view. Do not enable both Glow and WGPU.
 
 ### 6. Adopt focused boundary dependencies
 
 Use the exact researched baselines documented in the supporting research:
 
-- Serde 1.0.229 plus eframe Storage behind `SettingsStore`;
+- Serde 1.0.229 plus RON 0.12.2 behind `SettingsStore`, with the exact native
+  file adapter selected by ADR 0019;
 - tracing 0.1.44, tracing-subscriber 0.3.23, and tracing-appender 0.2.5;
 - lexopt 0.3.2 for path-preserving startup arguments;
 - fluent-bundle 0.16.0 and unic-langid 0.9.6 behind typed localization IDs;

@@ -17,3 +17,6 @@ Every candidate review should record:
 
 Finish each note with an actionable recommendation: adopt, prototype behind an
 adapter, defer pending benchmarks, study without copying, or reject.
+
+Product-facing UI decisions are recorded in
+[`ui-product-direction.md`](ui-product-direction.md).

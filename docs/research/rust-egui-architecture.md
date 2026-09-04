@@ -19,7 +19,8 @@ native UI code at the executable boundary.
 
 Adopt a deliberately small application dependency set:
 
-- `eframe`/`egui` 0.35.0 with Glow, AccessKit, default fonts, and persistence;
+- `eframe`/`egui` 0.35.0 with Glow, AccessKit, and default fonts; native
+  persistence is disabled under ADR 0019;
 - `egui_extras` 0.35.0 with default features disabled for the virtualized
   accessible table;
 - Serde 1.0.229 for the settings value;
@@ -170,7 +171,7 @@ the token, but must not replace RAII cleanup or terminate a thread.
 
 | Candidate | Evaluation | Outcome |
 |---|---|---|
-| [`eframe`/`egui` 0.35.0](https://docs.rs/eframe/0.35.0/eframe/) | MIT OR Apache-2.0; released 2026-06-25 and actively developed; eframe MSRV 1.92. Native presentation transitively includes unsafe/FFI in winit, glutin, OpenGL, and Windows bindings, so it is not allowed in portable crates. It directly provides DPI-aware Windows lifecycle, input, theme, AccessKit integration, persistence, and indexed meshes; reproducing those locally is unjustified. Build/binary cost is high and breaking API churn creates medium-high UI lock-in, mitigated by keeping egui types in the executable and committing the lockfile. | Adopt at the UI edge. |
+| [`eframe`/`egui` 0.35.0](https://docs.rs/eframe/0.35.0/eframe/) | MIT OR Apache-2.0; released 2026-06-25 and actively developed; eframe MSRV 1.92. Native presentation transitively includes unsafe/FFI in winit, glutin, OpenGL, and Windows bindings, so it is not allowed in portable crates. It directly provides DPI-aware Windows lifecycle, input, theme, AccessKit integration, and indexed meshes. Exact-source verification found that its optional persistence falls back to a framework path when no explicit path is supplied, so ADR 0019 disables only that feature. Build/binary cost is high and breaking API churn creates medium-high UI lock-in, mitigated by keeping egui types in the executable and committing the lockfile. | Adopt at the UI edge without native persistence. |
 | Glow backend in eframe 0.35.0 | Same license/activity boundary as eframe. The [official manifest](https://raw.githubusercontent.com/emilk/egui/0.35.0/crates/eframe/Cargo.toml) notes that switching from default WGPU to Glow can significantly reduce binary size. It is sufficient for DiskPie's two-dimensional indexed mesh. Native unsafe remains isolated in the UI graph. | Adopt Glow only; test Win10/11, RDP, VMs, and multiple GPUs. |
 | WGPU backend in eframe 0.35.0 | Actively maintained and portable, but substantially increases compile time and binary/dependency footprint. It offers no measured benefit for the initial analytic 2D mesh and enabling both renderers compounds support cost. | Reject initially; revisit after a required Glow configuration fails or GPU profiling justifies it. |
 | [`egui_extras` 0.35.0](https://docs.rs/egui_extras/latest/src/egui_extras/table.rs.html) | MIT OR Apache-2.0 and released with egui. Unsafe/platform exposure is inherited from the UI graph. With defaults disabled, its medium incremental cost earns virtualized `body.rows` for thousands of accessible rows; implementing a correct table locally is higher risk. Extra loader/image/SVG/syntax features add unrelated dependencies. Lock-in is limited to one UI adapter. | Adopt with `default-features = false`. |
@@ -201,9 +202,9 @@ permissively licensed fallback font for arbitrary path display.
 
 | Candidate | Evaluation | Outcome |
 |---|---|---|
-| Serde 1.0.229 plus [eframe Storage](https://docs.rs/eframe/latest/eframe/trait.Storage.html) | MIT OR Apache-2.0; Serde released 2026-07-18 and is foundational. Derive adds compile-time proc-macro cost but little runtime/binary overhead and no new native boundary. Eframe persistence is already paid for in the UI graph. A versioned `Settings` value behind `SettingsStore` limits format/framework lock-in and supports an explicit portable path through [`NativeOptions`](https://docs.rs/eframe/latest/eframe/struct.NativeOptions.html). | Adopt. |
+| Serde 1.0.229 plus RON 0.12.2 in an application-owned document | MIT OR Apache-2.0; both releases are current and foundational. Derive adds compile-time proc-macro cost but little runtime/binary overhead. A versioned `Settings` value behind `SettingsStore` limits format lock-in; ADR 0019 supplies an explicit native adapter because eframe's missing-path behavior is an implicit fallback. | Adopt; keep native file I/O outside UI callbacks. |
 | `confy` 2.0.0 / separate directories plus TOML or JSON | Confy is MIT and was released in 2025, but its [own documentation](https://docs.rs/confy/latest/confy/index.html) says it is not standard-compliant or maintained. A second path/format stack adds build and migration surface without initial benefit. | Reject; add an eframe-independent store only when a real headless frontend exists. |
-| [`tracing` 0.1.44](https://docs.rs/tracing/0.1.44/tracing/), `tracing-subscriber` 0.3.23, `tracing-appender` 0.2.5 | MIT; releases span 2025-12 through 2026-04 and the ecosystem is active. Structured spans materially improve scan-generation, queue, latency, omission, and OS-error diagnostics versus a local concurrent logger. Compile/binary cost is medium. The non-blocking writer has a fixed queue and transitive concurrent unsafe; hold its `WorkerGuard`, expose dropped-line counts, and audit the resolved graph. Framework lock-in is medium but call sites remain ordinary events/spans. | Adopt with narrowly selected `std`, `fmt`, `env-filter`, and `registry` features. |
+| [`tracing` 0.1.44](https://docs.rs/tracing/0.1.44/tracing/), `tracing-subscriber` 0.3.23, `tracing-appender` 0.2.5 | MIT; releases span 2025-12 through 2026-04 and the ecosystem is active. Structured spans materially improve scan-generation, queue, latency, omission, and OS-error diagnostics. Compile/binary cost is medium. Use tracing-appender only for its fixed nonblocking queue and `WorkerGuard`; its `std::fs` rolling sink cannot enforce DiskPie's Win32 reparse/hard-link/local-parent boundary. Framework lock-in remains medium because call sites are ordinary events/spans and the native writer implements `Write`. | Adopt narrowly selected `std`, `fmt`, `registry`, and `tracing-log` features plus an application-owned Win32 daily sink. |
 | `log` 0.4.33 plus `flexi_logger` 0.31.9 | Both are current and permissive; flexi_logger has useful rotation and retention. It loses structured scan/span fields or requires a bridge, duplicating the logging stack. Build cost is similar enough that the local benefit favors tracing. | Reject for the product baseline. |
 | [`lexopt` 0.3.2](https://docs.rs/lexopt/latest/src/lexopt/lib.rs.html) | MIT; released 2026-02-28; source forbids unsafe. It is portable, preserves `OsString`/`PathBuf`, has minimal compile/binary cost, and a short parser loop is cheaper than local edge-case handling. Low lock-in because the parsed application options are owned locally. | Adopt. |
 | `clap` 4.6.5 / `pico-args` 0.5.0 | Clap is active, MIT/Apache, and robust but derive/default help, suggestions, and styling are excessive for a handful of options; compile/binary cost is materially higher. Pico-args is MIT but last released in 2022. | Reject initially; revisit clap for nested commands, completions, or generated documentation. |
@@ -220,10 +221,11 @@ reportable omissions rather than global scan failures. The UI maps error codes
 to Fluent messages while diagnostics retain the full source chain. Never log
 every filename at info level.
 
-The tracing file layer should be non-ANSI plain text. Because
-tracing-appender's rolling writer is time-based rather than retention-capped,
-perform small, safe startup cleanup by retaining a configured number/total
-size of DiskPie-created log files only.
+The tracing file layer is non-ANSI plain text. An application-owned Win32
+writer binds the local directory and UTC active file by handle, while the
+library queue isolates application threads. Retention enumerates from the same
+directory handle with an explicit linear-work budget and runs in the writer,
+not during a UI callback or through tracing-appender's rolling implementation.
 
 ## Development dependency evaluation
 
