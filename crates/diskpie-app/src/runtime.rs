@@ -1775,10 +1775,7 @@ fn finalize_scan(
         && reducer.phase().is_terminal()
         && publication_generation_is_current(scan.generation, navigation)
     {
-        match reducer.maybe_publish_snapshot(
-            now,
-            SnapshotPolicy { min_events: 1, min_interval: Duration::ZERO },
-        ) {
+        match reducer.maybe_publish_snapshot(now, SnapshotPolicy::IMMEDIATE) {
             Ok(Some(publication)) => {
                 match prepare_publication_with_navigation(publication, true, navigation) {
                     Ok(prepared) => Some(prepared),
@@ -2931,6 +2928,9 @@ fn validate_runtime_config(config: &RuntimeConfig) -> Result<(), RuntimeError> {
     if config.snapshot_policy.min_events == 0 {
         return Err(RuntimeError::InvalidConfig { field: "snapshot_policy.min_events" });
     }
+    if config.snapshot_policy.max_interval < config.snapshot_policy.min_interval {
+        return Err(RuntimeError::InvalidConfig { field: "snapshot_policy.max_interval" });
+    }
     if !(1..=MAX_RETIRING_SCANS).contains(&config.max_retiring_scans) {
         return Err(RuntimeError::InvalidConfig { field: "max_retiring_scans" });
     }
@@ -3267,7 +3267,9 @@ mod tests {
                 },
             },
             drain_budget: DrainBudget { max_events, max_duration: Duration::from_millis(5) },
-            snapshot_policy: SnapshotPolicy { min_events: 1, min_interval: Duration::from_secs(1) },
+            // Publish every change so the runtime's own partial-layout
+            // throttle is what the progressive-frame tests observe.
+            snapshot_policy: SnapshotPolicy::IMMEDIATE,
             layout_options: LayoutOptions::new(NodeId::from_raw(0)),
             max_retiring_scans,
         }

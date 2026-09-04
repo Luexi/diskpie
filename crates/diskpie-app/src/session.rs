@@ -84,15 +84,57 @@ impl SessionProgress {
 }
 
 /// Pure rate-limit configuration for partial snapshot publication.
+///
+/// Every publication rebuilds the whole tree, so the spacing between partial
+/// publications grows with the number of staged nodes:
+/// `spacing = clamp(per_node_interval * node_count, min_interval, max_interval)`.
+/// A small tree refreshes every `min_interval`; a tree of a million entries
+/// refreshes every couple of seconds instead of spending the supervisor's
+/// whole time materializing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SnapshotPolicy {
+    /// Applied events required since the last publication before an
+    /// event-driven publication is considered once the spacing has elapsed.
     pub min_events: u64,
+    /// Smallest spacing between partial publications.
     pub min_interval: Duration,
+    /// Spacing added per staged node so rebuild cost stays a bounded fraction
+    /// of wall-clock time.
+    pub per_node_interval: Duration,
+    /// Largest spacing; a changed tree is published at least this often even
+    /// when fewer than `min_events` arrived.
+    pub max_interval: Duration,
+}
+
+impl SnapshotPolicy {
+    /// Publishes any change immediately; used for terminal reconciliation.
+    pub const IMMEDIATE: Self = Self {
+        min_events: 1,
+        min_interval: Duration::ZERO,
+        per_node_interval: Duration::ZERO,
+        max_interval: Duration::ZERO,
+    };
+
+    /// Spacing required before the next partial publication for `node_count`
+    /// staged nodes. Never below `min_interval`; never above `max_interval`
+    /// unless the configuration inverted the two, in which case `min_interval`
+    /// wins so the clamp cannot panic.
+    #[must_use]
+    pub fn spacing(self, node_count: usize) -> Duration {
+        let nodes = u32::try_from(node_count).unwrap_or(u32::MAX);
+        let proportional = self.per_node_interval.saturating_mul(nodes);
+        proportional.clamp(self.min_interval, self.max_interval.max(self.min_interval))
+    }
 }
 
 impl Default for SnapshotPolicy {
     fn default() -> Self {
-        Self { min_events: 4, min_interval: Duration::from_millis(50) }
+        Self {
+            min_events: 4,
+            min_interval: Duration::from_millis(50),
+            per_node_interval: Duration::from_micros(2),
+            max_interval: Duration::from_secs(3),
+        }
     }
 }
 
@@ -574,12 +616,15 @@ impl SessionReducer {
         let Some(last_at) = self.last_snapshot_at else {
             return Ok(SnapshotDecision::PublishInitial);
         };
+        let elapsed = now.checked_sub(last_at).ok_or(SessionError::ClockWentBackwards)?;
+        if elapsed < policy.spacing(self.nodes.len()) {
+            return Ok(SnapshotDecision::Deferred);
+        }
         let event_delta = self.revision.saturating_sub(self.last_snapshot_revision);
         if event_delta >= policy.min_events {
             return Ok(SnapshotDecision::PublishEventThreshold);
         }
-        if now.checked_sub(last_at).ok_or(SessionError::ClockWentBackwards)? >= policy.min_interval
-        {
+        if elapsed >= policy.max_interval {
             return Ok(SnapshotDecision::PublishTimeThreshold);
         }
         Ok(SnapshotDecision::Deferred)
@@ -1675,6 +1720,88 @@ mod tests {
                 .snapshot_decision(Duration::from_millis(1), SnapshotPolicy::default())
                 .expect("clean decision"),
             SnapshotDecision::NoChanges
+        );
+    }
+
+    #[test]
+    fn partial_publication_spacing_grows_with_staged_node_count() {
+        let policy = SnapshotPolicy {
+            min_events: 1,
+            min_interval: Duration::from_millis(50),
+            per_node_interval: Duration::from_millis(1),
+            max_interval: Duration::from_millis(500),
+        };
+        assert_eq!(policy.spacing(0), Duration::from_millis(50));
+        assert_eq!(policy.spacing(20), Duration::from_millis(50));
+        assert_eq!(policy.spacing(201), Duration::from_millis(201));
+        assert_eq!(policy.spacing(10_000), Duration::from_millis(500));
+        assert_eq!(policy.spacing(usize::MAX), Duration::from_millis(500));
+
+        let mut reducer = SessionReducer::new(generation(12));
+        apply(&mut reducer, started(12, &[(0, "root")]));
+        reducer.publish_snapshot(Duration::ZERO).expect("initial publication");
+        apply(
+            &mut reducer,
+            batch_event(12, 0, vec![entry(1, 0, "a", EntryKind::File)], Vec::new()),
+        );
+        assert_eq!(
+            reducer.snapshot_decision(Duration::from_millis(49), policy).expect("decision"),
+            SnapshotDecision::Deferred,
+            "two staged nodes still wait for the minimum spacing"
+        );
+        assert_eq!(
+            reducer.snapshot_decision(Duration::from_millis(50), policy).expect("decision"),
+            SnapshotDecision::PublishEventThreshold
+        );
+        reducer.publish_snapshot(Duration::from_millis(50)).expect("second publication");
+
+        for id in 2..=200 {
+            apply(
+                &mut reducer,
+                batch_event(12, 0, vec![entry(id, 0, "f", EntryKind::File)], Vec::new()),
+            );
+        }
+        assert_eq!(reducer.node_count(), 201);
+        assert_eq!(
+            reducer.snapshot_decision(Duration::from_millis(50 + 200), policy).expect("decision"),
+            SnapshotDecision::Deferred,
+            "201 staged nodes stretch the spacing to 201 ms"
+        );
+        assert_eq!(
+            reducer.snapshot_decision(Duration::from_millis(50 + 201), policy).expect("decision"),
+            SnapshotDecision::PublishEventThreshold
+        );
+    }
+
+    #[test]
+    fn sparse_changes_publish_by_max_interval_and_immediate_policy_never_waits() {
+        let policy = SnapshotPolicy {
+            min_events: 4,
+            min_interval: Duration::from_millis(50),
+            per_node_interval: Duration::ZERO,
+            max_interval: Duration::from_millis(400),
+        };
+        let mut reducer = SessionReducer::new(generation(13));
+        apply(&mut reducer, started(13, &[(0, "root")]));
+        reducer.publish_snapshot(Duration::ZERO).expect("initial publication");
+        apply(
+            &mut reducer,
+            batch_event(13, 0, vec![entry(1, 0, "a", EntryKind::File)], Vec::new()),
+        );
+
+        assert_eq!(
+            reducer.snapshot_decision(Duration::from_millis(60), policy).expect("decision"),
+            SnapshotDecision::Deferred,
+            "one event is below min_events and max_interval has not elapsed"
+        );
+        assert_eq!(
+            reducer.snapshot_decision(Duration::from_millis(400), policy).expect("decision"),
+            SnapshotDecision::PublishTimeThreshold
+        );
+        assert_eq!(
+            reducer.snapshot_decision(Duration::ZERO, SnapshotPolicy::IMMEDIATE).expect("decision"),
+            SnapshotDecision::PublishEventThreshold,
+            "the immediate policy publishes any change at the same instant"
         );
     }
 
