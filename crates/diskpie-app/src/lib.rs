@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod actions;
 pub mod diagnostics;
 pub mod format;
 pub mod i18n;
