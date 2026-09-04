@@ -210,7 +210,13 @@ Application (`diskpie_app::actions`):
   target because it has no in-snapshot parent to rescan (item 14), and a
   destructive validation without a supplied executable path is refused rather
   than skipping self-protection. Open and reveal validation accept the scan
-  root and do not require the executable path.
+  root and do not require the executable path. Because those checks depend on
+  the purpose, `FilesystemTarget` records the `ActionPurpose` it was validated
+  for, and `ConfirmationFlow::begin_recycle`/`begin_delete` refuse any target
+  that was not validated for `Destructive`
+  (`FlowError::NotValidatedForDestruction`); an open- or reveal-validated
+  executable, its directory, the scan root, or a drive root therefore cannot
+  become a capability through the public API (amendment 2026-09-04).
 - `ConfirmationFlow` is the pure state machine: `Idle -> Reviewing ->
   Confirmed` for recycling and `Idle -> Reviewing -> AwaitingWord ->
   StronglyConfirmed` for permanent deletion and emptying a bin. The words are
@@ -235,6 +241,16 @@ Application (`diskpie_app::actions`):
   and is exercised by fake-adapter tests for every outcome combination,
   including success plus abort, missing callbacks, per-item failure, null
   recycle item, and cancellation before and after mutation.
+- `DeleteEvidence::observation` carries the post-operation observation item 13
+  requires. Copy-engine success codes are not uniformly "removed":
+  `COPYENGINE_S_USER_IGNORED` (`0x00270005`) means skipped, and
+  `COPYENGINE_S_DONT_PROCESS_CHILDREN` (`0x00270008`) was observed for a plain
+  file delete. The adapter therefore re-opens the exact path (no reparse
+  following) after the operation; a path that still holds the same identity
+  (or, without a bound identity, the same kind) downgrades an otherwise
+  complete permanent file/link delete to `Failed` and every other case to
+  `UnknownMayHaveMutated` at stage `PostOperationObservation`. The observation
+  never upgrades an outcome (amendment 2026-09-04).
 
 Platform (`diskpie_platform`):
 
@@ -260,11 +276,18 @@ Platform (`diskpie_platform`):
   records `StartOperations`, `PreDeleteItem`, `PostDeleteItem` (`hrDelete` and
   whether `psiNewlyCreated` was non-null), and `FinishOperations`. The advise
   cookie is an RAII guard. `GetAnyOperationsAborted` is always queried.
+- Before validation the adapter refuses, as defence in depth, any request
+  whose target kind is the scan root or whose path is a drive, volume, or share
+  root (`Failed` at stage `ForbiddenTarget`), and a delete payload re-wrapped
+  in the other destructive `ShellRequest` variant (`Failed` at stage
+  `RequestMismatch`); neither reaches a file operation.
 - Late validation (item 8) opens the exact path with zero access, full
   sharing, `FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS`, checks
   the observed kind against the bound `TargetKind`, compares `FILE_ID_INFO`
   with the bound identity, and closes the handle before `DeleteItem`. A missing
-  item or changed kind/identity is `TargetChanged`. The scanner records no
+  item (`ERROR_FILE_NOT_FOUND`/`ERROR_PATH_NOT_FOUND` only; an un-openable name
+  is a validation failure, not a changed target) or changed kind/identity is
+  `TargetChanged`. The scanner records no
   identity for directories and reparse entries, so those validations report
   `IdentityAssurance::KindOnly` in the outcome instead of `Exact`; this is the
   weaker assurance the ADR requires to be surfaced.
@@ -278,17 +301,30 @@ Platform (`diskpie_platform`):
 
 Tests that run by default never mutate anything: they validate identity on
 temporary fixtures, prove a swapped target yields `TargetChanged` through the
-live STA with the fixture intact, exercise pre-cancelled requests, and map
-terminal events for every request kind. Fixture-mutating tests (recycle a
-temporary file, permanently delete one, delete a directory symlink whose
-sentinel must survive) run only with `DISKPIE_DESTRUCTIVE_FIXTURES=1` and act
-only on files they created under the temporary directory. On the development
-machine the permanent-delete and symlink-sentinel tests passed
-(`hrDelete` was `COPYENGINE_S_DONT_PROCESS_CHILDREN`, a success code other than
-`S_OK`, which the classifier treats as success); the recycle test was left
-for an explicit opt-in run because it adds an item to the user's real Recycle
-Bin. Emptying a bin is never tested against a real bin.
+live STA with the fixture intact (submitted in permanent mode on purpose, so a
+regression of late validation could only destroy the test's own fixture and
+never add an item to the developer's Recycle Bin), exercise pre-cancelled and
+re-wrapped requests, refuse scan/drive roots, observe gone/present/swapped
+paths, and map terminal events for every request kind. Fixture-mutating tests
+(recycle a temporary file, recycle a temporary directory tree, permanently
+delete a file, delete a directory symlink whose sentinel must survive) run
+only with `DISKPIE_DESTRUCTIVE_FIXTURES=1` and act only on files they created
+under the temporary directory. On the development machine the
+permanent-delete and symlink-sentinel tests passed (`hrDelete` was
+`COPYENGINE_S_DONT_PROCESS_CHILDREN`, a success code other than `S_OK`); the
+recycle tests were left for an explicit opt-in run because they add items to
+the user's real Recycle Bin. Emptying a bin is never tested against a real bin.
+
+Open question (2026-09-04): it is not yet verified whether the copy engine
+reports a recycled directory as a single `PostDeleteItem` carrying the new
+Recycle Bin item or as one callback per descendant. If descendants report
+success with a null `psiNewlyCreated`, the classifier raises
+`SafetyViolationUnexpectedPermanentDelete` for a folder recycle: fail-closed
+(halt plus incident) but a false alarm. The gated directory-recycle fixture is
+the test that settles it; until it has been run in a disposable profile,
+directory recycling must not be enabled in the UI.
 
 Still open: the egui binding of the flow and result presentation, the
 disposable-VM provider matrix that gates enabling Recycle per provider class
-(item 10), and ACL-denied descendant fixtures for the `Partial` path.
+(item 10), the directory-recycle callback shape above, and ACL-denied
+descendant fixtures for the `Partial` path.

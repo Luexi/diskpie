@@ -50,6 +50,8 @@ windows = { version = "=0.62.2", default-features = false, features = [
     "Win32_System_Console",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    # Only because `SHELLEXECUTEINFOW.hkeyClass` is an `HKEY`; DiskPie does
+    # not read or write the registry through this feature.
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",

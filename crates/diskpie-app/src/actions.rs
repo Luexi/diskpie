@@ -105,7 +105,11 @@ pub enum ActionPurpose {
 /// A real, current scan node resolved to its exact native path.
 ///
 /// Only [`TargetValidator`] constructs this type, so every instance passed a
-/// synthetic, stale, root, hidden, and self-protection check.
+/// synthetic, stale, and hidden check. The [`ActionPurpose`] it was validated
+/// for is recorded privately: only a target validated for
+/// [`ActionPurpose::Destructive`] also passed the root and self-protection
+/// checks, and only such a target can start a destructive
+/// [`ConfirmationFlow`].
 #[derive(Clone, Eq, PartialEq)]
 pub struct FilesystemTarget {
     generation: GenerationId,
@@ -117,12 +121,26 @@ pub struct FilesystemTarget {
     identity: Option<FileIdentity>,
     logical: SizeSummary,
     allocated: SizeSummary,
+    purpose: ActionPurpose,
 }
 
 impl FilesystemTarget {
     #[must_use]
     pub const fn generation(&self) -> GenerationId {
         self.generation
+    }
+
+    /// Returns the purpose the validator cleared this target for.
+    #[must_use]
+    pub const fn purpose(&self) -> ActionPurpose {
+        self.purpose
+    }
+
+    /// Whether the target passed the root and self-protection checks that
+    /// only destructive validation performs.
+    #[must_use]
+    pub const fn is_cleared_for_destruction(&self) -> bool {
+        matches!(self.purpose, ActionPurpose::Destructive)
     }
 
     #[must_use]
@@ -189,6 +207,7 @@ impl fmt::Debug for FilesystemTarget {
             .field("parent", &self.parent)
             .field("kind", &self.kind)
             .field("identity", &self.identity)
+            .field("purpose", &self.purpose)
             .field("path_present", &true)
             .finish()
     }
@@ -363,6 +382,7 @@ impl<'a> TargetValidator<'a> {
                 known_bytes: aggregate.allocated().known_bytes(),
                 unknown_entries: aggregate.allocated().unknown_entries(),
             },
+            purpose,
         })
     }
 }
@@ -566,10 +586,17 @@ fn escaped_native_path_units(_path: &Path) -> Option<String> {
 }
 
 /// Exact `X:\` Recycle Bin root that is never empty.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub struct DriveRoot {
     letter: char,
     path: PathBuf,
+}
+
+impl fmt::Debug for DriveRoot {
+    /// Renders the letter only, so no path-bearing type prints a path.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_tuple("DriveRoot").field(&self.letter).finish()
+    }
 }
 
 /// Why a path is not an exact drive root.
@@ -1121,8 +1148,18 @@ pub enum FailureStage {
     FinishOperations,
     MissingCallbacks,
     Unadvise,
+    /// Re-opening the exact path after the operation contradicted or could
+    /// not confirm the callback evidence.
+    PostOperationObservation,
     QueryRecycleBin,
     EmptyRecycleBin,
+    /// The adapter refused a target kind or path that must never reach a
+    /// file operation (scan root, drive/volume/share root), independently of
+    /// the confirmation that produced the request.
+    ForbiddenTarget,
+    /// The request's deletion mode did not match the operation it was
+    /// submitted as; nothing was run.
+    RequestMismatch,
     WorkerPanicked,
     ServiceShutdown,
 }
@@ -1231,6 +1268,22 @@ pub struct PostDeleteEvidence {
     pub newly_created: Option<RecycleReceipt>,
 }
 
+/// What re-opening the exact path observed after the operation returned.
+///
+/// Per-item success codes from the copy engine are not uniformly "removed"
+/// (skip and defer codes are also successes), so the adapter re-inspects the
+/// exact path, without following reparse points, after every attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostOperationObservation {
+    /// The confirmed object is no longer at the path.
+    Gone,
+    /// The same object (same identity, or same kind when no identity was
+    /// bound) is still at the path.
+    StillPresent,
+    /// The path could not be inspected; `code` is the native error.
+    Inconclusive { code: i32 },
+}
+
 /// Plain-data record of everything one `IFileOperation` attempt reported.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeleteEvidence {
@@ -1245,13 +1298,17 @@ pub struct DeleteEvidence {
     pub finish: Option<i32>,
     pub perform: Result<(), i32>,
     pub aborted: Result<bool, i32>,
+    /// What the exact path looked like after the operation returned.
+    pub observation: PostOperationObservation,
 }
 
 /// Classifies native evidence exactly per ADR 0008 item 13.
 ///
 /// Queuing and `PerformOperations` success are never completion. Success
 /// requires consistent per-item callbacks, a successful final callback, no
-/// abort, and, for recycling, a newly created Recycle Bin item per item.
+/// abort, for recycling a newly created Recycle Bin item per item, and a
+/// post-operation observation that the confirmed object is gone from its
+/// exact path.
 #[must_use]
 pub fn classify_delete_evidence(evidence: &DeleteEvidence) -> DestructiveOutcome {
     let mut items = Vec::with_capacity(evidence.post_delete.len());
@@ -1364,7 +1421,38 @@ pub fn classify_delete_evidence(evidence: &DeleteEvidence) -> DestructiveOutcome
         };
     }
 
-    DestructiveOutcome::Completed { items, assurance: evidence.assurance }
+    // Every callback claimed success; the exact path must agree before the
+    // attempt is reported as complete.
+    match evidence.observation {
+        PostOperationObservation::Gone => {
+            DestructiveOutcome::Completed { items, assurance: evidence.assurance }
+        }
+        PostOperationObservation::StillPresent => {
+            let code = items.first().map(|item| item.code);
+            match (evidence.mode, evidence.target_kind) {
+                // A single object that reported success and is still there
+                // was skipped, not deleted; nothing else could have changed.
+                (DeleteMode::Permanent, TargetKind::File | TargetKind::ReparsePoint(_)) => {
+                    DestructiveOutcome::Failed {
+                        stage: FailureStage::PostOperationObservation,
+                        code,
+                    }
+                }
+                // A surviving directory may have lost descendants, and a
+                // surviving item with a Recycle Bin receipt is contradictory.
+                _ => DestructiveOutcome::UnknownMayHaveMutated {
+                    stage: FailureStage::PostOperationObservation,
+                    code,
+                },
+            }
+        }
+        PostOperationObservation::Inconclusive { code } => {
+            DestructiveOutcome::UnknownMayHaveMutated {
+                stage: FailureStage::PostOperationObservation,
+                code: Some(code),
+            }
+        }
+    }
 }
 
 /// Exact-path presentation for a recycle or delete confirmation.
@@ -1437,6 +1525,9 @@ pub enum FlowStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FlowError {
     NotIdle,
+    /// The target was validated for open or reveal only; it never passed the
+    /// root and self-protection checks a destructive action requires.
+    NotValidatedForDestruction,
     NotReviewing,
     NotAwaitingWord,
     WordMismatch,
@@ -1447,6 +1538,9 @@ impl fmt::Display for FlowError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
             Self::NotIdle => "a confirmation is already in progress",
+            Self::NotValidatedForDestruction => {
+                "the target was not validated for a destructive action"
+            }
             Self::NotReviewing => "no confirmation is being reviewed",
             Self::NotAwaitingWord => "the confirmation is not awaiting the action word",
             Self::WordMismatch => "the typed word does not match the required action word",
@@ -1549,13 +1643,27 @@ impl ConfirmationFlow {
     }
 
     /// Starts reviewing a recycle of a target validated for [`ActionPurpose::Destructive`].
+    ///
+    /// A target validated for any other purpose is refused with
+    /// [`FlowError::NotValidatedForDestruction`] and the flow stays `Idle`.
     pub fn begin_recycle(&mut self, target: FilesystemTarget) -> Result<(), FlowError> {
+        Self::require_destructive(&target)?;
         self.begin(PendingIntent::Recycle(target))
     }
 
-    /// Starts reviewing a permanent deletion of a validated target.
+    /// Starts reviewing a permanent deletion of a target validated for
+    /// [`ActionPurpose::Destructive`]; any other target is refused.
     pub fn begin_delete(&mut self, target: FilesystemTarget) -> Result<(), FlowError> {
+        Self::require_destructive(&target)?;
         self.begin(PendingIntent::Delete(target))
+    }
+
+    fn require_destructive(target: &FilesystemTarget) -> Result<(), FlowError> {
+        if target.is_cleared_for_destruction() {
+            Ok(())
+        } else {
+            Err(FlowError::NotValidatedForDestruction)
+        }
     }
 
     /// Starts reviewing an empty-bin action for an exact scope.
@@ -1808,6 +1916,7 @@ mod tests {
             finish: Some(0),
             perform: Ok(()),
             aborted: Ok(false),
+            observation: PostOperationObservation::Gone,
         }
     }
 
@@ -1816,6 +1925,8 @@ mod tests {
         let fixture = fixture(1);
         let target = destructive_target(&fixture, fixture.leaf);
         assert_eq!(target.kind(), TargetKind::File);
+        assert_eq!(target.purpose(), ActionPurpose::Destructive);
+        assert!(target.is_cleared_for_destruction());
         assert_eq!(target.identity(), Some(identity(12)));
         assert_eq!(target.parent(), Some(fixture.directory));
         assert_eq!(target.logical(), SizeSummary { known_bytes: 10, unknown_entries: 0 });
@@ -2316,6 +2427,128 @@ mod tests {
         assert_eq!(ActionKind::Open.required_word(), None);
         assert_eq!(ActionKind::DeletePermanently.required_word(), Some("DELETE"));
         assert_eq!(ActionKind::EmptyRecycleBin.required_word(), Some("EMPTY"));
+    }
+
+    #[test]
+    fn open_or_reveal_validated_targets_cannot_start_a_destructive_flow() {
+        let fixture = fixture(1);
+        // Open/reveal validation skips the root and self-protection checks, so
+        // the executable, its directory, and the scan root all validate here.
+        let validator = validator(&fixture, None);
+        let mut refused = Vec::new();
+        for node in [fixture.exe, fixture.bin, fixture.root, fixture.leaf] {
+            for purpose in [ActionPurpose::Open, ActionPurpose::Reveal] {
+                let target = validator
+                    .validate(node, generation(1), false, purpose)
+                    .expect("non-destructive validation succeeds");
+                assert_eq!(target.purpose(), purpose);
+                assert!(!target.is_cleared_for_destruction());
+                refused.push(target);
+            }
+        }
+        for target in refused {
+            let mut flow = ConfirmationFlow::new();
+            assert_eq!(
+                flow.begin_recycle(target.clone()),
+                Err(FlowError::NotValidatedForDestruction)
+            );
+            assert_eq!(flow.status(), FlowStatus::Idle);
+            assert_eq!(flow.begin_delete(target), Err(FlowError::NotValidatedForDestruction));
+            assert_eq!(flow.status(), FlowStatus::Idle);
+            assert_eq!(flow.presentation(), None);
+            assert_eq!(flow.take_recycle().map(|_| ()), Err(FlowError::NothingConfirmed));
+            assert_eq!(flow.take_delete().map(|_| ()), Err(FlowError::NothingConfirmed));
+        }
+
+        // The same real leaf validated for destruction still works, so the
+        // gate is on the recorded purpose, not on the node.
+        let mut flow = ConfirmationFlow::new();
+        flow.begin_recycle(destructive_target(&fixture, fixture.leaf)).expect("begin");
+        assert_eq!(flow.status(), FlowStatus::Reviewing { kind: ActionKind::Recycle });
+    }
+
+    #[test]
+    fn classification_requires_the_object_to_be_gone_after_the_operation() {
+        let mut skipped = evidence(DeleteMode::Permanent);
+        skipped.post_delete[0].newly_created = None;
+        skipped.observation = PostOperationObservation::StillPresent;
+        assert_eq!(
+            classify_delete_evidence(&skipped),
+            DestructiveOutcome::Failed {
+                stage: FailureStage::PostOperationObservation,
+                code: Some(0)
+            }
+        );
+
+        let mut link = skipped.clone();
+        link.target_kind = TargetKind::ReparsePoint(ReparseKind::Directory);
+        link.assurance = IdentityAssurance::KindOnly;
+        assert_eq!(
+            classify_delete_evidence(&link),
+            DestructiveOutcome::Failed {
+                stage: FailureStage::PostOperationObservation,
+                code: Some(0)
+            }
+        );
+
+        let mut directory = skipped.clone();
+        directory.target_kind = TargetKind::Directory;
+        directory.assurance = IdentityAssurance::KindOnly;
+        assert_eq!(
+            classify_delete_evidence(&directory),
+            DestructiveOutcome::UnknownMayHaveMutated {
+                stage: FailureStage::PostOperationObservation,
+                code: Some(0)
+            }
+        );
+
+        let mut recycled_but_present = evidence(DeleteMode::Recycle);
+        recycled_but_present.observation = PostOperationObservation::StillPresent;
+        assert_eq!(
+            classify_delete_evidence(&recycled_but_present),
+            DestructiveOutcome::UnknownMayHaveMutated {
+                stage: FailureStage::PostOperationObservation,
+                code: Some(0)
+            }
+        );
+
+        let mut inconclusive = evidence(DeleteMode::Permanent);
+        inconclusive.post_delete[0].newly_created = None;
+        inconclusive.observation = PostOperationObservation::Inconclusive { code: 5 };
+        assert_eq!(
+            classify_delete_evidence(&inconclusive),
+            DestructiveOutcome::UnknownMayHaveMutated {
+                stage: FailureStage::PostOperationObservation,
+                code: Some(5)
+            }
+        );
+
+        // The observation never upgrades an outcome: failures, partial
+        // results, and safety violations are unchanged by a `Gone` path.
+        let mut failed = evidence(DeleteMode::Permanent);
+        failed.post_delete[0] = PostDeleteEvidence { hresult: -5, newly_created: None };
+        failed.observation = PostOperationObservation::Gone;
+        assert_eq!(
+            classify_delete_evidence(&failed),
+            DestructiveOutcome::Failed { stage: FailureStage::PostDeleteItem, code: Some(-5) }
+        );
+        let mut silent = evidence(DeleteMode::Recycle);
+        silent.post_delete[0].newly_created = None;
+        silent.observation = PostOperationObservation::Gone;
+        assert!(matches!(
+            classify_delete_evidence(&silent),
+            DestructiveOutcome::SafetyViolationUnexpectedPermanentDelete { .. }
+        ));
+    }
+
+    #[test]
+    fn drive_root_and_scope_debug_render_the_letter_only() {
+        let root = DriveRoot::parse(r"C:\").expect("root");
+        let scope = RecycleBinScope::Drive(root.clone());
+        let rendered = format!("{root:?} {scope:?}");
+        assert!(!rendered.contains(":\\"), "{rendered}");
+        assert!(rendered.contains("DriveRoot('C')"), "{rendered}");
+        assert_eq!(root.as_path(), Path::new(r"C:\"));
     }
 
     #[test]

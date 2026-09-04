@@ -965,7 +965,11 @@ pub struct ShellService {
     registry: Arc<ShellInstanceRegistry>,
     next_request_id: AtomicU64,
     /// Cancellation flags of accepted requests whose terminal event has not
-    /// been delivered yet; bounded by the queue capacity plus one in flight.
+    /// been delivered by `try_recv` yet. Modal requests contribute at most one
+    /// entry; non-modal requests (open, reveal, Installed Apps, bin query)
+    /// accumulate with their undrained events until the caller polls, so the
+    /// registry is bounded by the caller's polling cadence, not by the queue
+    /// capacity. Each delivery removes its entry with a linear scan.
     cancellations: Mutex<Vec<(DialogRequestId, Arc<AtomicBool>)>>,
     worker: Option<JoinHandle<()>>,
     instance_claim: Option<ServiceInstanceClaim>,
@@ -1498,12 +1502,13 @@ fn execute_request(queued: QueuedRequest) -> ShellEvent {
                 Err(hresult) => RecycleBinQueryOutcome::Failed { hresult: Some(hresult) },
             },
         },
-        ShellRequest::Recycle(request) => {
-            ShellEvent::Recycle { request_id: id, outcome: run_delete_request(&request, &cancel) }
-        }
+        ShellRequest::Recycle(request) => ShellEvent::Recycle {
+            request_id: id,
+            outcome: run_delete_request(&request, DeleteMode::Recycle, &cancel),
+        },
         ShellRequest::DeletePermanently(request) => ShellEvent::DeletePermanently {
             request_id: id,
-            outcome: run_delete_request(&request, &cancel),
+            outcome: run_delete_request(&request, DeleteMode::Permanent, &cancel),
         },
         ShellRequest::EmptyRecycleBin(request) => ShellEvent::EmptyRecycleBin {
             request_id: id,
@@ -1512,10 +1517,19 @@ fn execute_request(queued: QueuedRequest) -> ShellEvent {
     }
 }
 
+/// Runs a delete payload only when its mode matches the variant it arrived in.
+///
+/// Both destructive variants share the payload type, so a payload could be
+/// re-wrapped in the other variant; the terminal event would then be labelled
+/// with the wrong operation. Such a request is refused without running.
 fn run_delete_request(
     request: &DeleteShellRequest,
+    expected_mode: DeleteMode,
     cancel: &Arc<AtomicBool>,
 ) -> DestructiveOutcome {
+    if request.mode != expected_mode {
+        return DestructiveOutcome::Failed { stage: FailureStage::RequestMismatch, code: None };
+    }
     run_delete(&DeleteJob {
         owner: request.owner,
         path: &request.path,
@@ -2479,6 +2493,9 @@ mod tests {
         }
     }
 
+    /// Runs by default in permanent mode on purpose: if late validation ever
+    /// regressed, only this test's own temporary fixture could be destroyed,
+    /// never an item added to the developer's real Recycle Bin.
     #[test]
     fn swapped_target_reports_target_changed_through_the_live_service_without_mutation() {
         let fixture = ActionFixture::new("swap");
@@ -2491,7 +2508,7 @@ mod tests {
             EntryKind::File,
             Some(identity),
         );
-        let capability = confirmed_recycle(&snapshot, node);
+        let capability = strongly_confirmed_delete(&snapshot, node);
         assert_eq!(capability.request().target().path(), file.as_path());
 
         // The confirmation is now stale: the path is reused by a different object.
@@ -2500,14 +2517,14 @@ mod tests {
 
         let registry = private_registry();
         let service = start_in(&registry, WorkerBehaviour::Native);
-        let (request, obligation) = ShellRequest::recycle(owner(), capability);
+        let (request, obligation) = ShellRequest::delete_permanently(owner(), capability);
         let id = service.submit(request).expect("accepted");
         assert_eq!(service.submit_folder(owner()), Err(SubmitError::ModalOutstanding));
 
         let event = wait_for_event(&service);
         assert_eq!(
             event,
-            ShellEvent::Recycle {
+            ShellEvent::DeletePermanently {
                 request_id: id,
                 outcome: DestructiveOutcome::TargetChanged {
                     reason: TargetChangeReason::IdentityMismatch
@@ -2530,6 +2547,60 @@ mod tests {
             service.finish(Duration::from_secs(5)),
             ShellServiceFinish::Exited { panicked: false }
         );
+    }
+
+    #[test]
+    fn a_payload_rewrapped_in_the_other_destructive_variant_is_refused_unrun() {
+        let fixture = ActionFixture::new("rewrap");
+        let file = fixture.path().join("keep.bin");
+        fs::write(&file, b"keep").expect("write fixture");
+        let identity = read_file_identity(&file).expect("identity");
+        let (snapshot, node) =
+            child_snapshot(fixture.path(), OsStr::new("keep.bin"), EntryKind::File, Some(identity));
+
+        let (request, _obligation) =
+            ShellRequest::delete_permanently(owner(), strongly_confirmed_delete(&snapshot, node));
+        let ShellRequest::DeletePermanently(payload) = request else {
+            panic!("unexpected variant {request:?}");
+        };
+        assert_eq!(payload.mode(), DeleteMode::Permanent);
+        let queued = QueuedRequest {
+            id: DialogRequestId(7),
+            request: ShellRequest::Recycle(payload),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        assert_eq!(
+            execute_request(queued),
+            ShellEvent::Recycle {
+                request_id: DialogRequestId(7),
+                outcome: DestructiveOutcome::Failed {
+                    stage: FailureStage::RequestMismatch,
+                    code: None
+                },
+            }
+        );
+
+        let (request, _obligation) =
+            ShellRequest::recycle(owner(), confirmed_recycle(&snapshot, node));
+        let ShellRequest::Recycle(payload) = request else {
+            panic!("unexpected variant {request:?}");
+        };
+        let queued = QueuedRequest {
+            id: DialogRequestId(8),
+            request: ShellRequest::DeletePermanently(payload),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        assert_eq!(
+            execute_request(queued),
+            ShellEvent::DeletePermanently {
+                request_id: DialogRequestId(8),
+                outcome: DestructiveOutcome::Failed {
+                    stage: FailureStage::RequestMismatch,
+                    code: None
+                },
+            }
+        );
+        assert_eq!(fs::read(&file).expect("fixture intact"), b"keep");
     }
 
     #[test]
@@ -2742,6 +2813,57 @@ mod tests {
                 assert!(!file.exists(), "the fixture moved to the Recycle Bin");
             }
             other => panic!("recycle did not complete with Recycle Bin evidence: {other:?}"),
+        }
+        assert_eq!(
+            service.finish(Duration::from_secs(5)),
+            ShellServiceFinish::Exited { panicked: false }
+        );
+    }
+
+    /// Open question recorded in ADR 0008: whether the copy engine reports a
+    /// recycled directory as one `PostDeleteItem` with a Recycle Bin item, or
+    /// per descendant. The classifier fails closed on a success callback with
+    /// no new item, so this fixture is what proves or disproves that.
+    #[test]
+    fn gated_recycle_of_a_temp_directory_produces_recycle_bin_evidence() {
+        if !destructive_fixtures_enabled(
+            "gated_recycle_of_a_temp_directory_produces_recycle_bin_evidence",
+        ) {
+            return;
+        }
+        let fixture = ActionFixture::new("recycle-dir");
+        let directory = fixture.path().join("recycle-me");
+        fs::create_dir(&directory).expect("create directory fixture");
+        fs::write(directory.join("child.bin"), b"child").expect("write child");
+        fs::create_dir(directory.join("nested")).expect("create nested");
+        fs::write(directory.join("nested").join("leaf.bin"), b"leaf").expect("write leaf");
+        let (snapshot, node) =
+            child_snapshot(fixture.path(), OsStr::new("recycle-me"), EntryKind::Directory, None);
+        let registry = private_registry();
+        let service = start_in(&registry, WorkerBehaviour::Native);
+        let (request, _obligation) =
+            ShellRequest::recycle(owner(), confirmed_recycle(&snapshot, node));
+        let id = service.submit(request).expect("accepted");
+
+        let event = wait_for_event(&service);
+        let ShellEvent::Recycle { request_id, outcome } = event else {
+            panic!("unexpected event {event:?}");
+        };
+        assert_eq!(request_id, id);
+        println!("directory recycle evidence: {outcome:?}");
+        match outcome {
+            DestructiveOutcome::Completed { items, assurance } => {
+                assert_eq!(assurance, IdentityAssurance::KindOnly);
+                assert!(!items.is_empty());
+                assert!(
+                    items.iter().all(|item| matches!(item.effect, ItemEffect::Recycled { .. })),
+                    "{items:?}"
+                );
+                assert!(!directory.exists(), "the directory moved to the Recycle Bin");
+            }
+            other => {
+                panic!("directory recycle did not complete with Recycle Bin evidence: {other:?}")
+            }
         }
         assert_eq!(
             service.finish(Duration::from_secs(5)),

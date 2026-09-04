@@ -204,3 +204,14 @@ injected worker behaviours (stalled for a fixed duration, or panicking after
 the shutdown request) on private singleton registries so the tests prove
 bounded `finish`, bounded `Drop`, single ownership, restart only after the
 real exit, and the fail-closed outcome without showing any UI.
+
+## Decision note 2026-09-04: reveal parses the display name
+
+Item 5 describes obtaining the PIDL through `SHGetIDListFromObject` on an
+`IShellItem`. The implementation keeps that route for Open, where the item is
+needed anyway, but Reveal parses the exact path with `SHParseDisplayName`
+(no bind context, no attribute request) and hands the resulting absolute PIDL
+straight to `SHOpenFolderAndSelectItems`. Both routes address the item by its
+exact native path rather than a display string, and both PIDLs are freed with
+`CoTaskMemFree`; the marshalling of each is covered by tests behind the
+internal `ShellPrimitives` seam without launching Explorer.

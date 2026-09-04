@@ -380,9 +380,12 @@ implementation note 2026-09-04).
 What exists:
 
 - `diskpie_app::actions::TargetValidator` turns a real, current `NodeId` into a
-  `FilesystemTarget`; synthetic, stale, hidden, drive/volume/share-root,
-  scan-root, running-executable, and executable-containing nodes are rejected
-  before any dialog appears.
+  `FilesystemTarget` that records the purpose it was validated for; synthetic,
+  stale, and hidden nodes are rejected for every purpose, and
+  drive/volume/share-root, scan-root, running-executable, and
+  executable-containing nodes are rejected for destructive validation before
+  any dialog appears. `ConfirmationFlow` refuses to start a recycle or delete
+  from a target validated only for open or reveal.
 - `ConfirmationFlow` is the pure state machine (`Idle -> Reviewing ->
   Confirmed` for recycling; `Idle -> Reviewing -> AwaitingWord ->
   StronglyConfirmed` with the typed `DELETE`/`EMPTY` word otherwise). It
@@ -396,11 +399,13 @@ What exists:
   only way to build a destructive Shell request, and they take the capability
   by value. `ShellService::cancel(id)` skips a queued request reliably and is
   honoured cooperatively in `PreDeleteItem`.
-- The STA revalidates `(volume, FILE_ID_128)` through a no-follow handle
-  immediately before `DeleteItem` (`TargetChanged` on mismatch; `KindOnly`
-  assurance when the scanner captured no identity, as for directories), runs
-  one `IFileOperation` per request with explicit flags and a recording
-  progress sink, and classifies the evidence into `Completed`,
+- The STA refuses scan/drive roots and mode-mismatched payloads outright,
+  revalidates `(volume, FILE_ID_128)` through a no-follow handle immediately
+  before `DeleteItem` (`TargetChanged` on mismatch; `KindOnly` assurance when
+  the scanner captured no identity, as for directories), runs one
+  `IFileOperation` per request with explicit flags and a recording progress
+  sink, re-inspects the exact path afterwards so a skipped item is never
+  reported as removed, and classifies the evidence into `Completed`,
   `CancelledBeforeMutation`, `Partial`, `Failed`, `UnknownMayHaveMutated`,
   `SafetyViolationUnexpectedPermanentDelete`, or `TargetChanged`.
 - Open/reveal/Installed Apps report `Dispatched` or a typed failure stage; the
@@ -415,6 +420,9 @@ What remains:
 - the disposable-VM provider matrix (NTFS, FAT/removable, SMB, disabled/full
   bin, oversized items, read-only/open/ACL-denied targets) that gates enabling
   Recycle per provider class, and ACL-denied descendant fixtures for `Partial`;
+- the directory-recycle callback shape (one `PostDeleteItem` with a Recycle
+  Bin item, or one per descendant); the gated directory fixture settles it and
+  directory recycling stays disabled in the UI until it has run;
 - empty-bin verification in a disposable profile; it is never run against a
   developer's bin.
 

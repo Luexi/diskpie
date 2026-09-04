@@ -22,8 +22,9 @@
 
 use diskpie_app::actions::{
     DeleteEvidence, DeleteMode, DestructiveOutcome, EmptyBinOutcome, FailureStage,
-    IdentityAssurance, PostDeleteEvidence, PreDeleteEvidence, RecycleBinEstimate, RecycleBinScope,
-    RecycleReceipt, TargetChangeReason, TargetKind, classify_delete_evidence, identity_from_raw,
+    IdentityAssurance, PostDeleteEvidence, PostOperationObservation, PreDeleteEvidence,
+    RecycleBinEstimate, RecycleBinScope, RecycleReceipt, TargetChangeReason, TargetKind,
+    classify_delete_evidence, identity_from_raw, is_filesystem_root,
 };
 use diskpie_core::FileIdentity;
 use std::{
@@ -41,8 +42,7 @@ use std::{
 use windows::{
     Win32::{
         Foundation::{
-            E_INVALIDARG, ERROR_CANCELLED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_NAME,
-            ERROR_PATH_NOT_FOUND, HANDLE, HWND,
+            E_INVALIDARG, ERROR_CANCELLED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, HANDLE, HWND,
         },
         Storage::FileSystem::{
             FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
@@ -415,8 +415,13 @@ fn win32_code(hresult: i32) -> i32 {
     if (hresult as u32) & 0xFFFF_0000 == 0x8007_0000 { hresult & 0xFFFF } else { hresult }
 }
 
+/// Whether a Win32 open error proves that nothing exists at the path.
+///
+/// Only "file not found" and "path not found" qualify. A name Windows cannot
+/// open (`ERROR_INVALID_NAME`) is not evidence of absence and is reported as
+/// a validation failure instead of a changed target.
 fn is_missing_code(code: i32) -> bool {
-    [ERROR_FILE_NOT_FOUND.0, ERROR_PATH_NOT_FOUND.0, ERROR_INVALID_NAME.0]
+    [ERROR_FILE_NOT_FOUND.0, ERROR_PATH_NOT_FOUND.0]
         .iter()
         .any(|missing| i32::try_from(*missing).is_ok_and(|missing| missing == code))
 }
@@ -481,6 +486,54 @@ pub(crate) fn validate_target_identity(
         return Err(IdentityValidationFailure::TargetChanged(TargetChangeReason::IdentityMismatch));
     }
     Ok(IdentityAssurance::Exact)
+}
+
+/// Re-inspects the exact path after the file operation returned.
+///
+/// The open never follows a reparse point and the handle is closed before
+/// returning. The confirmed object counts as still present only when the
+/// same identity is found, or, when no identity was bound, when an object of
+/// the same kind is still there. A different object at the path means the
+/// confirmed one is gone.
+pub(crate) fn observe_after_operation(
+    path: &Path,
+    expected_kind: TargetKind,
+    expected: Option<FileIdentity>,
+) -> PostOperationObservation {
+    let file = match open_for_identity(path) {
+        Ok(file) => file,
+        Err(error) => {
+            let code = error.raw_os_error().unwrap_or(-1);
+            return if is_missing_code(code) {
+                PostOperationObservation::Gone
+            } else {
+                PostOperationObservation::Inconclusive { code }
+            };
+        }
+    };
+    match expected {
+        Some(expected) => match query_identity(&file) {
+            Ok(current) if current == expected => PostOperationObservation::StillPresent,
+            Ok(_) => PostOperationObservation::Gone,
+            Err(code) => PostOperationObservation::Inconclusive { code },
+        },
+        None => match query_attribute_tag(&file) {
+            Ok(tag) if kind_matches(expected_kind, observed_kind(&tag)) => {
+                PostOperationObservation::StillPresent
+            }
+            Ok(_) => PostOperationObservation::Gone,
+            Err(code) => PostOperationObservation::Inconclusive { code },
+        },
+    }
+}
+
+/// Whether a request names something no file operation may ever receive.
+///
+/// This is defence in depth behind the application's validator: the scan
+/// root has no in-snapshot parent to rescan, and a drive, volume, or share
+/// root must never be deleted whatever confirmation produced the request.
+pub(crate) fn is_forbidden_target(path: &Path, kind: TargetKind) -> bool {
+    kind == TargetKind::ScanRoot || is_filesystem_root(path)
 }
 
 /// Everything the STA needs for one recycle or permanent-delete request.
@@ -718,12 +771,17 @@ impl Drop for AdviseGuard<'_> {
 
 /// Runs one recycle or permanent-delete request and classifies the evidence.
 ///
-/// Identity validation runs first; every failure before `PerformOperations`
-/// is reported as `Failed` because nothing was queued or mutated. All COM
-/// objects are released before the function returns.
+/// The forbidden-target check and identity validation run first; every
+/// failure before `PerformOperations` is reported as `Failed` because nothing
+/// was queued or mutated. After the operation the exact path is re-inspected
+/// so a skipped item is never reported as removed. All COM objects are
+/// released before the function returns.
 pub(crate) fn run_delete(job: &DeleteJob<'_>) -> DestructiveOutcome {
     if job.cancel.load(Ordering::Acquire) {
         return DestructiveOutcome::CancelledBeforeMutation;
+    }
+    if is_forbidden_target(job.path, job.kind) {
+        return DestructiveOutcome::Failed { stage: FailureStage::ForbiddenTarget, code: None };
     }
     let assurance = match validate_target_identity(job.path, job.kind, job.identity) {
         Ok(assurance) => assurance,
@@ -819,6 +877,9 @@ pub(crate) fn run_delete(job: &DeleteJob<'_>) -> DestructiveOutcome {
     drop(sink);
     drop(operation);
 
+    // Observed after every COM object is released so the Shell holds no
+    // handle on the item while it is re-inspected.
+    let observation = observe_after_operation(job.path, job.kind, job.identity);
     let log = record.with_log(std::mem::take);
     let evidence = DeleteEvidence {
         mode: job.mode,
@@ -831,6 +892,7 @@ pub(crate) fn run_delete(job: &DeleteJob<'_>) -> DestructiveOutcome {
         finish: log.finish,
         perform,
         aborted,
+        observation,
     };
     classify_delete_evidence(&evidence)
 }
@@ -1261,5 +1323,86 @@ mod tests {
         assert!(is_missing_code(2));
         assert!(is_missing_code(3));
         assert!(!is_missing_code(5));
+        assert!(!is_missing_code(123), "ERROR_INVALID_NAME is not evidence of absence");
+    }
+
+    #[test]
+    fn post_operation_observation_distinguishes_gone_present_and_swapped() {
+        let directory = TestDirectory::new("observe");
+        let file = directory.path().join("target.bin");
+        fs::write(&file, b"payload").expect("write fixture");
+        let identity = read_file_identity(&file).expect("identity");
+
+        assert_eq!(
+            observe_after_operation(&file, TargetKind::File, Some(identity)),
+            PostOperationObservation::StillPresent
+        );
+        assert_eq!(
+            observe_after_operation(&file, TargetKind::File, None),
+            PostOperationObservation::StillPresent
+        );
+        assert_eq!(
+            observe_after_operation(directory.path(), TargetKind::Directory, None),
+            PostOperationObservation::StillPresent
+        );
+        // Without a bound identity only the kind can be compared: a directory
+        // where a file was confirmed means the confirmed file is gone.
+        assert_eq!(
+            observe_after_operation(directory.path(), TargetKind::File, None),
+            PostOperationObservation::Gone
+        );
+
+        fs::remove_file(&file).expect("remove fixture");
+        assert_eq!(
+            observe_after_operation(&file, TargetKind::File, Some(identity)),
+            PostOperationObservation::Gone
+        );
+        fs::write(&file, b"replacement").expect("recreate fixture");
+        assert_eq!(
+            observe_after_operation(&file, TargetKind::File, Some(identity)),
+            PostOperationObservation::Gone,
+            "a different object at the path means the confirmed one is gone"
+        );
+        assert!(file.exists(), "observation never mutates the fixture");
+    }
+
+    #[test]
+    fn run_delete_refuses_scan_and_filesystem_roots_before_any_native_call() {
+        let directory = TestDirectory::new("forbidden");
+        let sentinel = directory.path().join("sentinel.txt");
+        fs::write(&sentinel, b"survive").expect("write sentinel");
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let scan_root = DeleteJob {
+            owner: owner(),
+            path: directory.path(),
+            kind: TargetKind::ScanRoot,
+            identity: None,
+            mode: DeleteMode::Permanent,
+            cancel: &cancel,
+        };
+        assert_eq!(
+            run_delete(&scan_root),
+            DestructiveOutcome::Failed { stage: FailureStage::ForbiddenTarget, code: None }
+        );
+        assert_eq!(fs::read(&sentinel).expect("sentinel survives"), b"survive");
+
+        for root in [r"C:\", r"\\?\C:\", r"\\server\share\", r"\\?\Volume{1}\"] {
+            for mode in [DeleteMode::Recycle, DeleteMode::Permanent] {
+                let drive_root = DeleteJob {
+                    path: Path::new(root),
+                    kind: TargetKind::Directory,
+                    mode,
+                    ..scan_root
+                };
+                assert_eq!(
+                    run_delete(&drive_root),
+                    DestructiveOutcome::Failed { stage: FailureStage::ForbiddenTarget, code: None },
+                    "{root}"
+                );
+            }
+        }
+        assert!(is_forbidden_target(directory.path(), TargetKind::ScanRoot));
+        assert!(!is_forbidden_target(directory.path(), TargetKind::Directory));
     }
 }
