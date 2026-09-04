@@ -57,9 +57,11 @@ DiskPie will parse startup arguments with exact lexopt 0.3.2.
 1. The production entry point starts from `Parser::from_env`; tests use the
    iterable constructor. Filesystem values remain `OsString` and move directly
    into `PathBuf`.
-2. The supported grammar is `diskpie.exe [--] [PATH]`. Zero paths starts the
-   normal selection flow; one path becomes the initial scan request. Multiple
-   positional values are usage errors.
+2. The supported grammar is `diskpie.exe [--scan-path PATH | [--] PATH]`
+   (the `--scan-path` form was added by the 2026-09-04 addendum for the ADR
+   0009 Explorer verb). Zero paths starts the normal selection flow; one path
+   becomes the initial scan request. Multiple path values, positional or
+   through the option, are usage errors.
 3. Unknown options fail. `--` terminates option parsing so an option-like path
    is representable. Help and version are fixed ASCII protocol options.
 4. Argument parsing performs no UTF-8 conversion, display-string round trip,
