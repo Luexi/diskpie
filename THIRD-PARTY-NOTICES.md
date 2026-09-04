@@ -2912,8 +2912,8 @@ Used by:
 - smol_str 0.2.2
 - syn 2.0.119
 - syn 3.0.3
-- thiserror-impl 2.0.19
-- thiserror 2.0.19
+- thiserror-impl 2.0.20
+- thiserror 2.0.20
 - typeid 1.0.3
 - unic-langid-impl 0.9.6
 - unic-langid 0.9.6
