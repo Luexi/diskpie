@@ -8,6 +8,15 @@
 //! This first slice implements the folder picker. Future Shell actions can be
 //! added to [`ShellRequest`] while retaining the apartment, queue, message-pump,
 //! and shutdown machinery in this module.
+//!
+//! Shutdown is bounded. [`ShellService::request_shutdown`] never waits,
+//! [`ShellService::finish`] waits at most a caller-supplied deadline, and
+//! `Drop` performs atomic/`Arc` work only. A worker that is still inside a
+//! modal dialog after the deadline is transferred, together with the
+//! process-wide singleton claim, to one precreated bounded reaper thread that
+//! joins it before the claim is released. If that transfer is impossible the
+//! service fails closed: the claim is never released and no further Shell STA
+//! can start in this process.
 
 use std::{
     error::Error,
@@ -21,7 +30,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
         mpsc::{
             Receiver, SyncSender, TryRecvError as MpscTryRecvError, TrySendError, channel,
@@ -29,6 +38,7 @@ use std::{
         },
     },
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 use windows::{
     Win32::{
@@ -70,14 +80,30 @@ pub const MAX_REQUEST_CAPACITY: usize = 256;
 const FOLDER_DIALOG_CLIENT_GUID: GUID = GUID::from_u128(0x4b48f36d_68bf_49be_9e08_c08ca5afbd60);
 
 const WORKER_THREAD_NAME: &str = "diskpie-shell-sta";
+const REAPER_THREAD_NAME: &str = "diskpie-shell-reaper";
 const WAIT_HEALTH_INTERVAL_MS: u32 = 250;
+
+/// Maximum number of timed-out workers the process-wide reaper may hold.
+///
+/// Because the singleton claim travels with every queued worker and is only
+/// released after that worker joined, at most one live Shell STA can be queued
+/// at a time in practice. The small fixed capacity is a hard ceiling, not a
+/// throughput target.
+pub const SHELL_REAPER_CAPACITY: usize = 4;
+
+/// Interval between join-readiness checks inside [`ShellService::finish`].
+const FINISH_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 const STATE_STARTING: u8 = 0;
 const STATE_RUNNING: u8 = 1;
 const STATE_STOPPING: u8 = 2;
 const STATE_STOPPED: u8 = 3;
 
-static SERVICE_INSTANCE_CLAIMED: AtomicBool = AtomicBool::new(false);
+static PROCESS_REGISTRY: OnceLock<Arc<ShellInstanceRegistry>> = OnceLock::new();
+
+fn process_registry() -> Arc<ShellInstanceRegistry> {
+    Arc::clone(PROCESS_REGISTRY.get_or_init(|| Arc::new(ShellInstanceRegistry::new())))
+}
 
 /// Correlates a request with exactly one terminal dialog event.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -280,11 +306,24 @@ impl Error for TryReceiveError {}
 /// Fatal startup failure before a usable Shell STA exists.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShellServiceStartError {
-    InvalidQueueCapacity { capacity: usize },
+    InvalidQueueCapacity {
+        capacity: usize,
+    },
+    /// The singleton claim is held: a Shell STA is running, a timed-out STA has
+    /// not yet been joined by the reaper, or the lifecycle failed closed.
     AlreadyRunning,
-    CreateWakeEvent { hresult: i32 },
-    SpawnThread { os_code: Option<i32> },
-    InitializeCom { hresult: i32 },
+    /// The process-wide reaper thread could not be created, so no bounded
+    /// shutdown could be guaranteed for the new STA.
+    ReaperUnavailable,
+    CreateWakeEvent {
+        hresult: i32,
+    },
+    SpawnThread {
+        os_code: Option<i32>,
+    },
+    InitializeCom {
+        hresult: i32,
+    },
     WorkerExited,
 }
 
@@ -297,6 +336,9 @@ impl fmt::Display for ShellServiceStartError {
             ),
             Self::AlreadyRunning => {
                 formatter.write_str("a process-wide Shell STA is already running")
+            }
+            Self::ReaperUnavailable => {
+                formatter.write_str("the process-wide Shell reaper thread is unavailable")
             }
             Self::CreateWakeEvent { hresult } => write!(
                 formatter,
@@ -335,6 +377,22 @@ impl fmt::Display for ShellServiceShutdownError {
 }
 
 impl Error for ShellServiceShutdownError {}
+
+/// Typed outcome of the bounded [`ShellService::finish`] completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShellServiceFinish {
+    /// The worker exited within the deadline and was joined; the singleton
+    /// claim is released and a new service may start.
+    Exited { panicked: bool },
+    /// The deadline elapsed. The worker's join handle and the singleton claim
+    /// were transferred to the process-wide bounded reaper, which joins the
+    /// worker before releasing the claim.
+    TimedOutHandedToReaper,
+    /// The deadline elapsed and the reaper could not accept the worker. The
+    /// lifecycle failed closed: the claim stays held for the rest of the
+    /// process and no further Shell STA can start.
+    TimedOutReaperUnavailable,
+}
 
 /// Current externally observable lifecycle state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -438,20 +496,168 @@ struct WorkerStateGuard {
     shared: Arc<SharedState>,
 }
 
-struct ServiceInstanceClaim;
+/// Process-wide singleton bookkeeping: the instance claim, the fail-closed
+/// flag, and the precreated bounded reaper.
+///
+/// Production code uses exactly one registry ([`process_registry`]). Tests
+/// construct private registries so injected stalled or panicking workers
+/// cannot disturb each other or the real singleton.
+struct ShellInstanceRegistry {
+    claimed: AtomicBool,
+    fail_closed: AtomicBool,
+    reaper: OnceLock<Option<ShellReaper>>,
+}
+
+impl ShellInstanceRegistry {
+    fn new() -> Self {
+        Self {
+            claimed: AtomicBool::new(false),
+            fail_closed: AtomicBool::new(false),
+            reaper: OnceLock::new(),
+        }
+    }
+
+    /// Creates the reaper thread at most once. A creation failure is final.
+    fn ensure_reaper(&self) -> Result<&ShellReaper, ShellServiceStartError> {
+        self.reaper
+            .get_or_init(ShellReaper::start)
+            .as_ref()
+            .ok_or(ShellServiceStartError::ReaperUnavailable)
+    }
+
+    /// Returns the precreated reaper without initializing anything.
+    fn reaper(&self) -> Option<&ShellReaper> {
+        self.reaper.get().and_then(Option::as_ref)
+    }
+
+    #[cfg(test)]
+    fn is_claimed(&self) -> bool {
+        self.claimed.load(Ordering::Acquire)
+    }
+
+    fn is_fail_closed(&self) -> bool {
+        self.fail_closed.load(Ordering::Acquire)
+    }
+}
+
+/// Exclusive right to run the one Shell STA of a registry.
+///
+/// The claim is released when it is dropped, except after the registry failed
+/// closed: then the flag stays set forever because an unjoined STA may still
+/// be alive somewhere in the process.
+struct ServiceInstanceClaim {
+    registry: Arc<ShellInstanceRegistry>,
+}
 
 impl ServiceInstanceClaim {
-    fn acquire() -> Result<Self, ShellServiceStartError> {
-        SERVICE_INSTANCE_CLAIMED
+    fn acquire(registry: &Arc<ShellInstanceRegistry>) -> Result<Self, ShellServiceStartError> {
+        if registry.is_fail_closed() {
+            return Err(ShellServiceStartError::AlreadyRunning);
+        }
+        registry
+            .claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map(|_| Self)
+            .map(|_| Self { registry: Arc::clone(registry) })
             .map_err(|_| ShellServiceStartError::AlreadyRunning)
     }
 }
 
 impl Drop for ServiceInstanceClaim {
     fn drop(&mut self) {
-        SERVICE_INSTANCE_CLAIMED.store(false, Ordering::Release);
+        if !self.registry.is_fail_closed() {
+            self.registry.claimed.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// A timed-out worker and the claim that must outlive it.
+struct ReapRequest {
+    worker: JoinHandle<()>,
+    claim: ServiceInstanceClaim,
+}
+
+impl ReapRequest {
+    /// Joins the worker and only then releases the claim.
+    fn reap(self) {
+        let Self { worker, claim } = self;
+        let _exit = worker.join();
+        drop(claim);
+    }
+}
+
+/// One process-wide thread that joins timed-out Shell workers.
+///
+/// The queue is a fixed-capacity `sync_channel`; submission never blocks and
+/// never allocates a thread. Losing the receiver or filling the queue is
+/// reported to the caller, which then fails closed.
+struct ShellReaper {
+    sender: SyncSender<ReapRequest>,
+    _worker: Option<JoinHandle<()>>,
+}
+
+impl ShellReaper {
+    fn start() -> Option<Self> {
+        let (sender, receiver) = sync_channel(SHELL_REAPER_CAPACITY);
+        let worker = thread::Builder::new()
+            .name(REAPER_THREAD_NAME.to_owned())
+            .spawn(move || shell_reaper_loop(&receiver))
+            .ok()?;
+        Some(Self { sender, _worker: Some(worker) })
+    }
+
+    /// Hands a worker over without waiting. The payload is returned intact
+    /// when the queue is full or the reaper thread is gone.
+    fn try_submit(&self, request: ReapRequest) -> Result<(), ReapRequest> {
+        self.sender.try_send(request).map_err(|error| match error {
+            TrySendError::Full(request) | TrySendError::Disconnected(request) => request,
+        })
+    }
+
+    /// A reaper whose queue is already full and whose thread never drains it.
+    ///
+    /// The receiver is returned so the caller decides whether submissions
+    /// observe `Full` (receiver alive) or `Disconnected` (receiver dropped).
+    #[cfg(test)]
+    fn saturated_for_test() -> (Self, Receiver<ReapRequest>) {
+        let (sender, receiver) = sync_channel(SHELL_REAPER_CAPACITY);
+        for _ in 0..SHELL_REAPER_CAPACITY {
+            let registry = Arc::new(ShellInstanceRegistry::new());
+            let claim = ServiceInstanceClaim::acquire(&registry).expect("fresh registry");
+            let worker = thread::spawn(|| {});
+            sender.try_send(ReapRequest { worker, claim }).expect("capacity is exact");
+        }
+        (Self { sender, _worker: None }, receiver)
+    }
+}
+
+fn shell_reaper_loop(receiver: &Receiver<ReapRequest>) {
+    while let Ok(request) = receiver.recv() {
+        request.reap();
+    }
+}
+
+/// How the STA worker reacts once shutdown is requested.
+///
+/// Production always uses `Native`. The test-only variants model a worker
+/// that is stuck inside a modal dialog or that unwinds while stopping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerBehaviour {
+    Native,
+    #[cfg(test)]
+    StallAfterShutdown(Duration),
+    #[cfg(test)]
+    PanicAfterShutdown,
+}
+
+impl WorkerBehaviour {
+    fn observe_shutdown(self) {
+        match self {
+            Self::Native => {}
+            #[cfg(test)]
+            Self::StallAfterShutdown(duration) => thread::sleep(duration),
+            #[cfg(test)]
+            Self::PanicAfterShutdown => panic!("injected Shell STA shutdown panic"),
+        }
     }
 }
 
@@ -463,16 +669,22 @@ impl Drop for WorkerStateGuard {
 
 /// Handle to the one process-owned, message-pumping Shell STA.
 ///
-/// `submit` and `try_recv` never block. `shutdown` joins the worker and can
-/// therefore wait for a currently visible native modal dialog to return; the
-/// application's owner-window teardown should close that dialog during exit.
+/// `submit`, `try_recv`, and `request_shutdown` never block. The composition
+/// root completes the service with the bounded `finish`, outside any UI
+/// callback. `Drop` never joins: a worker that is still running is handed to
+/// the process-wide bounded reaper together with the singleton claim. The
+/// legacy `shutdown` still joins synchronously and can therefore wait for a
+/// visible native modal dialog to return; prefer `finish`.
 pub struct ShellService {
     request_tx: SyncSender<QueuedRequest>,
     event_rx: Receiver<CompletedRequest>,
     shared: Arc<SharedState>,
+    registry: Arc<ShellInstanceRegistry>,
     next_request_id: AtomicU64,
     worker: Option<JoinHandle<()>>,
     instance_claim: Option<ServiceInstanceClaim>,
+    /// `Some(panicked)` once this handle joined its worker itself.
+    joined: Option<bool>,
 }
 
 impl ShellService {
@@ -483,8 +695,19 @@ impl ShellService {
 
     /// Starts and handshakes with a dedicated STA worker.
     pub fn start_with_config(config: ShellServiceConfig) -> Result<Self, ShellServiceStartError> {
+        Self::start_in(process_registry(), config, WorkerBehaviour::Native)
+    }
+
+    fn start_in(
+        registry: Arc<ShellInstanceRegistry>,
+        config: ShellServiceConfig,
+        behaviour: WorkerBehaviour,
+    ) -> Result<Self, ShellServiceStartError> {
         let config = config.validate()?;
-        let instance_claim = ServiceInstanceClaim::acquire()?;
+        let instance_claim = ServiceInstanceClaim::acquire(&registry)?;
+        // The reaper is precreated so a later timed-out shutdown never has to
+        // create a thread and a creation failure surfaces here, not at drop.
+        registry.ensure_reaper()?;
         let wake = Arc::new(
             WakeEvent::create()
                 .map_err(|hresult| ShellServiceStartError::CreateWakeEvent { hresult })?,
@@ -497,7 +720,9 @@ impl ShellService {
 
         let worker = thread::Builder::new()
             .name(WORKER_THREAD_NAME.to_owned())
-            .spawn(move || worker_entry(request_rx, event_tx, startup_tx, worker_shared))
+            .spawn(move || {
+                worker_entry(request_rx, event_tx, startup_tx, worker_shared, behaviour);
+            })
             .map_err(|error| ShellServiceStartError::SpawnThread {
                 os_code: error.raw_os_error(),
             })?;
@@ -507,9 +732,11 @@ impl ShellService {
                 request_tx,
                 event_rx,
                 shared,
+                registry,
                 next_request_id: AtomicU64::new(1),
                 worker: Some(worker),
                 instance_claim: Some(instance_claim),
+                joined: None,
             }),
             Ok(Err(error)) => {
                 let _ = worker.join();
@@ -556,41 +783,125 @@ impl ShellService {
         self.shared.status()
     }
 
-    /// Requests stop, wakes the message-aware wait, and joins the STA.
+    /// Requests stop and wakes the message-aware wait without waiting.
     ///
-    /// The method is idempotent. Queued requests that have not started receive
-    /// `DialogEvent::Failed` with `ServiceShutdown` before the worker exits.
-    pub fn shutdown(&mut self) -> Result<(), ShellServiceShutdownError> {
-        self.shutdown_inner()
+    /// The method is idempotent and performs atomic work only, so it is safe
+    /// inside an egui callback. Queued requests that have not started receive
+    /// `DialogEvent::Failed` with `ServiceShutdown` before the worker exits. A
+    /// worker inside a native modal dialog observes the request only after
+    /// that dialog returns; the application's owner-window teardown should
+    /// close it during exit.
+    pub fn request_shutdown(&self) {
+        // Acceptance closes through the atomic state alone. A submit that
+        // already passed the Running check under the acceptance gate can still
+        // enqueue; the worker drains under that same gate after observing the
+        // request, so no accepted request is lost.
+        let _ = self.shared.lifecycle.compare_exchange(
+            STATE_RUNNING,
+            STATE_STOPPING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.shared.shutdown_requested.store(true, Ordering::Release);
+        // Signalling is an optimization backed by the bounded health timeout
+        // of the message-aware wait; the flag alone terminates the loop.
+        let _ = self.shared.wake.signal();
     }
 
-    fn shutdown_inner(&mut self) -> Result<(), ShellServiceShutdownError> {
+    /// Requests stop and waits at most `timeout` for the STA to exit.
+    ///
+    /// Call this from the composition root outside any UI callback. A worker
+    /// that has not exited by the deadline is transferred, with the singleton
+    /// claim, to the process-wide bounded reaper. When even that transfer is
+    /// impossible the lifecycle fails closed and reports it.
+    pub fn finish(mut self, timeout: Duration) -> ShellServiceFinish {
+        self.request_shutdown();
         let Some(worker) = self.worker.take() else {
-            return Ok(());
+            return ShellServiceFinish::Exited { panicked: self.joined.unwrap_or(false) };
         };
 
-        {
-            let _acceptance =
-                self.shared.acceptance.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _ = self.shared.lifecycle.compare_exchange(
-                STATE_RUNNING,
-                STATE_STOPPING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-            self.shared.shutdown_requested.store(true, Ordering::Release);
+        if wait_until_finished(&worker, timeout) {
+            let panicked = worker.join().is_err();
+            self.joined = Some(panicked);
+            self.instance_claim.take();
+            return ShellServiceFinish::Exited { panicked };
         }
-        let _ = self.shared.wake.signal();
 
-        let joined = worker.join().map_err(|_| ShellServiceShutdownError::WorkerPanicked);
+        let Some(claim) = self.instance_claim.take() else {
+            // Unreachable by construction: the claim is only taken together
+            // with the worker. Fail closed rather than release ownership.
+            self.registry.fail_closed.store(true, Ordering::Release);
+            return ShellServiceFinish::TimedOutReaperUnavailable;
+        };
+        if self.hand_to_reaper(ReapRequest { worker, claim }) {
+            ShellServiceFinish::TimedOutHandedToReaper
+        } else {
+            ShellServiceFinish::TimedOutReaperUnavailable
+        }
+    }
+
+    /// Requests stop, wakes the message-aware wait, and joins the STA.
+    ///
+    /// The method is idempotent and repeats the recorded join outcome. It can
+    /// block for as long as a visible modal dialog stays open; prefer
+    /// [`ShellService::finish`].
+    pub fn shutdown(&mut self) -> Result<(), ShellServiceShutdownError> {
+        self.request_shutdown();
+        let Some(worker) = self.worker.take() else {
+            return match self.joined {
+                Some(true) => Err(ShellServiceShutdownError::WorkerPanicked),
+                Some(false) | None => Ok(()),
+            };
+        };
+
+        let panicked = worker.join().is_err();
+        self.joined = Some(panicked);
         self.instance_claim.take();
-        joined
+        if panicked { Err(ShellServiceShutdownError::WorkerPanicked) } else { Ok(()) }
+    }
+
+    /// Transfers a live worker and its claim to the bounded reaper.
+    ///
+    /// Returns `false` after failing closed: the claim is retained for the
+    /// process lifetime and the detached worker is left to exit on its own.
+    fn hand_to_reaper(&self, request: ReapRequest) -> bool {
+        let rejected = match self.registry.reaper() {
+            Some(reaper) => match reaper.try_submit(request) {
+                Ok(()) => return true,
+                Err(request) => request,
+            },
+            None => request,
+        };
+        // Order matters: the flag must be set before the claim drops so the
+        // claim's `Drop` keeps the singleton marked as held.
+        self.registry.fail_closed.store(true, Ordering::Release);
+        drop(rejected);
+        false
     }
 }
 
 impl Drop for ShellService {
+    /// Atomic/`Arc` work only: never joins, never creates a thread.
     fn drop(&mut self) {
-        let _ = self.shutdown_inner();
+        self.request_shutdown();
+        if let (Some(worker), Some(claim)) = (self.worker.take(), self.instance_claim.take()) {
+            let _handed = self.hand_to_reaper(ReapRequest { worker, claim });
+        }
+    }
+}
+
+/// Polls join-readiness with bounded sleeps until `timeout` elapses.
+fn wait_until_finished(worker: &JoinHandle<()>, timeout: Duration) -> bool {
+    let started = Instant::now();
+    loop {
+        if worker.is_finished() {
+            return true;
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return false;
+        }
+        thread::sleep((timeout - elapsed).min(FINISH_POLL_INTERVAL));
     }
 }
 
@@ -678,6 +989,7 @@ fn worker_entry(
     event_tx: std::sync::mpsc::Sender<CompletedRequest>,
     startup_tx: SyncSender<Result<(), ShellServiceStartError>>,
     shared: Arc<SharedState>,
+    behaviour: WorkerBehaviour,
 ) {
     let _state_guard = WorkerStateGuard { shared: Arc::clone(&shared) };
 
@@ -703,7 +1015,8 @@ fn worker_entry(
     }
 
     let _apartment = apartment;
-    let outcome = catch_unwind(AssertUnwindSafe(|| worker_loop(&request_rx, &event_tx, &shared)));
+    let outcome =
+        catch_unwind(AssertUnwindSafe(|| worker_loop(&request_rx, &event_tx, &shared, behaviour)));
     match outcome {
         Ok(error) => stop_accepting_and_fail_queued(&request_rx, &event_tx, &shared, error),
         Err(payload) => {
@@ -722,9 +1035,11 @@ fn worker_loop(
     request_rx: &Receiver<QueuedRequest>,
     event_tx: &std::sync::mpsc::Sender<CompletedRequest>,
     shared: &SharedState,
+    behaviour: WorkerBehaviour,
 ) -> DialogError {
     loop {
         if shared.shutdown_requested.load(Ordering::Acquire) {
+            behaviour.observe_shutdown();
             return DialogError::service_shutdown();
         }
 
@@ -732,6 +1047,7 @@ fn worker_loop(
             Ok(queued) => {
                 if shared.shutdown_requested.load(Ordering::Acquire) {
                     fail_request(queued, event_tx, shared, DialogError::service_shutdown());
+                    behaviour.observe_shutdown();
                     return DialogError::service_shutdown();
                 }
                 if let Err(error) = guard_request_execution(queued, event_tx, shared, || {
@@ -1339,5 +1655,247 @@ mod tests {
         let units = [b'C' as u16, b':' as u16, b'\\' as u16, 0xD800, b'x' as u16];
         let value = os_string_from_wide(&units);
         assert_eq!(value.encode_wide().collect::<Vec<_>>(), units);
+    }
+
+    // Lifecycle tests below use private registries so injected stalled or
+    // panicking workers never touch the real process singleton and can run in
+    // parallel with each other.
+
+    const STALL: Duration = Duration::from_millis(1_000);
+    const RESTART_DEADLINE: Duration = Duration::from_secs(10);
+    const FINISH_TIMEOUT: Duration = Duration::from_millis(100);
+
+    fn private_registry() -> Arc<ShellInstanceRegistry> {
+        Arc::new(ShellInstanceRegistry::new())
+    }
+
+    fn start_in(registry: &Arc<ShellInstanceRegistry>, behaviour: WorkerBehaviour) -> ShellService {
+        ShellService::start_in(
+            Arc::clone(registry),
+            ShellServiceConfig { request_capacity: 1 },
+            behaviour,
+        )
+        .expect("a fresh worker thread can initialize an STA")
+    }
+
+    fn start_error(
+        registry: &Arc<ShellInstanceRegistry>,
+    ) -> Result<ShellService, ShellServiceStartError> {
+        ShellService::start_in(
+            Arc::clone(registry),
+            ShellServiceConfig { request_capacity: 1 },
+            WorkerBehaviour::Native,
+        )
+    }
+
+    /// Retries `start` until it succeeds and returns how long that took.
+    fn wait_for_restart(registry: &Arc<ShellInstanceRegistry>) -> (ShellService, Duration) {
+        let started = Instant::now();
+        loop {
+            match start_error(registry) {
+                Ok(service) => return (service, started.elapsed()),
+                Err(ShellServiceStartError::AlreadyRunning) => {}
+                Err(error) => panic!("unexpected restart failure: {error}"),
+            }
+            assert!(
+                started.elapsed() < RESTART_DEADLINE,
+                "reaper did not release the claim of the stalled worker"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn request_shutdown_is_nonblocking_idempotent_and_closes_acceptance() {
+        let registry = private_registry();
+        let service = start_in(&registry, WorkerBehaviour::Native);
+
+        let started = Instant::now();
+        service.request_shutdown();
+        service.request_shutdown();
+        assert!(started.elapsed() < FINISH_TIMEOUT);
+        assert!(matches!(
+            service.status(),
+            ShellServiceStatus::Stopping | ShellServiceStatus::Stopped
+        ));
+        assert_eq!(service.submit_folder(owner()), Err(SubmitError::ServiceUnavailable));
+
+        assert_eq!(
+            service.finish(Duration::from_secs(5)),
+            ShellServiceFinish::Exited { panicked: false }
+        );
+        assert!(!registry.is_claimed());
+        assert!(!registry.is_fail_closed());
+    }
+
+    #[test]
+    fn finish_of_a_clean_worker_reports_exit_and_allows_restart() {
+        let registry = private_registry();
+        let service = start_in(&registry, WorkerBehaviour::Native);
+
+        assert_eq!(
+            service.finish(Duration::from_secs(5)),
+            ShellServiceFinish::Exited { panicked: false }
+        );
+        assert!(!registry.is_claimed());
+
+        let restarted = start_error(&registry).expect("claim was released by finish");
+        assert_eq!(restarted.status(), ShellServiceStatus::Running);
+        assert_eq!(
+            restarted.finish(Duration::from_secs(5)),
+            ShellServiceFinish::Exited { panicked: false }
+        );
+    }
+
+    #[test]
+    fn finish_hands_a_stalled_worker_to_the_reaper_within_the_deadline() {
+        let registry = private_registry();
+        let service = start_in(&registry, WorkerBehaviour::StallAfterShutdown(STALL));
+
+        let requested = Instant::now();
+        let outcome = service.finish(FINISH_TIMEOUT);
+        let elapsed = requested.elapsed();
+        assert_eq!(outcome, ShellServiceFinish::TimedOutHandedToReaper);
+        assert!(elapsed < FINISH_TIMEOUT * 2, "finish took {elapsed:?}");
+
+        // The stalled STA still owns the singleton claim.
+        assert!(registry.is_claimed());
+        assert!(!registry.is_fail_closed());
+        assert!(matches!(start_error(&registry), Err(ShellServiceStartError::AlreadyRunning)));
+
+        let (restarted, _) = wait_for_restart(&registry);
+        assert!(
+            requested.elapsed() >= STALL,
+            "restart succeeded before the stalled worker could have exited"
+        );
+        assert_eq!(
+            restarted.finish(Duration::from_secs(5)),
+            ShellServiceFinish::Exited { panicked: false }
+        );
+    }
+
+    #[test]
+    fn drop_of_a_stalled_service_returns_promptly_and_restart_waits_for_real_exit() {
+        let registry = private_registry();
+        let service = start_in(&registry, WorkerBehaviour::StallAfterShutdown(STALL));
+
+        let dropped = Instant::now();
+        drop(service);
+        let elapsed = dropped.elapsed();
+        assert!(elapsed < FINISH_TIMEOUT * 2, "drop took {elapsed:?}");
+
+        assert!(registry.is_claimed());
+        assert!(matches!(start_error(&registry), Err(ShellServiceStartError::AlreadyRunning)));
+
+        let (restarted, _) = wait_for_restart(&registry);
+        assert!(dropped.elapsed() >= STALL);
+        assert!(!registry.is_fail_closed());
+        drop(restarted);
+    }
+
+    #[test]
+    fn panicking_worker_reports_the_panic_and_releases_the_claim() {
+        let registry = private_registry();
+        let service = start_in(&registry, WorkerBehaviour::PanicAfterShutdown);
+
+        assert_eq!(
+            service.finish(Duration::from_secs(5)),
+            ShellServiceFinish::Exited { panicked: true }
+        );
+        assert!(!registry.is_claimed());
+        assert!(!registry.is_fail_closed());
+
+        let restarted = start_error(&registry).expect("panic releases the claim");
+        assert_eq!(
+            restarted.finish(Duration::from_secs(5)),
+            ShellServiceFinish::Exited { panicked: false }
+        );
+    }
+
+    #[test]
+    fn legacy_shutdown_repeats_a_recorded_worker_panic() {
+        let registry = private_registry();
+        let mut service = start_in(&registry, WorkerBehaviour::PanicAfterShutdown);
+
+        assert_eq!(service.shutdown(), Err(ShellServiceShutdownError::WorkerPanicked));
+        assert_eq!(service.shutdown(), Err(ShellServiceShutdownError::WorkerPanicked));
+        assert!(!registry.is_claimed());
+    }
+
+    #[test]
+    fn saturated_reaper_fails_closed_and_retains_the_claim() {
+        let registry = private_registry();
+        let (reaper, _receiver_kept_alive) = ShellReaper::saturated_for_test();
+        assert!(registry.reaper.set(Some(reaper)).is_ok());
+        let stall = Duration::from_millis(300);
+        let service = start_in(&registry, WorkerBehaviour::StallAfterShutdown(stall));
+
+        let requested = Instant::now();
+        let outcome = service.finish(FINISH_TIMEOUT);
+        assert!(requested.elapsed() < FINISH_TIMEOUT * 2);
+        assert_eq!(outcome, ShellServiceFinish::TimedOutReaperUnavailable);
+
+        assert!(registry.is_fail_closed());
+        assert!(registry.is_claimed());
+        assert!(matches!(start_error(&registry), Err(ShellServiceStartError::AlreadyRunning)));
+
+        // Even after the detached worker has certainly exited, the lifecycle
+        // stays closed: nobody joined that thread, so nobody may reuse the STA.
+        thread::sleep(stall * 2);
+        assert!(registry.is_claimed());
+        assert!(matches!(start_error(&registry), Err(ShellServiceStartError::AlreadyRunning)));
+    }
+
+    #[test]
+    fn disconnected_reaper_returns_the_payload_without_blocking() {
+        let (reaper, receiver) = ShellReaper::saturated_for_test();
+        drop(receiver);
+        let registry = private_registry();
+        let claim = ServiceInstanceClaim::acquire(&registry).expect("fresh registry");
+
+        let started = Instant::now();
+        let rejected = reaper
+            .try_submit(ReapRequest { worker: thread::spawn(|| {}), claim })
+            .expect_err("a dead reaper cannot accept ownership");
+        assert!(started.elapsed() < FINISH_TIMEOUT);
+        assert!(registry.is_claimed());
+        drop(rejected);
+        assert!(!registry.is_claimed(), "a healthy registry releases a dropped claim");
+    }
+
+    #[test]
+    fn reaper_joins_the_worker_before_releasing_its_claim() {
+        let reaper = ShellReaper::start().expect("test reaper thread starts");
+        let registry = private_registry();
+        let claim = ServiceInstanceClaim::acquire(&registry).expect("fresh registry");
+        let hold = Duration::from_millis(200);
+        let worker = thread::spawn(move || thread::sleep(hold));
+
+        let submitted = Instant::now();
+        reaper.try_submit(ReapRequest { worker, claim }).ok().expect("reaper has capacity");
+        assert!(registry.is_claimed());
+
+        while registry.is_claimed() {
+            assert!(submitted.elapsed() < RESTART_DEADLINE, "reaper never released the claim");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(submitted.elapsed() >= hold, "claim released before the worker exited");
+    }
+
+    #[test]
+    fn precreated_reaper_is_shared_by_every_start_in_a_registry() {
+        let registry = private_registry();
+        assert!(registry.reaper().is_none());
+        let first = start_in(&registry, WorkerBehaviour::Native);
+        let first_reaper: *const ShellReaper =
+            registry.reaper().expect("start precreates the reaper");
+        assert_eq!(
+            first.finish(Duration::from_secs(5)),
+            ShellServiceFinish::Exited { panicked: false }
+        );
+        let second = start_in(&registry, WorkerBehaviour::Native);
+        let second_reaper: *const ShellReaper = registry.reaper().expect("reaper persists");
+        assert!(std::ptr::eq(first_reaper, second_reaper));
+        drop(second);
     }
 }

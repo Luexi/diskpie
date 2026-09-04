@@ -168,3 +168,39 @@ Accepted tradeoffs:
   contract with no duplicate binding graph.
 - Supersede this ADR if Windows removes or materially changes the documented
   Shell/COM contracts on a required OS version.
+
+## Decision note 2026-09-03: bounded shutdown and singleton retirement
+
+The original `Drop` joined the STA worker without a deadline, so a visible
+modal folder dialog or a stalled Shell call could block process exit
+indefinitely. The lifecycle now has three explicit stages:
+
+1. `ShellService::request_shutdown` is nonblocking and idempotent. It moves the
+   lifecycle to `Stopping`, sets the shutdown flag, and signals the wake event;
+   the message-aware wait's bounded health timeout guarantees the loop observes
+   the flag even if signalling fails.
+2. `ShellService::finish(timeout)` is the composition root's explicit
+   completion point, called outside every UI callback. It polls join-readiness
+   with bounded sleeps and returns `ShellServiceFinish::Exited { panicked }`,
+   `TimedOutHandedToReaper`, or `TimedOutReaperUnavailable`.
+3. `Drop` performs atomic/`Arc` work only. A worker that is still running is
+   handed, together with its singleton claim, to one process-wide reaper
+   through a nonblocking `try_send`; it never joins.
+
+The reaper is a single thread created at most once, precreated during
+`ShellService::start` so a creation failure surfaces as
+`ShellServiceStartError::ReaperUnavailable` instead of at drop. Its queue is a
+fixed `sync_channel` of `SHELL_REAPER_CAPACITY` (4) entries. Each entry owns
+the `JoinHandle` and the `ServiceInstanceClaim`; the reaper joins first and
+releases the claim afterwards, so a second Shell STA cannot start while the
+old one is still alive. If the queue is full or the reaper thread is gone the
+lifecycle fails closed: the claim is retained for the rest of the process,
+`start` keeps returning `AlreadyRunning`, and the detached worker exits on its
+own. There is no per-drop thread, no unbounded queue, and no `mem::forget`.
+
+The legacy blocking `shutdown` remains for callers that need a synchronous
+join and repeats a recorded worker panic on every later call. Validation uses
+injected worker behaviours (stalled for a fixed duration, or panicking after
+the shutdown request) on private singleton registries so the tests prove
+bounded `finish`, bounded `Drop`, single ownership, restart only after the
+real exit, and the fail-closed outcome without showing any UI.

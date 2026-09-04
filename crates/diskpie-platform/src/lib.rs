@@ -42,8 +42,9 @@ pub use windows::settings_file::{
 #[cfg(windows)]
 pub use windows::shell_service::{
     DialogError, DialogErrorStage, DialogEvent, DialogRequestId, FolderDialogRequest, OwnerWindow,
-    ShellRequest, ShellService, ShellServiceConfig, ShellServiceShutdownError,
-    ShellServiceStartError, ShellServiceStatus, SubmitError, TryReceiveError,
+    SHELL_REAPER_CAPACITY, ShellRequest, ShellService, ShellServiceConfig, ShellServiceFinish,
+    ShellServiceShutdownError, ShellServiceStartError, ShellServiceStatus, SubmitError,
+    TryReceiveError,
 };
 #[cfg(windows)]
 pub use windows::startup_feedback::{attach_parent_console, show_startup_failure};
