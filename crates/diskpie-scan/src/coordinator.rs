@@ -175,6 +175,86 @@ struct WorkItem {
     storage_class: StorageClass,
 }
 
+/// Pending directories kept as one FIFO per volume with round-robin rotation.
+///
+/// Dispatch inspects only the head of each volume queue, so a volume whose
+/// permit cap is saturated never forces a scan over every pending directory.
+/// A large scan can hold hundreds of thousands of pending directories on one
+/// volume, which made the previous global-queue search quadratic whenever a
+/// rotational or removable cap was reached.
+#[derive(Debug, Default)]
+struct PendingQueue {
+    queues: HashMap<VolumeKey, VecDeque<WorkItem>>,
+    rotation: VecDeque<VolumeKey>,
+    len: usize,
+}
+
+impl PendingQueue {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn clear(&mut self) {
+        self.queues.clear();
+        self.rotation.clear();
+        self.len = 0;
+    }
+
+    fn push_back(&mut self, work: WorkItem) {
+        let queue = self.queues.entry(work.volume).or_default();
+        if queue.is_empty() {
+            self.rotation.push_back(work.volume);
+        }
+        queue.push_back(work);
+        self.len += 1;
+    }
+
+    /// Returns an item to the head of its volume queue after a full worker
+    /// channel rejected it, keeping that volume next in rotation.
+    fn push_front(&mut self, work: WorkItem) {
+        let queue = self.queues.entry(work.volume).or_default();
+        if queue.is_empty() {
+            self.rotation.push_front(work.volume);
+        } else {
+            self.rotation.retain(|volume| *volume != work.volume);
+            self.rotation.push_front(work.volume);
+        }
+        queue.push_front(work);
+        self.len += 1;
+    }
+
+    /// Pops the oldest directory of the first volume in rotation that
+    /// `eligible` accepts and moves that volume to the back of the rotation so
+    /// every volume with available permits gets a turn.
+    fn pop_eligible(&mut self, mut eligible: impl FnMut(VolumeKey) -> bool) -> Option<WorkItem> {
+        for _ in 0..self.rotation.len() {
+            let volume = self.rotation.pop_front()?;
+            if !eligible(volume) {
+                self.rotation.push_back(volume);
+                continue;
+            }
+            let Some(queue) = self.queues.get_mut(&volume) else {
+                continue;
+            };
+            let work = queue.pop_front();
+            if queue.is_empty() {
+                self.queues.remove(&volume);
+            } else {
+                self.rotation.push_back(volume);
+            }
+            if let Some(work) = work {
+                self.len -= 1;
+                return Some(work);
+            }
+        }
+        None
+    }
+}
+
 #[derive(Debug)]
 struct RawBatch {
     entries: Vec<FsEntry>,
@@ -336,7 +416,7 @@ impl Drop for WorkerPool {
 struct CoordinatorState {
     generation: ScanGeneration,
     next_id: u64,
-    pending: VecDeque<WorkItem>,
+    pending: PendingQueue,
     active_by_volume: HashMap<VolumeKey, usize>,
     volume_caps: HashMap<VolumeKey, usize>,
     counters: ScanCounters,
@@ -368,7 +448,7 @@ fn run_coordinator(
     let mut state = CoordinatorState {
         generation,
         next_id: 0,
-        pending: VecDeque::new(),
+        pending: PendingQueue::default(),
         active_by_volume: HashMap::new(),
         volume_caps: HashMap::new(),
         counters: ScanCounters::default(),
@@ -527,10 +607,26 @@ fn coordinator_loop(
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if cancellation_observed {
+                    // Every worker sender is gone, so a worker that gave up
+                    // its final `Done` because the result channel was full at
+                    // cancellation time can never report its slot idle.
+                    // Release those slots here instead of misreporting the
+                    // cancelled scan as a channel failure.
+                    let abandoned = pool
+                        .slots
+                        .iter()
+                        .filter_map(|slot| {
+                            slot.busy.as_ref().map(|busy| (slot.id, busy.work.directory))
+                        })
+                        .collect::<Vec<_>>();
+                    for (worker, directory) in abandoned {
+                        let _ = release_worker(state, pool, worker, directory);
+                    }
+                    return TerminalState::Cancelled;
+                }
                 if pool.all_idle() && state.pending.is_empty() {
-                    return if cancellation_observed {
-                        TerminalState::Cancelled
-                    } else if state.partial {
+                    return if state.partial {
                         TerminalState::Partial
                     } else {
                         TerminalState::Complete
@@ -550,14 +646,14 @@ fn dispatch_available(
         if slot.busy.is_some() {
             continue;
         }
-        let Some(position) = state.pending.iter().position(|work| {
-            let active = state.active_by_volume.get(&work.volume).copied().unwrap_or(0);
-            let cap = state.volume_caps.get(&work.volume).copied().unwrap_or(1);
+        let CoordinatorState { pending, active_by_volume, volume_caps, .. } = &mut *state;
+        let Some(work) = pending.pop_eligible(|volume| {
+            let active = active_by_volume.get(&volume).copied().unwrap_or(0);
+            let cap = volume_caps.get(&volume).copied().unwrap_or(1);
             active < cap
         }) else {
             continue;
         };
-        let work = state.pending.remove(position).expect("position came from pending queue");
         let sender = slot.sender.as_ref().ok_or(ScanFailure::WorkerDisconnected {
             worker: slot.id,
             directory: Some(work.directory),
@@ -1147,5 +1243,85 @@ fn send_worker_message(
             }
             Err(TrySendError::Disconnected(_)) => return false,
         }
+    }
+}
+
+#[cfg(test)]
+mod pending_queue_tests {
+    use super::*;
+
+    fn item(volume: u128, directory: u64) -> WorkItem {
+        WorkItem {
+            generation: ScanGeneration::new(1),
+            directory: ScanNodeId::from_raw(directory),
+            path: PathBuf::from(format!("v{volume}/d{directory}")),
+            volume: VolumeKey::new(volume),
+            storage_class: StorageClass::Unknown,
+        }
+    }
+
+    fn drain(queue: &mut PendingQueue, eligible: impl Fn(VolumeKey) -> bool) -> Vec<(u128, u64)> {
+        let mut popped = Vec::new();
+        while let Some(work) = queue.pop_eligible(&eligible) {
+            popped.push((work.volume.get(), work.directory.raw()));
+        }
+        popped
+    }
+
+    #[test]
+    fn keeps_fifo_within_a_volume_and_rotates_across_volumes() {
+        let mut queue = PendingQueue::default();
+        for directory in 0..3 {
+            queue.push_back(item(1, directory));
+        }
+        queue.push_back(item(2, 10));
+        queue.push_back(item(2, 11));
+        assert_eq!(queue.len(), 5);
+
+        let order = drain(&mut queue, |_| true);
+        assert_eq!(order, vec![(1, 0), (2, 10), (1, 1), (2, 11), (1, 2)]);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn a_saturated_volume_is_skipped_without_losing_its_work() {
+        let mut queue = PendingQueue::default();
+        for directory in 0..1_000 {
+            queue.push_back(item(1, directory));
+        }
+        queue.push_back(item(2, 5_000));
+
+        let saturated = VolumeKey::new(1);
+        assert_eq!(drain(&mut queue, |volume| volume != saturated), vec![(2, 5_000)]);
+        assert_eq!(queue.len(), 1_000, "the saturated volume keeps every pending directory");
+        assert!(queue.pop_eligible(|volume| volume != saturated).is_none());
+
+        let released = drain(&mut queue, |_| true);
+        assert_eq!(released.len(), 1_000);
+        assert!(released.windows(2).all(|pair| pair[0].1 < pair[1].1), "FIFO preserved");
+    }
+
+    #[test]
+    fn a_rejected_item_returns_to_the_head_of_its_volume_and_rotation() {
+        let mut queue = PendingQueue::default();
+        queue.push_back(item(1, 0));
+        queue.push_back(item(1, 1));
+        queue.push_back(item(2, 2));
+
+        let first = queue.pop_eligible(|_| true).expect("first item");
+        assert_eq!(first.directory.raw(), 0);
+        queue.push_front(first);
+
+        assert_eq!(drain(&mut queue, |_| true), vec![(1, 0), (2, 2), (1, 1)]);
+    }
+
+    #[test]
+    fn clear_empties_every_volume() {
+        let mut queue = PendingQueue::default();
+        queue.push_back(item(1, 0));
+        queue.push_back(item(2, 1));
+        queue.clear();
+        assert!(queue.is_empty());
+        assert!(queue.pop_eligible(|_| true).is_none());
     }
 }

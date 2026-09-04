@@ -3,7 +3,7 @@ use crate::{
     PermitCaps, ScanEvent, ScanFs, ScanGeneration, ScanOptions, ScanRequest, ScanRoot, ScanSession,
     StorageClass, TerminalState, VisitControl, start_scan, start_scan_with_cancel,
 };
-use diskpie_core::{EntryKind, MetricSource, OwnMetrics, SizeMetric, VolumeKey};
+use diskpie_core::{EntryKind, MetricSource, OwnMetrics, ReparseKind, SizeMetric, VolumeKey};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -184,6 +184,47 @@ fn wait_until(timeout: Duration, predicate: impl Fn() -> bool) {
         assert!(Instant::now() < deadline, "condition timed out");
         thread::sleep(Duration::from_millis(1));
     }
+}
+
+#[test]
+fn directory_reparse_points_are_reported_but_never_enqueued() {
+    let junction = || {
+        DirectoryItem::Entry(FsEntry::new(
+            "junction",
+            EntryKind::ReparsePoint(ReparseKind::Directory),
+            OwnMetrics::ZERO_BY_POLICY,
+        ))
+    };
+    let fake = Arc::new(FakeFs::default());
+    fake.insert("root", FakeDirectory::items(vec![junction(), directory("real"), file("leaf")]));
+    // Following the reparse point would rediscover itself forever. The fake
+    // provider makes that visible: the loop only terminates if the coordinator
+    // never asks to enumerate the junction at all.
+    fake.insert(Path::new("root").join("junction"), FakeDirectory::items(vec![junction()]));
+    fake.insert(Path::new("root").join("real"), FakeDirectory::items(vec![file("inner")]));
+
+    let session = start_scan(
+        Arc::clone(&fake) as Arc<dyn ScanFs>,
+        request(7, vec![root("root", 7, StorageClass::Unknown)], options(2)),
+    )
+    .expect("start scan");
+    let (events, terminal) = collect_session(session);
+
+    assert_eq!(terminal.state, TerminalState::Complete);
+    assert_eq!(fake.visits(), 2, "only the root and the real directory are enumerated");
+    let kinds = events
+        .iter()
+        .filter_map(|event| match event {
+            ScanEvent::Batch(batch) => Some(batch.entries.iter().map(|entry| entry.kind)),
+            _ => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    assert!(
+        kinds.contains(&EntryKind::ReparsePoint(ReparseKind::Directory)),
+        "the reparse point itself is still reported as a boundary entry"
+    );
+    assert_eq!(kinds.iter().filter(|kind| **kind == EntryKind::Directory).count(), 1);
 }
 
 #[test]
@@ -426,9 +467,13 @@ fn cancellation_mid_directory_returns_promptly_with_partial_progress() {
 #[test]
 fn cancellation_escapes_full_event_and_result_channels() {
     let fake = Arc::new(FakeFs::default());
+    // A small per-item delay keeps the directory from finishing before the
+    // cancellation below is requested, so the assertion cannot race the scan
+    // on a fast or lightly loaded machine.
     fake.insert(
         "root",
-        FakeDirectory::items((0..1_000).map(|index| file(format!("file-{index}"))).collect()),
+        FakeDirectory::items((0..1_000).map(|index| file(format!("file-{index}"))).collect())
+            .with_item_delay(Duration::from_micros(200)),
     );
     let mut scan_options = options(1);
     scan_options.batch_entries = 1;
