@@ -15,6 +15,14 @@ diskpie-diagnostics-*.zip
 .DS_Store
 Thumbs.db
 
+# Local agent working directories. The reviewed project skill lives in
+# .agents/skills and .claude/skills; everything else under these roots is
+# session state that must never reach the public repository.
+/.agents/*
+!/.agents/skills/
+/.claude/*
+!/.claude/skills/
+
 # Protected legacy reference material must never enter this repository.
 **/Scanner.exe
 **/Scanner.lang

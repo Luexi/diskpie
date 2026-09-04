@@ -23,7 +23,6 @@ eframe = { version = "=0.35.0", default-features = false, features = [
     "accesskit",
     "default_fonts",
     "glow",
-    "persistence",
     "wayland",
     "x11",
 ] }
@@ -32,16 +31,25 @@ lexopt = "=0.3.2"
 ron = "=0.12.2"
 serde = { version = "=1.0.229", features = ["derive"] }
 thiserror = "=2.0.19"
+tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = [
+    "fmt",
+    "std",
+    "tracing-log",
+] }
 unic-langid = "=0.9.6"
 windows = { version = "=0.62.2", default-features = false, features = [
     "std",
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Storage_CloudFilters",
     "Win32_Storage_FileSystem",
     "Win32_Security",
     "Win32_System_Com",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
