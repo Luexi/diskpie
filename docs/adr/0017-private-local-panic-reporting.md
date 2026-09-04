@@ -138,3 +138,73 @@ Accepted tradeoffs:
   policy, and legal review; it cannot amend this ADR silently.
 - Evidence shows the hook itself contributes to recursive failure; simplify or
   disable the marker rather than collecting broader state.
+
+## Implementation note (2026-09-04)
+
+The marker transport is wired on Windows through
+`diskpie_platform::WindowsMarkerSession` and the sealed bridge in
+`crates/diskpie/src/panic_marker.rs`. Native evidence:
+
+- Preparation opens the crash directory once with `CreateFileW`
+  (`FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT`), keeps that
+  handle for the process lifetime, and proves it has not moved with
+  `GetFinalPathNameByHandleW` before every later operation. Each slot is
+  opened through the retained parent's final path with
+  `FILE_FLAG_OPEN_REPARSE_POINT`, inspected with `GetFileInformationByHandle`
+  and `GetFileInformationByHandleEx` (`FileAttributeTagInfo`, `FileIdInfo`),
+  and required to be a regular, single-link, non-reparse direct child. The
+  bounded read uses `GetFileSizeEx` plus `ReadFile` on that same handle.
+- The hook path uses only precomputed UTF-16 buffers: `CreateFileW` with
+  `CREATE_NEW | FILE_SHARE_NONE | FILE_FLAG_WRITE_THROUGH` for the sibling,
+  `WriteFile`, `FlushFileBuffers`, and a size/identity/link-count
+  verification, then the namespace commit. It performs no heap allocation,
+  takes no lock, and never re-resolves a path.
+- The commit is `NtSetInformationFile` with `FileRenameInformationEx`, the
+  retained parent as `RootDirectory`, a plain relative name, and
+  `FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS`
+  when the inspected target still exists, or no flags (create-only) when it
+  was and still is missing, so a concurrently created entry fails atomically.
+  `SetFileInformationByHandle` cannot express a `RootDirectory` (ADR 0019) and
+  is used only for `FileDispositionInfo` on an already inspected handle.
+- Every outcome is classified from post-operation identities: the sibling
+  identity observed at the target name is `Committed`; an unchanged target is
+  `NotCommitted` and the never-renamed sibling is deleted through its own
+  handle. A rename that failed while the sibling handle still resolves to the
+  sibling name under the retained parent (`GetFinalPathNameByHandleW`), such
+  as a create-only rename that lost to a concurrent creator, is also
+  `NotCommitted`: the sibling provably never moved, so deleting it through
+  its handle cannot discard a copy of the marker and a stale
+  `last-panic.write` cannot block every later commit. Errors 1176/1177 or an
+  otherwise unprovable result are `CommittedButUnverified`, which preserves
+  every copy for the rest of the session. The identity is recorded in a
+  lock-free atomic record; a contended or unverified record disables
+  reconciliation and makes later commits in that session refuse the
+  session's own marker (either marker already proves the panic).
+- Reconciliation is identity-conditional: the target is re-inspected through
+  the retained parent on a handle opened without `FILE_SHARE_DELETE`, so no
+  other opener can unlink, rename, or replace that object while its identity
+  and session token are checked. `Delete` is applied to that very object with
+  `FileDispositionInfo` on the same handle and has no race window. `Restore`
+  prepares and verifies the sibling while the pin is held, releases the pin,
+  and immediately issues the handle-relative replace rename; Windows has no
+  compare-and-rename, so a replacement raced into that single system call
+  would be superseded and reported as `RestoredPrevious`. This residual is
+  the same window ADR 0019 accepts for settings and is disclosed in the
+  capability documentation. A different identity, token, directory, reparse
+  point, or hard link returns `OwnershipLost` without touching anything; any
+  post-operation doubt returns `PreservedUncertain` and deletes nothing.
+- The hook path holds two nested fixed 32 Ki-unit UTF-16 stack buffers
+  (about 128 KiB) while validating handles against the retained parent, so
+  the panicking thread needs that much free stack; no heap is used.
+- Item 7 is implemented more strictly than allowed: the installed hook never
+  chains the previous hook in any build. The hook returns normally and never
+  swallows the panic. The subprocess test panics on the libtest worker thread
+  that installed the hook (`thread_role=main`), not on the process main
+  thread; it asserts the redacted marker and the non-success exit status that
+  libtest's failure accounting produces because the panic propagated.
+- The composition root mints `ShutdownQuiescenceProof` only from a
+  `DiagnosticsQuiescenceReceipt`, a private-field value that
+  `LocalDiagnostics::finish` produces solely when the worker guard received
+  the worker's own completion message; a bare `DiagnosticsFinishStatus` cannot
+  mint one. The runtime receipt is a placeholder that the scan/Shell wiring
+  must replace with joined receipts.

@@ -6,6 +6,7 @@
 pub mod cli;
 #[cfg(windows)]
 mod local_diagnostics;
+pub mod panic_marker;
 mod shell;
 pub mod storage;
 pub mod sunburst_view;
@@ -16,6 +17,7 @@ use std::{process::ExitCode, sync::Arc};
 use eframe::egui;
 
 use diskpie_app::settings::SettingsSession;
+use panic_marker::{CrashMarkerError, FinishCleanOutcome};
 use storage::SettingsDocumentStore;
 
 #[cfg(windows)]
@@ -33,6 +35,26 @@ use diskpie_platform::{
 };
 #[cfg(windows)]
 use local_diagnostics::{InitialRetentionOutcome, LocalDiagnostics};
+#[cfg(windows)]
+use panic_marker::{
+    CrashMarkerErrorKind, CrashRuntime, RuntimeQuiescenceReceipt, ShutdownQuiescenceProof,
+};
+
+/// What happened to this session's crash marker at exit.
+///
+/// Diagnostics are already finished when the value is known, so it is not
+/// logged; it is returned from `run` for a future explicit export.
+#[derive(Debug)]
+#[allow(dead_code, reason = "retained for a future diagnostics export")]
+enum CrashMarkerFinish {
+    /// No process hook was installed in this session.
+    NotInstalled,
+    /// No quiescence proof could be minted; the runtime was dropped and every
+    /// marker state was preserved.
+    PreservedWithoutProof,
+    /// Clean-session reconciliation ran with a proof.
+    Reconciled(Result<FinishCleanOutcome, CrashMarkerError>),
+}
 
 fn main() -> ExitCode {
     let startup = match cli::parse_env() {
@@ -51,7 +73,8 @@ fn main() -> ExitCode {
         }
     };
 
-    match run(startup) {
+    let (result, _crash_marker_finish) = run(startup);
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             report_startup_failure(&format!("diskpie: application startup failed: {error}"));
@@ -84,25 +107,27 @@ fn report_startup_failure(text: &str) {
 }
 
 #[cfg(windows)]
-fn run(startup: cli::StartupRequest) -> eframe::Result {
+fn run(startup: cli::StartupRequest) -> (eframe::Result, CrashMarkerFinish) {
     let mut services = WindowsStartupServices::prepare();
     let settings = SettingsSession::load(&mut services.settings_store);
     services.start_diagnostics(&settings);
 
     let (result, session) = run_ui(startup, settings, services.optional_services_unavailable);
 
+    // Exit order: settings publication, diagnostics stop/finish, then crash
+    // marker reconciliation with the proof minted from that finish.
     services.publish_settings(session);
-    services.finish();
-    result
+    let crash_marker_finish = services.finish();
+    (result, crash_marker_finish)
 }
 
 #[cfg(not(windows))]
-fn run(startup: cli::StartupRequest) -> eframe::Result {
+fn run(startup: cli::StartupRequest) -> (eframe::Result, CrashMarkerFinish) {
     // ADR 0019 item 10: other desktop targets stay explicitly nonpersistent
     // until they implement an equivalent adapter.
     let mut store = SettingsDocumentStore::unavailable("settings.storage.unavailable");
     let settings = SettingsSession::load(&mut store);
-    run_ui(startup, settings, true).0
+    (run_ui(startup, settings, true).0, CrashMarkerFinish::NotInstalled)
 }
 
 fn run_ui(
@@ -167,6 +192,7 @@ struct WindowsStartupServices {
     settings_unavailable: Option<ErrorClass>,
     settings_store: SettingsDocumentStore,
     diagnostics: Option<LocalDiagnostics>,
+    crash_runtime: Option<CrashRuntime>,
     optional_services_unavailable: bool,
 }
 
@@ -196,17 +222,20 @@ impl WindowsStartupServices {
             settings_unavailable,
             settings_store: SettingsDocumentStore::from_read(initial_read),
             diagnostics: None,
+            crash_runtime: None,
             optional_services_unavailable: unavailable,
         }
     }
 
-    /// Starts local logging at the level the loaded settings request and
-    /// records the startup facts that are already known.
+    /// Starts local logging at the level the loaded settings request, records
+    /// the startup facts that are already known, and then installs the crash
+    /// marker hook before any UI, scan, or Shell thread exists.
     fn start_diagnostics(&mut self, settings: &SettingsSession) {
         let level = DiagnosticLevel::from(settings.settings().diagnostic_level);
         self.diagnostics =
             prepare_diagnostics(&self.paths, level, &mut self.optional_services_unavailable);
-        if self.paths.create_directory(ProjectPathFacility::Crashes).is_err() {
+        let crashes_ready = self.paths.create_directory(ProjectPathFacility::Crashes).is_ok();
+        if !crashes_ready {
             self.optional_services_unavailable = true;
         }
         if self.diagnostics.as_ref().is_some_and(|diagnostics| {
@@ -215,19 +244,59 @@ impl WindowsStartupServices {
             self.optional_services_unavailable = true;
         }
 
-        let Some(diagnostics) = self.diagnostics.as_ref() else {
+        if let Some(diagnostics) = self.diagnostics.as_ref() {
+            diagnostics.record(application_event(DiagnosticCode::AppStarted));
+            if !self.paths.issues.is_empty() {
+                diagnostics.record(DiagnosticEvent::new(DiagnosticCode::ProjectPathsUnavailable));
+            }
+            if let Some(class) = self.settings_unavailable {
+                diagnostics.record(classified_event(DiagnosticCode::SettingsUnavailable, class));
+            }
+            if let Some(event) = settings_recovery_event(settings.warning()) {
+                diagnostics.record(event);
+            }
+        }
+
+        self.install_crash_runtime(crashes_ready);
+    }
+
+    /// Installs the process panic hook through the retained-handle session
+    /// (ADR 0017 item 1). Failure is nonfatal: the marker facility is reported
+    /// unavailable and startup continues without a hook.
+    fn install_crash_runtime(&mut self, crashes_ready: bool) {
+        let directory =
+            crashes_ready.then(|| self.paths.directory(ProjectPathFacility::Crashes)).flatten();
+        let Some(directory) = directory else {
+            self.optional_services_unavailable = true;
+            self.record(classified_event(
+                DiagnosticCode::PanicMarkerUnavailable,
+                ErrorClass::NotFound,
+            ));
             return;
         };
-        diagnostics.record(application_event(DiagnosticCode::AppStarted));
-        if !self.paths.issues.is_empty() {
-            diagnostics.record(DiagnosticEvent::new(DiagnosticCode::ProjectPathsUnavailable));
+        let runtime = match CrashRuntime::install(directory) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                self.optional_services_unavailable = true;
+                self.record(classified_event(
+                    DiagnosticCode::PanicMarkerUnavailable,
+                    error_class_from_crash_marker(error.kind),
+                ));
+                return;
+            }
+        };
+        for failure in runtime.preparation_failures() {
+            self.record(classified_event(
+                DiagnosticCode::PanicMarkerUnavailable,
+                error_class_from_crash_marker(failure.kind),
+            ));
         }
-        if let Some(class) = self.settings_unavailable {
-            diagnostics.record(classified_event(DiagnosticCode::SettingsUnavailable, class));
+        // ADR 0017 item 8: presence is the only fact recorded; no cause is
+        // inferred. A read failure was already reported above.
+        if matches!(runtime.prepared_previous_marker(), Ok(Some(_marker))) {
+            self.record(DiagnosticEvent::new(DiagnosticCode::PanicMarkerFound));
         }
-        if let Some(event) = settings_recovery_event(settings.warning()) {
-            diagnostics.record(event);
-        }
+        self.crash_runtime = Some(runtime);
     }
 
     /// Publishes the settings session handed back by the shell through the
@@ -265,27 +334,51 @@ impl WindowsStartupServices {
         self.record(event);
     }
 
-    /// Reports the bounded logging health observed during the run, then
-    /// flushes and joins the diagnostics worker outside any UI callback.
-    fn finish(self) {
-        let Some(diagnostics) = self.diagnostics else {
-            return;
+    /// Reports the bounded logging health observed during the run, flushes
+    /// and joins the diagnostics worker outside any UI callback, and only
+    /// then reconciles the crash marker with a proof minted from that join.
+    ///
+    /// Without a completed diagnostics finish there is no proof: the runtime
+    /// is dropped, which preserves every marker state by construction. That
+    /// deliberately includes a session whose diagnostics never started: no
+    /// worker exists to join, but there is also no receipt to certify it, so
+    /// a marker from a caught worker panic stays on disk and the next start
+    /// records `panic.marker_found`. A "diagnostics never started" receipt
+    /// would be mintable without any join and is therefore not offered.
+    fn finish(self) -> CrashMarkerFinish {
+        let Self { diagnostics, crash_runtime, .. } = self;
+        let diagnostics_receipt = diagnostics.and_then(|diagnostics| {
+            let counters = diagnostics.counters();
+            if counters.dropped_events > 0 {
+                diagnostics.record(count_event(
+                    DiagnosticCode::DiagnosticQueueDropped,
+                    counters.dropped_events,
+                ));
+            }
+            if counters.write_failures > 0 {
+                diagnostics.record(count_event(
+                    DiagnosticCode::DiagnosticWriteFailed,
+                    counters.write_failures,
+                ));
+            }
+            diagnostics.record(application_event(DiagnosticCode::AppStopped));
+            // The receipt is minted inside `LocalDiagnostics::finish` from
+            // the worker's own completion message and cannot be built here.
+            diagnostics.finish().quiescence
+        });
+
+        let Some(runtime) = crash_runtime else {
+            return CrashMarkerFinish::NotInstalled;
         };
-        let counters = diagnostics.counters();
-        if counters.dropped_events > 0 {
-            diagnostics.record(count_event(
-                DiagnosticCode::DiagnosticQueueDropped,
-                counters.dropped_events,
-            ));
-        }
-        if counters.write_failures > 0 {
-            diagnostics.record(count_event(
-                DiagnosticCode::DiagnosticWriteFailed,
-                counters.write_failures,
-            ));
-        }
-        diagnostics.record(application_event(DiagnosticCode::AppStopped));
-        let _final_outcome = diagnostics.finish();
+        let Some(diagnostics_receipt) = diagnostics_receipt else {
+            drop(runtime);
+            return CrashMarkerFinish::PreservedWithoutProof;
+        };
+        let proof = ShutdownQuiescenceProof::from_receipts(
+            diagnostics_receipt,
+            RuntimeQuiescenceReceipt::no_runtime_composed(),
+        );
+        CrashMarkerFinish::Reconciled(runtime.finish_clean(proof))
     }
 
     fn record(&self, event: DiagnosticEvent) {
@@ -340,6 +433,26 @@ const fn error_class_from_settings_file(kind: SettingsFileErrorKind) -> ErrorCla
         SettingsFileErrorKind::AlreadyExists => ErrorClass::Busy,
         SettingsFileErrorKind::Unsupported => ErrorClass::Unsupported,
         SettingsFileErrorKind::PartialReplacement | SettingsFileErrorKind::Io => ErrorClass::Io,
+    }
+}
+
+#[cfg(windows)]
+const fn error_class_from_crash_marker(kind: CrashMarkerErrorKind) -> ErrorClass {
+    match kind {
+        CrashMarkerErrorKind::AccessDenied => ErrorClass::AccessDenied,
+        CrashMarkerErrorKind::NotFound => ErrorClass::NotFound,
+        CrashMarkerErrorKind::InvalidData
+        | CrashMarkerErrorKind::InvalidMarker
+        | CrashMarkerErrorKind::OwnershipConflict => ErrorClass::InvalidData,
+        CrashMarkerErrorKind::Busy | CrashMarkerErrorKind::PreservedSibling => ErrorClass::Busy,
+        CrashMarkerErrorKind::StorageFull | CrashMarkerErrorKind::MarkerTooLarge => {
+            ErrorClass::ResourceExhausted
+        }
+        CrashMarkerErrorKind::Unsupported => ErrorClass::Unsupported,
+        CrashMarkerErrorKind::HookAlreadyInstalled | CrashMarkerErrorKind::PanickingThread => {
+            ErrorClass::Internal
+        }
+        CrashMarkerErrorKind::Other => ErrorClass::Io,
     }
 }
 

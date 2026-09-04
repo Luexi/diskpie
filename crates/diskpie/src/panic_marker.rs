@@ -30,6 +30,9 @@ use std::{
     io::{self, Read, Write},
 };
 
+#[cfg(windows)]
+use crate::local_diagnostics::DiagnosticsQuiescenceReceipt;
+
 /// Maximum size of a complete panic marker, in bytes.
 pub const MAX_MARKER_BYTES: usize = 4 * 1024;
 
@@ -353,6 +356,9 @@ pub(crate) struct MarkerSnapshot {
 }
 
 impl MarkerSnapshot {
+    /// Only the Windows bridge and the tests build snapshots from raw slot
+    /// bytes; other targets have no native store.
+    #[cfg(any(windows, test))]
     pub(crate) fn from_bytes(bytes: Vec<u8>) -> Result<Self, MarkerStoreFailure> {
         if bytes.len() > MAX_MARKER_BYTES {
             return Err(MarkerStoreFailure::new(MarkerStoreFailureKind::MarkerTooLarge, None));
@@ -460,12 +466,17 @@ pub(crate) trait PreparedMarkerCapability:
     fn commit(&self, contents: &[u8]) -> MarkerCommitResult;
 
     /// Reconciles only the expected session marker after shutdown quiescence.
-    /// `AtomicFileIdentity` implementations must make the identity check and
-    /// mutation one native conditional operation, and must conditionally clean
-    /// an owned sibling without touching any other token or file identity. The
-    /// bridge must flush explicitly and must not use unsupported
-    /// `REPLACEFILE_WRITE_THROUGH`. Any post-operation uncertainty returns
-    /// `PreservedUncertain` and preserves every known complete copy.
+    /// `AtomicFileIdentity` implementations must check identity and token on
+    /// a retained handle that pins the object against unlink and replacement,
+    /// must apply `Delete` to that very inspected object as one native
+    /// conditional operation, and may apply `Restore` only by an atomic
+    /// rename over the pinned object immediately after releasing that pin;
+    /// the adapter must document any residual window of that release. They
+    /// must conditionally clean an owned sibling without touching any other
+    /// token or file identity. The bridge must flush explicitly and must not
+    /// use unsupported `REPLACEFILE_WRITE_THROUGH`. Any post-operation
+    /// uncertainty returns `PreservedUncertain` and preserves every known
+    /// complete copy.
     fn reconcile_if_owned(
         &self,
         expected_owner: SessionToken,
@@ -503,24 +514,7 @@ impl MarkerStore for StdMarkerStore {
         let paths = MarkerPaths { target: target.to_owned(), sibling: sibling.to_owned() };
         let target = read_snapshot_slot(&paths.target);
         let sibling = read_snapshot_slot(&paths.sibling);
-        let recovery = match (&target, &sibling) {
-            (_, MarkerSlotSnapshot::Unavailable(failure))
-            | (MarkerSlotSnapshot::Unavailable(failure), MarkerSlotSnapshot::Present(_)) => {
-                PreparationRecovery::Uncertain(*failure)
-            }
-            (MarkerSlotSnapshot::Present(target), MarkerSlotSnapshot::Present(sibling))
-                if target.owner != sibling.owner =>
-            {
-                PreparationRecovery::KnownCopyPreserved(MarkerStoreFailure::new(
-                    MarkerStoreFailureKind::OwnershipConflict,
-                    None,
-                ))
-            }
-            (_, MarkerSlotSnapshot::Present(_)) => PreparationRecovery::KnownCopyPreserved(
-                MarkerStoreFailure::new(MarkerStoreFailureKind::PreservedSibling, None),
-            ),
-            (_, MarkerSlotSnapshot::Missing) => PreparationRecovery::Ready,
-        };
+        let recovery = classify_recovery(&target, &sibling);
         let target_present = matches!(target, MarkerSlotSnapshot::Present(_));
         let sibling_present = matches!(sibling, MarkerSlotSnapshot::Present(_));
         let capability =
@@ -614,6 +608,203 @@ impl PreparedMarkerCapability for StdPreparedMarkerCapability {
             deleted = true;
         }
         Ok(deleted)
+    }
+}
+
+/// Classifies the two fixed slots captured by a store's preparation.
+///
+/// A present sibling is a preserved known copy that blocks cleanup until an
+/// explicit decision; an unavailable slot makes the whole preparation
+/// uncertain.
+fn classify_recovery(
+    target: &MarkerSlotSnapshot,
+    sibling: &MarkerSlotSnapshot,
+) -> PreparationRecovery {
+    match (target, sibling) {
+        (_, MarkerSlotSnapshot::Unavailable(failure))
+        | (MarkerSlotSnapshot::Unavailable(failure), MarkerSlotSnapshot::Present(_)) => {
+            PreparationRecovery::Uncertain(*failure)
+        }
+        (MarkerSlotSnapshot::Present(target), MarkerSlotSnapshot::Present(sibling))
+            if target.owner != sibling.owner =>
+        {
+            PreparationRecovery::KnownCopyPreserved(MarkerStoreFailure::new(
+                MarkerStoreFailureKind::OwnershipConflict,
+                None,
+            ))
+        }
+        (_, MarkerSlotSnapshot::Present(_)) => PreparationRecovery::KnownCopyPreserved(
+            MarkerStoreFailure::new(MarkerStoreFailureKind::PreservedSibling, None),
+        ),
+        (_, MarkerSlotSnapshot::Missing) => PreparationRecovery::Ready,
+    }
+}
+
+/// Windows bridge from the sealed capability contract to the retained-handle
+/// platform session.
+///
+/// The bridge forwards the two fixed paths exactly once during preparation.
+/// Afterwards it holds no path: commit, reconciliation, and explicit deletion
+/// operate on the handles, identities, and precomputed buffers retained by
+/// [`WindowsMarkerSession`](diskpie_platform::WindowsMarkerSession). The
+/// bridge contains no `unsafe` code.
+#[cfg(windows)]
+mod native {
+    use std::{path::Path, sync::Arc};
+
+    use diskpie_platform::{
+        DiagnosticFileError, DiagnosticFileErrorKind, MarkerCommitStatus, MarkerReconcileAction,
+        MarkerReconcileOutcome, MarkerSlotState, WindowsMarkerSession,
+    };
+
+    use super::{
+        MAX_MARKER_BYTES, MarkerCommitResult, MarkerSlotSnapshot, MarkerSnapshot, MarkerStore,
+        MarkerStoreFailure, MarkerStoreFailureKind, OwnedReconcileAction, OwnedReconcileOutcome,
+        OwnershipReconciliation, PreparedMarkerCapability, PreparedMarkerSession,
+        PreparedMarkerView, ReplacementSemantics, SessionToken, ValidationPolicy,
+        classify_recovery, sealed, validate_marker,
+    };
+
+    /// Production Windows store: prepares one native session per install.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub(super) struct WindowsMarkerStore;
+
+    impl sealed::Store for WindowsMarkerStore {}
+
+    impl MarkerStore for WindowsMarkerStore {
+        fn prepare(
+            &self,
+            target: &Path,
+            sibling: &Path,
+        ) -> Result<PreparedMarkerSession, MarkerStoreFailure> {
+            let session =
+                WindowsMarkerSession::prepare(target, sibling).map_err(failure_from_native)?;
+            let target = snapshot_from_slot(session.target_slot());
+            let sibling = snapshot_from_slot(session.sibling_slot());
+            let recovery = classify_recovery(&target, &sibling);
+            Ok(PreparedMarkerSession::new(
+                Arc::new(WindowsPreparedCapability { session }),
+                PreparedMarkerView { target, sibling },
+                recovery,
+            ))
+        }
+    }
+
+    fn snapshot_from_slot(slot: MarkerSlotState<'_>) -> MarkerSlotSnapshot {
+        match slot {
+            MarkerSlotState::Missing => MarkerSlotSnapshot::Missing,
+            MarkerSlotState::Present(bytes) => match MarkerSnapshot::from_bytes(bytes.to_vec()) {
+                Ok(snapshot) => MarkerSlotSnapshot::Present(snapshot),
+                Err(failure) => MarkerSlotSnapshot::Unavailable(failure),
+            },
+            MarkerSlotState::Unavailable(error) => {
+                MarkerSlotSnapshot::Unavailable(failure_from_native(error))
+            }
+        }
+    }
+
+    /// Maps the path-free platform error onto the store failure vocabulary.
+    pub(super) const fn failure_from_native(error: DiagnosticFileError) -> MarkerStoreFailure {
+        let kind = match error.kind {
+            DiagnosticFileErrorKind::AccessDenied => MarkerStoreFailureKind::AccessDenied,
+            DiagnosticFileErrorKind::NotFound => MarkerStoreFailureKind::NotFound,
+            DiagnosticFileErrorKind::InvalidDestination | DiagnosticFileErrorKind::ReparsePoint => {
+                MarkerStoreFailureKind::InvalidData
+            }
+            DiagnosticFileErrorKind::OwnedDestination => MarkerStoreFailureKind::OwnershipConflict,
+            DiagnosticFileErrorKind::InvalidContent => MarkerStoreFailureKind::InvalidMarker,
+            DiagnosticFileErrorKind::TooLarge => MarkerStoreFailureKind::MarkerTooLarge,
+            DiagnosticFileErrorKind::AlreadyExists => MarkerStoreFailureKind::Busy,
+            DiagnosticFileErrorKind::PartialReplacement => MarkerStoreFailureKind::PreservedSibling,
+            DiagnosticFileErrorKind::Unsupported => MarkerStoreFailureKind::Unsupported,
+            DiagnosticFileErrorKind::Io => MarkerStoreFailureKind::Other,
+        };
+        MarkerStoreFailure::new(kind, error.os_code)
+    }
+
+    struct WindowsPreparedCapability {
+        session: WindowsMarkerSession,
+    }
+
+    impl sealed::PreparedCapability for WindowsPreparedCapability {}
+
+    impl PreparedMarkerCapability for WindowsPreparedCapability {
+        /// Handle-relative `FileRenameInformationEx` with POSIX semantics makes
+        /// the replacement atomically visible; the platform session does not
+        /// claim directory-entry durability across power loss.
+        fn replacement_semantics(&self) -> ReplacementSemantics {
+            ReplacementSemantics::AtomicVisibility
+        }
+
+        /// The session checks identity and token on a handle opened without
+        /// delete sharing, deletes through that very handle, and restores by
+        /// an atomic rename issued immediately after releasing it (Windows
+        /// has no compare-and-rename; the platform documents that single-call
+        /// window). Results are classified from post-operation identities.
+        fn ownership_reconciliation(&self) -> OwnershipReconciliation {
+            OwnershipReconciliation::AtomicFileIdentity
+        }
+
+        fn commit(&self, contents: &[u8]) -> MarkerCommitResult {
+            if contents.len() > MAX_MARKER_BYTES {
+                return MarkerCommitResult::not_committed(MarkerStoreFailure::new(
+                    MarkerStoreFailureKind::MarkerTooLarge,
+                    None,
+                ));
+            }
+            if validate_marker(contents, ValidationPolicy::Current).is_err() {
+                return MarkerCommitResult::not_committed(MarkerStoreFailure::new(
+                    MarkerStoreFailureKind::InvalidMarker,
+                    None,
+                ));
+            }
+            match self.session.commit(contents) {
+                MarkerCommitStatus::Committed => MarkerCommitResult::committed(),
+                MarkerCommitStatus::NotCommitted(error) => {
+                    MarkerCommitResult::not_committed(failure_from_native(error))
+                }
+                // The platform preserved every known copy; the runtime keeps
+                // this session permanently conservative.
+                MarkerCommitStatus::CommittedButUnverified(error) => {
+                    MarkerCommitResult::committed_but_unverified(failure_from_native(error))
+                }
+            }
+        }
+
+        fn reconcile_if_owned(
+            &self,
+            expected_owner: SessionToken,
+            action: OwnedReconcileAction<'_>,
+        ) -> Result<OwnedReconcileOutcome, MarkerStoreFailure> {
+            let native_action = match action {
+                OwnedReconcileAction::Restore(previous) => MarkerReconcileAction::Restore(previous),
+                OwnedReconcileAction::Delete => MarkerReconcileAction::Delete,
+            };
+            let owner_check = |bytes: &[u8]| {
+                validate_marker(bytes, ValidationPolicy::Previewable)
+                    .is_ok_and(|validated| validated.owner == expected_owner)
+            };
+            self.session
+                .reconcile_if_owned(native_action, &owner_check)
+                .map(|outcome| match outcome {
+                    MarkerReconcileOutcome::RestoredPrevious => {
+                        OwnedReconcileOutcome::RestoredPrevious
+                    }
+                    MarkerReconcileOutcome::RemovedSessionMarker => {
+                        OwnedReconcileOutcome::RemovedSessionMarker
+                    }
+                    MarkerReconcileOutcome::OwnershipLost => OwnedReconcileOutcome::OwnershipLost,
+                    MarkerReconcileOutcome::MarkerMissing => OwnedReconcileOutcome::MarkerMissing,
+                    MarkerReconcileOutcome::PreservedUncertain => {
+                        OwnedReconcileOutcome::PreservedUncertain
+                    }
+                })
+                .map_err(failure_from_native)
+        }
+
+        fn delete_explicit(&self) -> Result<bool, MarkerStoreFailure> {
+            self.session.delete_explicit().map_err(failure_from_native)
+        }
     }
 }
 
@@ -839,18 +1030,69 @@ pub struct CrashRuntime {
 
 /// Explicit proof that every panic-capable provider has stopped.
 ///
-/// The private field makes the value unforgeable to API callers. There is no
-/// production constructor until the composite coordinator can require joined
-/// receipts from UI, scan, layout, shell, and every extension/provider worker.
-/// A detached provider invalidates any future proof.
+/// The private field makes the value unforgeable to API callers. The only
+/// production constructor is [`Self::from_receipts`], which demands one typed
+/// receipt per owned worker family; a receipt can only be minted from real
+/// join evidence. A detached provider invalidates any future proof.
+///
+/// Only the Windows composition root and the tests coordinate a shutdown,
+/// so the proof and its receipts exist on no other target.
+#[cfg(any(windows, test))]
 #[derive(Debug)]
 pub(crate) struct ShutdownQuiescenceProof {
     _private: (),
 }
 
+#[cfg(any(windows, test))]
 impl ShutdownQuiescenceProof {
+    /// Assembles the proof from the receipts of every worker family the
+    /// composition root owns. Adding a worker family means adding a receipt
+    /// parameter here, so a caller cannot forget new evidence silently.
+    ///
+    /// The diagnostics receipt is minted only by
+    /// [`LocalDiagnostics::finish`](crate::local_diagnostics::LocalDiagnostics::finish)
+    /// when the worker guard received the worker's own completion message;
+    /// `HandedOff` and `WorkerFailed` leave a thread that may still run (or
+    /// may have died panicking) under the process-wide reaper and never carry
+    /// one, so the crash runtime is dropped and the marker is preserved.
+    #[cfg(windows)]
+    pub(crate) const fn from_receipts(
+        diagnostics: DiagnosticsQuiescenceReceipt,
+        runtime: RuntimeQuiescenceReceipt,
+    ) -> Self {
+        // The receipts are consumed, not inspected: their private fields are
+        // the evidence, and only their minting modules can produce them.
+        let _joined_diagnostics_worker = diagnostics;
+        let RuntimeQuiescenceReceipt { _private: () } = runtime;
+        Self { _private: () }
+    }
+
     #[cfg(test)]
     const fn for_test() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Receipt for the scan, layout, and Shell runtime workers.
+///
+/// The scan runtime, layout worker, and Shell service are not yet composed by
+/// the executable: today the shell spawns no thread, so the only owned worker
+/// is the diagnostics writer. This receipt is therefore a placeholder that
+/// proves nothing beyond "no runtime was composed". The UI wiring that starts
+/// those services MUST replace [`Self::no_runtime_composed`] with a
+/// constructor that consumes the joined receipts of every runtime worker;
+/// keeping the placeholder after that point would forge quiescence.
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) struct RuntimeQuiescenceReceipt {
+    _private: (),
+}
+
+#[cfg(windows)]
+impl RuntimeQuiescenceReceipt {
+    /// Evidence that no scan/layout/Shell runtime was ever started in this
+    /// process. Valid only while the executable composes none of them.
+    pub(crate) const fn no_runtime_composed() -> Self {
         Self { _private: () }
     }
 }
@@ -872,13 +1114,17 @@ pub enum FinishCleanOutcome {
 }
 
 impl CrashRuntime {
-    /// Installs the local hook with the standard-library best-effort store.
+    /// Installs the local hook with this target's production store.
     ///
-    /// Windows intentionally has no such entry point: production Windows must
-    /// inject a native capability-retaining store with `install_with_store`.
-    #[cfg(not(windows))]
+    /// The crash directory must already have been resolved and created by
+    /// the project-path adapter (ADR 0017 item 1). On Windows the
+    /// retained-handle session is prepared once here: it keeps the parent
+    /// directory handle and the bounded previous-marker snapshot, and the
+    /// hook afterwards commits only prebuilt bounded data through it. Other
+    /// targets use the standard-library best-effort store, which never
+    /// reconciles at shutdown.
     pub fn install(crashes_directory: &Path) -> Result<Self, CrashMarkerError> {
-        Self::install_with_store(crashes_directory, Arc::new(StdMarkerStore))
+        Self::install_with_store(crashes_directory, Arc::new(production_store()))
     }
 
     /// Installs the hook with a sealed crate-controlled platform adapter.
@@ -996,6 +1242,7 @@ impl CrashRuntime {
     /// The proof must come from the composite shutdown coordinator after every
     /// panic-capable worker has stopped. Without it there is no cleanup API;
     /// dropping the runtime preserves all marker state.
+    #[cfg(any(windows, test))]
     pub(crate) fn finish_clean(
         self,
         _proof: ShutdownQuiescenceProof,
@@ -1069,16 +1316,28 @@ impl fmt::Debug for CrashRuntime {
     }
 }
 
+/// The store used by every production entry point on this target.
+#[cfg(windows)]
+fn production_store() -> impl MarkerStore {
+    native::WindowsMarkerStore
+}
+
+#[cfg(not(windows))]
+fn production_store() -> impl MarkerStore {
+    StdMarkerStore
+}
+
 /// Reads a bounded marker for explicit preview/export.
 ///
 /// The schema/version/OS/architecture tuple must match an exact compile-time
 /// allowlist. Generic semver strings are rejected; a cross-version/architecture
 /// marker is accepted only when that exact shipped tuple remains listed.
 /// If the target is missing, a valid preserved sibling remains previewable.
-#[cfg(not(windows))]
+/// While a [`CrashRuntime`] is live, prefer its retained
+/// [`CrashRuntime::prepared_previous_marker`] over preparing a second session.
 pub fn preview_marker(crashes_directory: &Path) -> Result<Option<MarkerPreview>, CrashMarkerError> {
     let paths = MarkerPaths::new(crashes_directory);
-    let prepared = StdMarkerStore
+    let prepared = production_store()
         .prepare(&paths.target, &paths.sibling)
         .map_err(|failure| CrashMarkerError::from_store(CrashMarkerOperation::Preview, failure))?;
     preview_prepared(&prepared)
@@ -1127,10 +1386,13 @@ fn preview_marker_with_store(
 }
 
 /// Explicitly deletes validated fixed target/sibling markers.
-#[cfg(not(windows))]
+///
+/// A fresh session inspects both slots and deletes only through handles whose
+/// identities still match that inspection; a swapped object is preserved and
+/// reported as an ownership conflict.
 pub fn delete_marker(crashes_directory: &Path) -> Result<bool, CrashMarkerError> {
     let paths = MarkerPaths::new(crashes_directory);
-    let prepared = StdMarkerStore
+    let prepared = production_store()
         .prepare(&paths.target, &paths.sibling)
         .map_err(|failure| CrashMarkerError::from_store(CrashMarkerOperation::Delete, failure))?;
     delete_prepared(prepared)
@@ -1741,8 +2003,26 @@ mod tests {
         session_panicked: bool,
         commit_observation: u8,
     ) -> CrashRuntime {
+        runtime_with_capability(
+            capability,
+            previous_marker,
+            recovery_degraded,
+            session_panicked,
+            commit_observation,
+        )
+    }
+
+    /// Builds a runtime around any sealed capability, including the real
+    /// platform adapter, without installing the process hook.
+    fn runtime_with_capability(
+        capability: Arc<dyn PreparedMarkerCapability>,
+        previous_marker: PreviousMarkerState,
+        recovery_degraded: bool,
+        session_panicked: bool,
+        commit_observation: u8,
+    ) -> CrashRuntime {
         let state = Arc::new(HookState {
-            capability: capability as Arc<dyn PreparedMarkerCapability>,
+            capability,
             markers: HookMarkers::new(42, TEST_TOKEN).expect("prebuild hook markers"),
             replacement_semantics: ReplacementSemantics::AtomicAndDurable,
             ownership_reconciliation: OwnershipReconciliation::AtomicFileIdentity,
@@ -2326,5 +2606,326 @@ mod tests {
                 .owner,
             first
         );
+    }
+
+    #[cfg(windows)]
+    mod native_bridge {
+        use super::*;
+        use crate::panic_marker::native::{WindowsMarkerStore, failure_from_native};
+        use diskpie_platform::{
+            DiagnosticFileError, DiagnosticFileErrorKind, DiagnosticFileOperation,
+        };
+
+        fn prepare_native(directory: &Path) -> PreparedMarkerSession {
+            let paths = MarkerPaths::new(directory);
+            WindowsMarkerStore
+                .prepare(&paths.target, &paths.sibling)
+                .expect("prepare the native marker session")
+        }
+
+        fn native_runtime(
+            prepared: PreparedMarkerSession,
+            previous_marker: PreviousMarkerState,
+        ) -> CrashRuntime {
+            runtime_with_capability(
+                prepared.capability,
+                previous_marker,
+                false,
+                false,
+                COMMIT_NOT_ATTEMPTED,
+            )
+        }
+
+        #[test]
+        fn native_capability_reports_truthful_semantics() {
+            let directory = TestDirectory::new("native-semantics");
+            let prepared = prepare_native(directory.path());
+            assert_eq!(prepared.recovery, PreparationRecovery::Ready);
+            assert_eq!(prepared.initial, empty_view());
+            assert_eq!(
+                prepared.capability.replacement_semantics(),
+                ReplacementSemantics::AtomicVisibility
+            );
+            assert_eq!(
+                prepared.capability.ownership_reconciliation(),
+                OwnershipReconciliation::AtomicFileIdentity
+            );
+        }
+
+        #[test]
+        fn native_commit_through_the_hook_path_restores_the_previous_marker() {
+            let directory = TestDirectory::new("native-restore");
+            let paths = MarkerPaths::new(directory.path());
+            let previous = marker_bytes_with_token(81, ThreadRole::Main, SessionToken([0x22; 16]));
+            fs::write(&paths.target, &previous).expect("write previous marker");
+
+            let prepared = prepare_native(directory.path());
+            assert_eq!(
+                prepared.initial.target,
+                MarkerSlotSnapshot::Present(snapshot(previous.clone()))
+            );
+            let runtime =
+                native_runtime(prepared, PreviousMarkerState::Snapshot(snapshot(previous.clone())));
+
+            record_panic_for_role(&runtime.state, ThreadRole::Ui);
+            assert_eq!(runtime.state.commit_observation.load(Ordering::Acquire), COMMIT_COMMITTED);
+            let committed = fs::read(&paths.target).expect("read committed marker");
+            assert_eq!(committed, runtime.state.markers.for_role(ThreadRole::Ui));
+            assert!(!paths.sibling.exists(), "no sibling survives a proven commit");
+
+            let outcome = runtime
+                .finish_clean(ShutdownQuiescenceProof::for_test())
+                .expect("restore through the native session");
+            assert_eq!(outcome, FinishCleanOutcome::RestoredPrevious);
+            assert_eq!(fs::read(&paths.target).expect("read restored marker"), previous);
+            assert!(!paths.sibling.exists());
+        }
+
+        #[test]
+        fn native_commit_without_a_previous_marker_is_removed_after_quiescence() {
+            let directory = TestDirectory::new("native-remove");
+            let paths = MarkerPaths::new(directory.path());
+            let prepared = prepare_native(directory.path());
+            let runtime = native_runtime(prepared, PreviousMarkerState::Missing);
+
+            record_panic_for_role(&runtime.state, ThreadRole::ScanWorker);
+            record_panic_for_role(&runtime.state, ThreadRole::LayoutWorker);
+            assert_eq!(runtime.state.commit_observation.load(Ordering::Acquire), COMMIT_COMMITTED);
+            let latest = fs::read(&paths.target).expect("read latest marker");
+            assert_eq!(latest, runtime.state.markers.for_role(ThreadRole::LayoutWorker));
+
+            let outcome = runtime
+                .finish_clean(ShutdownQuiescenceProof::for_test())
+                .expect("remove through the native session");
+            assert_eq!(outcome, FinishCleanOutcome::RemovedSessionMarker);
+            assert!(!paths.target.exists());
+            assert!(!paths.sibling.exists());
+        }
+
+        #[test]
+        fn native_reconciliation_is_identity_conditional_not_token_conditional() {
+            let directory = TestDirectory::new("native-identity");
+            let paths = MarkerPaths::new(directory.path());
+            let prepared = prepare_native(directory.path());
+            let runtime = native_runtime(prepared, PreviousMarkerState::Missing);
+            record_panic_for_role(&runtime.state, ThreadRole::Ui);
+            let session_bytes = fs::read(&paths.target).expect("read session marker");
+
+            // Same token, different object: the identity check must win.
+            fs::remove_file(&paths.target).expect("remove session marker");
+            fs::write(&paths.target, &session_bytes).expect("recreate with a new identity");
+            let outcome = runtime
+                .finish_clean(ShutdownQuiescenceProof::for_test())
+                .expect("identity mismatch is nonfatal");
+            assert_eq!(outcome, FinishCleanOutcome::OwnershipLost);
+            assert_eq!(fs::read(&paths.target).expect("foreign object intact"), session_bytes);
+            assert!(!paths.sibling.exists());
+        }
+
+        #[test]
+        fn native_reconciliation_preserves_a_foreign_token() {
+            let directory = TestDirectory::new("native-foreign-token");
+            let paths = MarkerPaths::new(directory.path());
+            let prepared = prepare_native(directory.path());
+            let runtime = native_runtime(prepared, PreviousMarkerState::Missing);
+            record_panic_for_role(&runtime.state, ThreadRole::Ui);
+
+            let foreign =
+                marker_bytes_with_token(82, ThreadRole::ShellWorker, SessionToken([0x55; 16]));
+            fs::remove_file(&paths.target).expect("remove session marker");
+            fs::write(&paths.target, &foreign).expect("foreign marker appears");
+            let outcome = runtime
+                .finish_clean(ShutdownQuiescenceProof::for_test())
+                .expect("foreign marker is nonfatal");
+            assert_eq!(outcome, FinishCleanOutcome::OwnershipLost);
+            assert_eq!(fs::read(&paths.target).expect("foreign marker intact"), foreign);
+        }
+
+        #[test]
+        fn native_store_reports_unavailable_slots_and_preserved_siblings() {
+            let directory = TestDirectory::new("native-slots");
+            let paths = MarkerPaths::new(directory.path());
+            fs::write(&paths.target, b"payload=C:\\private\\secret\n").expect("write malformed");
+            let foreign =
+                marker_bytes_with_token(83, ThreadRole::ShellWorker, SessionToken([0x66; 16]));
+            fs::write(&paths.sibling, &foreign).expect("write preserved sibling");
+
+            let prepared = prepare_native(directory.path());
+            assert!(matches!(
+                prepared.initial.target,
+                MarkerSlotSnapshot::Unavailable(MarkerStoreFailure {
+                    kind: MarkerStoreFailureKind::InvalidMarker,
+                    ..
+                })
+            ));
+            assert_eq!(
+                prepared.initial.sibling,
+                MarkerSlotSnapshot::Present(snapshot(foreign.clone()))
+            );
+            assert!(matches!(prepared.recovery, PreparationRecovery::Uncertain(_)));
+
+            let error =
+                delete_marker(directory.path()).expect_err("uncertain preparation blocks delete");
+            assert_eq!(error.operation, CrashMarkerOperation::Delete);
+            assert!(!error.to_string().contains("private"));
+            assert!(paths.target.exists());
+            assert_eq!(fs::read(&paths.sibling).expect("sibling preserved"), foreign);
+
+            fs::remove_file(&paths.target).expect("clear malformed target");
+            let preview = preview_marker(directory.path())
+                .expect("preview the preserved sibling")
+                .expect("sibling is previewable");
+            assert_eq!(preview.as_bytes(), foreign);
+        }
+
+        #[test]
+        fn native_explicit_delete_uses_identity_matched_handles_only() {
+            let directory = TestDirectory::new("native-delete");
+            let paths = MarkerPaths::new(directory.path());
+            let existing = marker_bytes(88, ThreadRole::Main);
+            fs::write(&paths.target, &existing).expect("write marker");
+            assert!(delete_marker(directory.path()).expect("delete through the native session"));
+            assert!(!paths.target.exists());
+            assert!(!delete_marker(directory.path()).expect("nothing left to delete"));
+
+            fs::write(&paths.target, &existing).expect("write marker again");
+            let prepared = prepare_native(directory.path());
+            fs::remove_file(&paths.target).expect("remove inspected marker");
+            fs::write(&paths.target, &existing).expect("swap the object under the name");
+            let error = delete_prepared(prepared).expect_err("swapped object is preserved");
+            assert_eq!(error.kind, CrashMarkerErrorKind::OwnershipConflict);
+            assert_eq!(fs::read(&paths.target).expect("swapped marker intact"), existing);
+        }
+
+        #[test]
+        fn native_failures_map_onto_the_store_vocabulary_with_codes() {
+            let operation = DiagnosticFileOperation::ReplaceDestination;
+            for (kind, expected) in [
+                (DiagnosticFileErrorKind::AccessDenied, MarkerStoreFailureKind::AccessDenied),
+                (DiagnosticFileErrorKind::NotFound, MarkerStoreFailureKind::NotFound),
+                (DiagnosticFileErrorKind::InvalidDestination, MarkerStoreFailureKind::InvalidData),
+                (DiagnosticFileErrorKind::ReparsePoint, MarkerStoreFailureKind::InvalidData),
+                (
+                    DiagnosticFileErrorKind::OwnedDestination,
+                    MarkerStoreFailureKind::OwnershipConflict,
+                ),
+                (DiagnosticFileErrorKind::InvalidContent, MarkerStoreFailureKind::InvalidMarker),
+                (DiagnosticFileErrorKind::TooLarge, MarkerStoreFailureKind::MarkerTooLarge),
+                (DiagnosticFileErrorKind::AlreadyExists, MarkerStoreFailureKind::Busy),
+                (
+                    DiagnosticFileErrorKind::PartialReplacement,
+                    MarkerStoreFailureKind::PreservedSibling,
+                ),
+                (DiagnosticFileErrorKind::Unsupported, MarkerStoreFailureKind::Unsupported),
+                (DiagnosticFileErrorKind::Io, MarkerStoreFailureKind::Other),
+            ] {
+                let failure = failure_from_native(DiagnosticFileError {
+                    operation,
+                    kind,
+                    os_code: Some(1176),
+                });
+                assert_eq!(failure, MarkerStoreFailure::new(expected, Some(1176)));
+            }
+        }
+
+        #[test]
+        #[ignore = "subprocess helper"]
+        fn subprocess_child_records_native_redacted_marker() {
+            let crashes = PathBuf::from(
+                std::env::var_os(CHILD_CRASH_DIRECTORY_ENV)
+                    .expect("subprocess crash directory is provided"),
+            );
+            let private_environment = std::env::var(CHILD_PRIVATE_ENV)
+                .expect("subprocess private environment sentinel is provided");
+            let username = std::env::var("USERNAME").unwrap_or_default();
+            let runtime = CrashRuntime::install(&crashes).expect("install the native hook");
+            assert_eq!(
+                runtime.ownership_reconciliation(),
+                OwnershipReconciliation::AtomicFileIdentity
+            );
+
+            let worker = std::thread::Builder::new()
+                .name(PRIVATE_THREAD_SENTINEL.to_owned())
+                .spawn(move || {
+                    with_thread_role(ThreadRole::ScanWorker, || {
+                        panic!("{PRIVATE_PAYLOAD_SENTINEL}:{private_environment}:{username}");
+                    });
+                })
+                .expect("spawn named panic test thread");
+            assert!(worker.join().is_err());
+            assert!(runtime.session_panicked());
+            // The runtime is dropped without a proof: the marker must survive.
+        }
+
+        #[test]
+        fn subprocess_native_hook_leaves_a_redacted_marker_on_a_worker_panic() {
+            let directory = TestDirectory::new("native-subprocess");
+            let status = run_subprocess_helper(
+                "subprocess_child_records_native_redacted_marker",
+                directory.path(),
+                directory.path(),
+            );
+            assert!(status.success());
+
+            let preview = preview_marker(directory.path())
+                .expect("subprocess marker is readable through the native store")
+                .expect("subprocess marker exists");
+            let text = preview.as_str();
+            let username = std::env::var("USERNAME").unwrap_or_default();
+            let mut forbidden = vec![
+                PRIVATE_PAYLOAD_SENTINEL.to_owned(),
+                PRIVATE_ENV_SENTINEL.to_owned(),
+                PRIVATE_THREAD_SENTINEL.to_owned(),
+                "panic_marker.rs".to_owned(),
+                "--ignored".to_owned(),
+                directory.path().to_string_lossy().into_owned(),
+                std::env::temp_dir().to_string_lossy().into_owned(),
+            ];
+            if !username.is_empty() {
+                forbidden.push(username);
+            }
+            for forbidden in forbidden {
+                assert!(!text.contains(&forbidden), "subprocess marker exposed {forbidden}");
+            }
+            assert!(text.contains("thread_role=scan_worker\n"));
+            assert!(validate_marker(preview.as_bytes(), ValidationPolicy::Current).is_ok());
+            assert!(!directory.path().join(TEMPORARY_FILE_NAMES[0]).exists());
+        }
+
+        #[test]
+        #[ignore = "subprocess helper"]
+        fn subprocess_child_panics_on_the_installing_thread() {
+            let crashes = PathBuf::from(
+                std::env::var_os(CHILD_CRASH_DIRECTORY_ENV)
+                    .expect("subprocess crash directory is provided"),
+            );
+            let _runtime = CrashRuntime::install(&crashes).expect("install the native hook");
+            panic!("{PRIVATE_PAYLOAD_SENTINEL}");
+        }
+
+        /// The child panics on the libtest worker thread that installed the
+        /// hook (its `thread_role=main`), not on the process main thread; the
+        /// non-success exit comes from libtest's failure accounting, which
+        /// only happens because the hook returned instead of swallowing the
+        /// panic.
+        #[test]
+        fn subprocess_native_hook_does_not_swallow_the_panic() {
+            let directory = TestDirectory::new("native-subprocess-main");
+            let status = run_subprocess_helper(
+                "subprocess_child_panics_on_the_installing_thread",
+                directory.path(),
+                directory.path(),
+            );
+            assert!(
+                !status.success(),
+                "the hook returns and libtest still reports the installing thread's panic"
+            );
+
+            let preview = preview_marker(directory.path())
+                .expect("marker is readable")
+                .expect("marker exists");
+            assert!(preview.as_str().contains("thread_role=main\n"));
+            assert!(!preview.as_str().contains(PRIVATE_PAYLOAD_SENTINEL));
+        }
     }
 }

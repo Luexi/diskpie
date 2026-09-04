@@ -96,11 +96,12 @@ pub enum DiagnosticCode {
     ShellActionRequested,
     ShellActionFailed,
     PanicMarkerFound,
+    PanicMarkerUnavailable,
 }
 
 impl DiagnosticCode {
     /// Complete list, used by policy and uniqueness tests.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::AppStarted,
         Self::AppStopped,
         Self::ProjectPathsUnavailable,
@@ -123,6 +124,7 @@ impl DiagnosticCode {
         Self::ShellActionRequested,
         Self::ShellActionFailed,
         Self::PanicMarkerFound,
+        Self::PanicMarkerUnavailable,
     ];
 
     #[must_use]
@@ -150,6 +152,7 @@ impl DiagnosticCode {
             Self::ShellActionRequested => "shell.action_requested",
             Self::ShellActionFailed => "shell.action_failed",
             Self::PanicMarkerFound => "panic.marker_found",
+            Self::PanicMarkerUnavailable => "panic.marker_unavailable",
         }
     }
 
@@ -165,7 +168,8 @@ impl DiagnosticCode {
             | Self::DiagnosticQueueDropped
             | Self::DiagnosticWriteFailed
             | Self::ShellActionFailed
-            | Self::PanicMarkerFound => DiagnosticLevel::Warn,
+            | Self::PanicMarkerFound
+            | Self::PanicMarkerUnavailable => DiagnosticLevel::Warn,
             Self::ScanProgress | Self::ScanOmission | Self::RenderAllocationChanged => {
                 DiagnosticLevel::Debug
             }
