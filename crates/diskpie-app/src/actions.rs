@@ -1854,7 +1854,7 @@ mod tests {
 
     fn fixture(generation: u64) -> Fixture {
         let mut builder = TreeBuilder::new(GenerationId::new(generation));
-        let root = builder.add_root(NodeSpec::root(r"C:\zqx")).expect("root");
+        let root = builder.add_root(NodeSpec::root(fixture_root())).expect("root");
         let directory =
             builder.add_child(root, NodeSpec::directory("directory")).expect("directory");
         let leaf =
@@ -1886,8 +1886,19 @@ mod tests {
         GenerationId::new(value)
     }
 
+    /// Platform-neutral fixture root. The portable policy is also tested on
+    /// the Linux CI job, where `C:\` is an ordinary name rather than a prefix
+    /// and `Path::join` uses `/`, so every fixture path is built from this.
+    fn fixture_root() -> &'static str {
+        if cfg!(windows) { r"C:\zqx" } else { "/zqx" }
+    }
+
+    fn fixture_path(parts: &[&str]) -> PathBuf {
+        parts.iter().fold(PathBuf::from(fixture_root()), |path, part| path.join(part))
+    }
+
     fn executable() -> PathBuf {
-        PathBuf::from(r"C:\zqx\bin\diskpie.exe")
+        fixture_path(&["bin", "diskpie.exe"])
     }
 
     fn validator<'a>(fixture: &'a Fixture, executable: Option<&'a Path>) -> TargetValidator<'a> {
@@ -1931,8 +1942,8 @@ mod tests {
         assert_eq!(target.parent(), Some(fixture.directory));
         assert_eq!(target.logical(), SizeSummary { known_bytes: 10, unknown_entries: 0 });
         assert_eq!(target.allocated(), SizeSummary { known_bytes: 20, unknown_entries: 0 });
-        assert_eq!(target.path(), Path::new(r"C:\zqx\directory\leaf.bin"));
-        assert_eq!(target.parent_path(), Some(Path::new(r"C:\zqx\directory")));
+        assert_eq!(target.path(), fixture_path(&["directory", "leaf.bin"]));
+        assert_eq!(target.parent_path(), Some(fixture_path(&["directory"]).as_path()));
     }
 
     #[test]
@@ -2087,7 +2098,7 @@ mod tests {
         };
         assert_eq!(*kind, ActionKind::Recycle);
         assert_eq!(shown.exact_path, target.path());
-        assert_eq!(shown.display, r"C:\zqx\directory\leaf.bin");
+        assert_eq!(shown.display, fixture_path(&["directory", "leaf.bin"]).to_string_lossy());
         assert_eq!(shown.escaped_utf16, None);
         assert!(!shown.reparse_note);
         assert_eq!(flow.begin_recycle(target.clone()), Err(FlowError::NotIdle));
@@ -2108,7 +2119,7 @@ mod tests {
             &PostActionObligation::RescanParent {
                 generation: generation(1),
                 parent: fixture.directory,
-                parent_path: PathBuf::from(r"C:\zqx\directory"),
+                parent_path: fixture_path(&["directory"]),
             }
         );
         let report = pending.settle(DestructiveOutcome::CancelledBeforeMutation.into());
@@ -2239,7 +2250,7 @@ mod tests {
         assert_eq!(binding.verify_target(&other_generation), Err(BindingMismatch::Generation));
 
         let mut other_path = target.clone();
-        other_path.path = PathBuf::from(r"C:\zqx\directory\other.bin");
+        other_path.path = fixture_path(&["directory", "other.bin"]);
         assert_eq!(binding.verify_target(&other_path), Err(BindingMismatch::Path));
 
         let mut other_kind = target.clone();
@@ -2274,7 +2285,7 @@ mod tests {
         let capability = flow.take_recycle().expect("capability");
 
         let mut builder = TreeBuilder::new(generation(1));
-        let root = builder.add_root(NodeSpec::root(r"C:\zqx")).expect("root");
+        let root = builder.add_root(NodeSpec::root(fixture_root())).expect("root");
         let directory = builder.add_child(root, NodeSpec::directory("directory")).expect("dir");
         let renamed =
             builder.add_child(directory, file("renamed.bin", Some(identity(12)))).expect("leaf");
@@ -2375,7 +2386,7 @@ mod tests {
         assert_eq!(unescape_utf16(&escaped).expect("round trip"), units);
 
         let mut builder = TreeBuilder::new(generation(1));
-        let root = builder.add_root(NodeSpec::root(r"C:\zqx")).expect("root");
+        let root = builder.add_root(NodeSpec::root(fixture_root())).expect("root");
         let name = OsString::from_wide(&[0xD800_u16, b'x'.into()]);
         let leaf = builder.add_child(root, file(name, Some(identity(1)))).expect("leaf");
         let snapshot = builder.freeze().expect("snapshot");
