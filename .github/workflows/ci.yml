@@ -20,7 +20,7 @@ jobs:
   windows:
     name: Windows quality gate
     runs-on: windows-2022
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -36,10 +36,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Lint all targets
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Run workspace tests
-        run: cargo test --workspace --all-targets --locked
+        run: cargo test --workspace --all-targets --all-features --locked
 
       - name: Run documentation tests
         run: cargo test --workspace --doc --locked
@@ -89,7 +89,7 @@ jobs:
   msrv:
     name: Rust 1.92 compatibility
     runs-on: windows-2022
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
