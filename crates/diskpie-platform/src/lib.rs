@@ -15,6 +15,7 @@ pub mod windows {
     pub mod project_paths;
     pub mod settings_file;
     pub mod shell_service;
+    pub mod startup_feedback;
     pub mod volumes;
 }
 
@@ -44,6 +45,8 @@ pub use windows::shell_service::{
     ShellRequest, ShellService, ShellServiceConfig, ShellServiceShutdownError,
     ShellServiceStartError, ShellServiceStatus, SubmitError, TryReceiveError,
 };
+#[cfg(windows)]
+pub use windows::startup_feedback::{attach_parent_console, show_startup_failure};
 #[cfg(windows)]
 pub use windows::volumes::{
     ResolvedScanRoot, VolumeDiscovery, VolumeError, WindowsVolume, discover_volumes,
