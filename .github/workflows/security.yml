@@ -75,6 +75,10 @@ jobs:
 
   license-notices:
     name: License notices
+    # The notices are generated and committed from Windows; the comparison
+    # below normalizes the blank-line differences cargo-about emits between
+    # hosts (verified identical on Windows and Linux after normalization), so
+    # the faster Linux runner can perform the check.
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -107,9 +111,13 @@ jobs:
           set -euo pipefail
           generated="${RUNNER_TEMP}/THIRD-PARTY-NOTICES.md"
           cargo about generate --locked --fail about.hbs -o "${generated}"
-          # The committed copy is LF-normalized by .gitattributes; ignore the
-          # line-ending flavor cargo-about happens to emit on this host.
-          if diff -u --strip-trailing-cr THIRD-PARTY-NOTICES.md "${generated}"; then
+          # The committed copy is LF-normalized by .gitattributes and some
+          # license files carry CRLF fragments, which can differ in blank
+          # lines between hosts. Compare with carriage returns removed and
+          # runs of blank lines squeezed on both sides: a crate or a license
+          # text that appears, disappears, or changes still fails the check.
+          normalize() { tr -d '\r' < "$1" | cat -s; }
+          if diff -u <(normalize THIRD-PARTY-NOTICES.md) <(normalize "${generated}"); then
             echo "THIRD-PARTY-NOTICES.md matches the locked dependency graph."
           else
             echo "::error file=THIRD-PARTY-NOTICES.md::THIRD-PARTY-NOTICES.md is stale. Run 'cargo about generate --locked --fail about.hbs -o THIRD-PARTY-NOTICES.md' and commit the result."
