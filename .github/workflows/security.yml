@@ -1,6 +1,8 @@
 name: Dependency security
 
 on:
+  push:
+    branches: [main]
   pull_request:
     paths:
       - "**/Cargo.toml"
@@ -11,6 +13,7 @@ on:
       - ".deny.exceptions.toml"
       - "about.toml"
       - "about.hbs"
+      - "THIRD-PARTY-NOTICES.md"
       - "audit.toml"
       - ".cargo/**"
       - ".github/dependabot.yml"
@@ -69,3 +72,46 @@ jobs:
       - name: Audit locked dependencies
         if: ${{ always() && steps.install_tools.outcome == 'success' }}
         run: cargo audit --deny warnings
+
+  license-notices:
+    name: License notices
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record pinned Rust toolchain
+        run: |
+          rustup show active-toolchain
+          rustc -vV
+          cargo -vV
+
+      - name: Install pinned cargo-about
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_root="${RUNNER_TEMP}/cargo-license-tools"
+          cargo install cargo-about --version 0.9.1 --features cli --locked --root "${tool_root}"
+          printf '%s\n' "${tool_root}/bin" >> "${GITHUB_PATH}"
+
+      - name: Verify cargo-about version
+        run: cargo about --version
+
+      - name: Regenerate third-party notices and compare
+        shell: bash
+        run: |
+          set -euo pipefail
+          generated="${RUNNER_TEMP}/THIRD-PARTY-NOTICES.md"
+          cargo about generate --locked --fail about.hbs -o "${generated}"
+          # The committed copy is LF-normalized by .gitattributes; ignore the
+          # line-ending flavor cargo-about happens to emit on this host.
+          if diff -u --strip-trailing-cr THIRD-PARTY-NOTICES.md "${generated}"; then
+            echo "THIRD-PARTY-NOTICES.md matches the locked dependency graph."
+          else
+            echo "::error file=THIRD-PARTY-NOTICES.md::THIRD-PARTY-NOTICES.md is stale. Run 'cargo about generate --locked --fail about.hbs -o THIRD-PARTY-NOTICES.md' and commit the result."
+            exit 1
+          fi

@@ -41,11 +41,17 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace --all-targets --locked
 
+      - name: Run documentation tests
+        run: cargo test --workspace --doc --locked
+
       - name: Reject documentation warnings
         shell: pwsh
         run: |
           $env:RUSTDOCFLAGS = "-D warnings"
           cargo doc --workspace --no-deps --locked
+
+      - name: Build the release executable
+        run: cargo build --release -p diskpie --locked
 
   portable-core:
     name: Portable core on Linux
