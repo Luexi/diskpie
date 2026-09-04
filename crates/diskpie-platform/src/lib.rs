@@ -10,18 +10,33 @@ pub use diskpie_core::PRODUCT_NAME;
 
 #[cfg(windows)]
 pub mod windows {
+    pub mod diagnostic_files;
     pub mod filesystem;
     pub mod project_paths;
+    pub mod settings_file;
     pub mod shell_service;
     pub mod volumes;
 }
 
+#[cfg(windows)]
+pub use windows::diagnostic_files::{
+    DiagnosticFileError, DiagnosticFileErrorKind, DiagnosticFileOperation,
+    DiagnosticRetentionReport, ExportDestinationKind, ExportWriteOutcome, MAX_DAILY_LOG_BYTES,
+    MAX_DIAGNOSTIC_EXPORT_BYTES, MAX_PANIC_MARKER_BYTES, MAX_RETAINED_LOG_FILES,
+    WindowsAtomicMarkerWriter, WindowsDailyLogHealth, WindowsDailyLogWriter,
+    classify_export_destination, prune_diagnostic_logs, write_diagnostic_export,
+};
 #[cfg(windows)]
 pub use windows::filesystem::WindowsFileSystem;
 #[cfg(windows)]
 pub use windows::project_paths::{
     APPLICATION_IDENTIFIER, ProjectPathError, ProjectPathErrorKind, ProjectPathFacility,
     ProjectPathOperation, ProjectPaths, resolve_project_paths,
+};
+#[cfg(windows)]
+pub use windows::settings_file::{
+    MAX_SETTINGS_DOCUMENT_BYTES, SETTINGS_FILE_NAME, SettingsCommitOutcome, SettingsFileError,
+    SettingsFileErrorKind, SettingsFileOperation, SettingsFileRead, WindowsSettingsFile,
 };
 #[cfg(windows)]
 pub use windows::shell_service::{

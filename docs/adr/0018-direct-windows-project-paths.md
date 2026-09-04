@@ -4,6 +4,11 @@
 - Date: 2026-08-02
 - Owners: DiskPie maintainers
 
+ADR 0019 supersedes only decision item 10 below: the resolved settings path is
+now supplied to DiskPie's application-owned settings adapter, not to eframe.
+All Known Folder selection, failure, privacy, and no-fallback rules remain in
+force.
+
 ## Context
 
 DiskPie needs stable locations for roaming preferences and machine-local logs
@@ -93,9 +98,10 @@ through exact windows 0.62.2.
 9. There is no fallback to current directory, executable directory, guessed
    environment variables, temp, drive root, or a lossy path. Diagnostics and
    settings never silently migrate between locations.
-10. Pass the settings file to eframe through
-   `NativeOptions::persistence_path`. ADRs 0016 and 0017 receive the local log
-   and crash directories through the same adapter.
+10. Pass the settings file only to the application-owned adapter defined by
+   ADR 0019. Do not enable eframe native persistence. ADRs 0016 and 0017
+   receive the local log and crash directories through the same project-path
+   adapter.
 11. Reject directories and directories-next for the Windows baseline. Add a
     separate adapter or reconsider a maintained cross-platform crate only when
     another desktop target is funded.

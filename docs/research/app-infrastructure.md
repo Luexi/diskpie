@@ -11,9 +11,10 @@ DiskPie should keep these facilities behind small consumer-owned ports and
 use the platform or framework already selected when that gives a narrower
 dependency and privacy boundary:
 
-- Store versioned Serde data as RON in `eframe::Storage`. Pin Serde 1.0.229;
-  use the RON 0.12.2 already selected by eframe 0.35.0's `persistence`
-  feature. Do not add `serde_json` for this frontend.
+- Store versioned Serde data as one application-owned RON document. Pin Serde
+  1.0.229 and RON 0.12.2; disable eframe's `persistence` feature and do not add
+  `serde_json` for this frontend. This corrects the initial recommendation
+  after exact-source verification described in ADR 0019.
 - Parse the optional startup path with lexopt 0.3.2 from `OsString`. Never
   round-trip a filesystem argument through UTF-8.
 - Implement the Windows folder picker directly with `IFileOpenDialog` through
@@ -103,7 +104,7 @@ for the final Windows target rather than substitute crate download size.
 
 | Choice | Incremental dependency and build shape | Unsafe and portability boundary |
 | --- | --- | --- |
-| Serde/RON over eframe | Serde derive and RON are already enabled by eframe persistence, so application schemas add no new format family. JSON would add another serializer and its code paths. | Serde/RON deny unsafe in their public source; framework filesystem/native-location code remains outside portable crates. |
+| Application-owned Serde/RON document | Serde derive and RON are direct, pinned dependencies. Disabling eframe persistence removes its path/storage behavior; JSON would add another serializer and its code paths. | Serde/RON deny unsafe in their public source; native file ownership and atomic replacement remain in the reviewed platform adapter. |
 | lexopt | One direct crate, zero transitives, no derive macro. pico-args is similarly small; clap adds clap-builder and optional derive/formatting/filter facilities. | lexopt forbids unsafe and preserves `OsString`; all three are portable, but only lexopt matches the current complexity/maintenance balance. |
 | Direct Common Item Dialog | Reuses windows 0.62.2. Dialog/Known Folder code needs narrow `Win32_System_Com` and `Win32_UI_Shell` features; the existing Shell STA also needs its message-window feature set. rfd instead brings its own raw windows-sys backend and cross-platform facade. | Direct code concentrates native allocation/COM invariants in one target-gated adapter. rfd's Windows backend contains extensive raw unsafe and broad raw-handle `Send`/`Sync`; its safe facade does not repair the path/error semantics. |
 | Direct Known Folder paths | Reuses the same `Win32_UI_Shell` projection. directories adds directories/dirs-sys platform logic; directories-next adds an older parallel family. | The consumer port is portable, while one small Windows conversion/free boundary is platform-only. directories is a safe convenience surface but its archived upstream and platform internals weaken the maintenance case. |
@@ -114,6 +115,13 @@ for the final Windows target rather than substitute crate download size.
 ## Persistent preferences
 
 ### Framework behavior
+
+> **Post-decision correction:** exact inspection of the locked eframe 0.35.0
+> native renderer paths found that `persistence_path: None` calls
+> `create_storage(app_id)`, which selects eframe's default directory. It does
+> not disable persistence. Because Known Folder resolution can fail at
+> runtime, this violates the no-fallback contract. ADR 0019 therefore
+> supersedes the adoption conclusion below and disables the feature.
 
 eframe's [`Storage` trait](https://docs.rs/eframe/0.35.0/eframe/trait.Storage.html)
 is a small string key/value interface. Its
@@ -137,11 +145,23 @@ be explicit:
 - the current save uses `File::create`, so the outer file replacement is not
   atomic.
 
-DiskPie therefore owns the schema under one namespaced string key, but does
-not reach into or promise compatibility with eframe's outer map. The
-framework-level non-atomic save is an accepted risk for nonessential
-preferences; a custom atomic storage adapter becomes a revisit item if field
-evidence shows corruption or another frontend needs the same data.
+DiskPie retains the schema analysis but does not use eframe's outer map. The
+application owns the entire bounded document and delegates explicit native
+read/replacement to the platform adapter. UI callbacks operate only on the
+in-memory settings session.
+
+The Windows adapter holds a local, non-reparse parent and the inspected
+single-link target by handle. A save creates and flushes an exclusive sibling,
+then calls `NtSetInformationFile(FileRenameInformationEx)` with a plain name
+relative to the retained parent plus replace/POSIX flags. The Win32 wrapper
+`SetFileInformationByHandle` rejects any non-null `RootDirectory` with
+`ERROR_INVALID_PARAMETER`, so it cannot express this handle-relative commit
+(see ADR 0019 for the measured evidence). The target handle grants delete
+sharing because POSIX replacement requires it from every opener; identity is
+protected by comparing the retained handle's file identity immediately before
+and after the rename, not by a sharing lock. Windows builds/filesystems
+without this extended operation get session-only settings, never a path-based
+fallback.
 
 ### Schema contract
 
@@ -155,8 +175,9 @@ struct SettingsEnvelope {
 ```
 
 The exact type belongs in the app/application boundary, not in the scanner.
-The key is stable and namespaced, for example `diskpie.settings`. Serialized
-input and output are capped at 64 KiB before parsing or saving.
+Under ADR 0019 this envelope is the entire `app.ron` document rather than a
+framework map entry. Serialized input and output are capped at 64 KiB before
+parsing or saving.
 
 Load behavior is deterministic:
 
@@ -182,13 +203,13 @@ last folder" feature needs a separate privacy decision and explicit opt-in.
 
 ### Candidate comparison
 
-- **Serde + RON over eframe Storage — adopt.** Smallest graph, typed schema,
-  human-inspectable local value, already integrated with the UI lifecycle.
+- **Application-owned Serde + RON document — adopt (corrected).** Typed,
+  bounded schema with an exact no-fallback path and atomic native replacement.
 - **Serde JSON — defer.** JSON is useful for interchange or a framework-free
   settings service, but adding a second format provides no present benefit.
-- **Application-owned raw file immediately — defer.** It could provide atomic
-  replacement and independent lifecycle, but duplicates the framework store
-  before corruption data or a second frontend demonstrates need.
+- **eframe Storage — reject after exact-source verification.** A missing
+  explicit path activates its default platform path, and the outer file save
+  is not atomic. There is no supported runtime disable switch.
 - **Unversioned eframe key per field — reject.** It makes cross-field
   migration, newer-version protection, reset, and bounded validation harder.
 
@@ -338,9 +359,9 @@ which Microsoft recommends for new Known Folder code, through windows 0.62.2:
 The exact identifier should be treated as persistent after release. A
 `ProjectPaths` adapter returns native `PathBuf` values; it converts the
 allocated `PWSTR` losslessly and frees it with `CoTaskMemFree` on every path,
-including failure. eframe receives the settings file through
-`NativeOptions::persistence_path`. Portable crates do not import Windows
-types.
+including failure. The application-owned adapter from ADR 0019 receives the
+settings file; eframe never receives or derives a persistence path. Portable
+crates do not import Windows types.
 
 There is one subtle unsafe obligation. The
 [Microsoft contract](https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/nf-shlobj_core-shgetknownfolderpath)
@@ -387,24 +408,37 @@ fields make scan generation, service, request ID, outcome code, item counts,
 latency, and queue pressure useful without raw file names. Per-file successful
 events are prohibited at normal levels.
 
-Use tracing-appender's
-[`rolling::Builder`](https://docs.rs/tracing-appender/0.2.5/tracing_appender/rolling/struct.Builder.html)
-with daily rotation in the dedicated log directory, a unique `diskpie` prefix
-and `.log` suffix, but leave its internal maximum disabled. A source audit of
-[tracing-appender 0.2.5 retention](https://docs.rs/crate/tracing-appender/0.2.5/source/src/rolling.rs)
-found two mismatches with DiskPie's accepted deletion boundary: `DirEntry::metadata`
-follows links, and a Windows creation timestamp lets any regular entry with the
-configured prefix/suffix bypass exact date-name parsing. Enabling
-`max_log_files(8)` could therefore remove a symlink or an unrelated similarly
-named file.
+Do not use tracing-appender's
+[`rolling::Builder`](https://docs.rs/tracing-appender/0.2.5/tracing_appender/rolling/struct.Builder.html).
+The pinned implementation joins a raw path and opens it through `std::fs`
+before DiskPie can verify the directory or leaf by handle. A junction or
+symlink can therefore redirect the active sink, including to UNC, and an
+existing hard link can receive log bytes. Its retention separately follows
+metadata and lets a Windows creation timestamp admit names outside DiskPie's
+exact namespace. A later prune cannot make an already-open unsafe sink safe.
 
-DiskPie instead runs a narrow retention pass in the logging worker. It accepts
-only ASCII names matching `diskpie.YYYY-MM-DD.log`, validates calendar fields,
-uses non-following metadata plus the Windows reparse attribute, and deletes
-only owned regular files until at most eight remain. Rotation remains
-time-based and retention count-based; release tests must measure worst-case
-INFO volume. Excessive volume triggers a byte-bounded writer revisit, not
-silent unlimited growth.
+Use tracing-appender only for its bounded nonblocking queue. Its consumer is a
+small application-owned Win32 daily writer. The writer retains a local,
+non-reparse directory handle, opens the UTC active name with append access and
+`FILE_FLAG_OPEN_REPARSE_POINT`, verifies a regular direct child with one link,
+and retains that file handle until UTC rollover. Every rollover repeats the
+full object and parent validation; no failure selects another path. The handle
+denies competing writers, so its current size can enforce a 16 MiB daily cap:
+append only a complete record that fits and count a whole-record omission when
+the next write would cross the limit.
+
+Retention runs on that same writer thread and directory handle. Enumerate with
+`GetFileInformationByHandleEx` and `FileIdExtdDirectoryInfo`, whose resumable
+records include the 128-bit file ID and reparse tag, rather than reopening a
+raw path with `fs::read_dir`. Parse the variable records defensively, enforce
+an explicit total-entry budget, perform linear work, and protect the actual
+active handle/identity. Only exact ASCII `diskpie.YYYY-MM-DD.log` regular
+single-link children belong to the eight-file namespace. The active identity
+is always one retained member; syntactically valid future dates remain managed
+inside the same cap rather than being preserved without limit. Ambiguity fails
+closed and is counted. Eight managed files plus the per-file cap place the
+application-owned log payload below 128 MiB. Release tests still measure
+normal INFO volume and verify that cap pressure is exceptional and visible.
 
 Use
 [`NonBlockingBuilder`](https://docs.rs/tracing-appender/0.2.5/tracing_appender/non_blocking/struct.NonBlockingBuilder.html)
@@ -425,11 +459,10 @@ Alternatives:
   maintained, but env_logger targets stderr and environment filtering. It
   supplies neither structured spans, rolling retention, bounded async I/O,
   nor export policy.
-- **Small application-owned writer — defer.** It would remove channel/rolling
-  dependencies and could rotate by bytes, but concurrency, drop accounting,
-  retention, flush, and error behavior are security-sensitive code. Prototype
-  it only if measured appender cost or count-only rotation misses a release
-  gate.
+- **Use tracing-appender's rolling writer — reject.** It cannot enforce the
+  root/leaf reparse, hard-link, transport, or retained-identity contract before
+  its first write. Its nonblocking queue remains useful because it keeps
+  concurrency, saturation, and drop accounting out of the native writer.
 - **A network observability SDK — reject.** It conflicts with the product's
   local-only diagnostic boundary and provides no required capability.
 
@@ -530,7 +563,7 @@ The diagnostic privacy promise is therefore precise:
 
 | Area | Candidate | Status | Reason and revisit trigger |
 | --- | --- | --- | --- |
-| Preferences | Serde 1.0.229 + RON 0.12.2 over eframe Storage | **Adopt** | Already in the UI graph; typed, versioned application value. Revisit outer storage if corruption is observed. |
+| Preferences | Serde 1.0.229 + RON 0.12.2 application-owned document | **Adopt** | Typed and versioned; exact Known Folder path, bounded decode, and native atomic replacement enforce ADR 0019. |
 | Preferences | serde_json 1.0.151 | **Defer** | No interchange or independent-backend requirement. Revisit for a second frontend or public config format. |
 | CLI | lexopt 0.3.2 | **Adopt** | Native `OsString`, zero dependencies, visible grammar. |
 | CLI | pico-args 0.5.0 | **Reject** | Correctly small but stale with no advantage over lexopt. |
@@ -550,12 +583,12 @@ The diagnostic privacy promise is therefore precise:
 
 ### Preferences
 
-- Fake-Storage unit tests cover missing, current, every supported old, newer,
+- Pure document-store unit tests cover missing, current, every supported old, newer,
   malformed, oversized, and clamped values.
 - Golden fixtures prove migrations are deterministic and preserve a newer raw
   value until explicit reset.
-- Restart tests prove app settings coexist with eframe window state and no
-  scan path is persisted by default.
+- Restart tests prove application settings and bounded window state round-trip
+  without persisting a scan path by default.
 - Read-only/missing AppData tests prove persistence disables nonfatally and
   never falls back beside the executable.
 
@@ -593,8 +626,9 @@ The diagnostic privacy promise is therefore precise:
 
 ## Revisit triggers
 
-- Replace eframe storage only after reproducible corruption, a headless or
-  second frontend, or a need for transactional cross-process settings.
+- Reconsider the application-owned store only if a second frontend or
+  transactional cross-process settings require a broader shared service. Do
+  not re-enable an implicit framework path.
 - Reconsider clap when the CLI gains subcommands, generated documentation, or
   completions; preserve `OsString` at the positional boundary.
 - Reconsider rfd only for a future non-Windows adapter and only after its

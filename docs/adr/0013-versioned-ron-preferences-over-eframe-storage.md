@@ -1,8 +1,14 @@
 # ADR 0013: Store versioned RON preferences through eframe Storage
 
-- Status: Accepted
+- Status: Superseded by ADR 0019
 - Date: 2026-08-02
 - Owners: DiskPie maintainers
+
+ADR 0019 preserves the versioned RON schema and storage-neutral application
+port, but replaces eframe's native storage backend. Inspection of the pinned
+eframe 0.35.0 implementation showed that a missing `persistence_path` selects
+eframe's default platform path instead of disabling persistence. That behavior
+conflicts with ADR 0018's no-fallback rule.
 
 ## Context
 
