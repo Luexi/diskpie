@@ -119,10 +119,50 @@ pub enum MessageId {
     ItemCount,
     ChartAccessibilityLabel,
     PreviousSessionEndedUnexpectedly,
+    Resolving,
+    Choosing,
+    Failed,
+    ScanFailedTitle,
+    ScanFailedOther,
+    ShowSummary,
+    ScanAllVolumes,
+    RefreshVolumes,
+    RestoreAllBranches,
+    FolderPickerUnavailable,
+    Volumes,
+    NoVolumesFound,
+    DiscoveryIssues,
+    Free,
+    Total,
+    ReasonStaleGeneration,
+    ReasonUnknownNode,
+    ReasonSyntheticTarget,
+    ReasonNotNavigable,
+    ReasonNotFilesystemRoot,
+    ReasonNoSummary,
+    ReasonRootCannotBeHidden,
+    ReasonViewRootCannotBeHidden,
+    ReasonAlreadyHidden,
+    ReasonNotHidden,
+    ReasonNoHiddenBranches,
+    ReasonHiddenStateBusy,
+    ReasonHiddenTarget,
+    ReasonNoRescanRoots,
+    ReasonNoRealPath,
+    RescanBranchUnavailable,
+    AllocationEstimate,
+    ShareOfView,
+    DialogBusy,
+    DialogFailed,
+    ResolverBusy,
+    ListKeyboardHint,
+    PartialSettled,
+    ScanRoots,
+    Shortcuts,
 }
 
 impl MessageId {
-    pub const ALL: [Self; 71] = [
+    pub const ALL: [Self; 111] = [
         Self::AppName,
         Self::Tagline,
         Self::Back,
@@ -194,6 +234,46 @@ impl MessageId {
         Self::ItemCount,
         Self::ChartAccessibilityLabel,
         Self::PreviousSessionEndedUnexpectedly,
+        Self::Resolving,
+        Self::Choosing,
+        Self::Failed,
+        Self::ScanFailedTitle,
+        Self::ScanFailedOther,
+        Self::ShowSummary,
+        Self::ScanAllVolumes,
+        Self::RefreshVolumes,
+        Self::RestoreAllBranches,
+        Self::FolderPickerUnavailable,
+        Self::Volumes,
+        Self::NoVolumesFound,
+        Self::DiscoveryIssues,
+        Self::Free,
+        Self::Total,
+        Self::ReasonStaleGeneration,
+        Self::ReasonUnknownNode,
+        Self::ReasonSyntheticTarget,
+        Self::ReasonNotNavigable,
+        Self::ReasonNotFilesystemRoot,
+        Self::ReasonNoSummary,
+        Self::ReasonRootCannotBeHidden,
+        Self::ReasonViewRootCannotBeHidden,
+        Self::ReasonAlreadyHidden,
+        Self::ReasonNotHidden,
+        Self::ReasonNoHiddenBranches,
+        Self::ReasonHiddenStateBusy,
+        Self::ReasonHiddenTarget,
+        Self::ReasonNoRescanRoots,
+        Self::ReasonNoRealPath,
+        Self::RescanBranchUnavailable,
+        Self::AllocationEstimate,
+        Self::ShareOfView,
+        Self::DialogBusy,
+        Self::DialogFailed,
+        Self::ResolverBusy,
+        Self::ListKeyboardHint,
+        Self::PartialSettled,
+        Self::ScanRoots,
+        Self::Shortcuts,
     ];
 
     #[must_use]
@@ -291,6 +371,46 @@ impl MessageId {
             Self::ItemCount => "item-count",
             Self::ChartAccessibilityLabel => "chart-accessibility-label",
             Self::PreviousSessionEndedUnexpectedly => "previous-session-ended-unexpectedly",
+            Self::Resolving => "resolving",
+            Self::Choosing => "choosing",
+            Self::Failed => "failed",
+            Self::ScanFailedTitle => "scan-failed-title",
+            Self::ScanFailedOther => "scan-failed-other",
+            Self::ShowSummary => "show-summary",
+            Self::ScanAllVolumes => "scan-all-volumes",
+            Self::RefreshVolumes => "refresh-volumes",
+            Self::RestoreAllBranches => "restore-all-branches",
+            Self::FolderPickerUnavailable => "folder-picker-unavailable",
+            Self::Volumes => "volumes",
+            Self::NoVolumesFound => "no-volumes-found",
+            Self::DiscoveryIssues => "discovery-issues",
+            Self::Free => "free",
+            Self::Total => "total",
+            Self::ReasonStaleGeneration => "reason-stale-generation",
+            Self::ReasonUnknownNode => "reason-unknown-node",
+            Self::ReasonSyntheticTarget => "reason-synthetic-target",
+            Self::ReasonNotNavigable => "reason-not-navigable",
+            Self::ReasonNotFilesystemRoot => "reason-not-filesystem-root",
+            Self::ReasonNoSummary => "reason-no-summary",
+            Self::ReasonRootCannotBeHidden => "reason-root-cannot-be-hidden",
+            Self::ReasonViewRootCannotBeHidden => "reason-view-root-cannot-be-hidden",
+            Self::ReasonAlreadyHidden => "reason-already-hidden",
+            Self::ReasonNotHidden => "reason-not-hidden",
+            Self::ReasonNoHiddenBranches => "reason-no-hidden-branches",
+            Self::ReasonHiddenStateBusy => "reason-hidden-state-busy",
+            Self::ReasonHiddenTarget => "reason-hidden-target",
+            Self::ReasonNoRescanRoots => "reason-no-rescan-roots",
+            Self::ReasonNoRealPath => "reason-no-real-path",
+            Self::RescanBranchUnavailable => "rescan-branch-unavailable",
+            Self::AllocationEstimate => "allocation-estimate",
+            Self::ShareOfView => "share-of-view",
+            Self::DialogBusy => "dialog-busy",
+            Self::DialogFailed => "dialog-failed",
+            Self::ResolverBusy => "resolver-busy",
+            Self::ListKeyboardHint => "list-keyboard-hint",
+            Self::PartialSettled => "partial-settled",
+            Self::ScanRoots => "scan-roots",
+            Self::Shortcuts => "shortcuts",
         }
     }
 }
@@ -366,9 +486,23 @@ impl I18n {
 
     /// Format the localized item-count plural without exposing Fluent to callers.
     pub fn item_count(&self, count: u64) -> Result<String, I18nError> {
+        self.counted(MessageId::ItemCount, count)
+    }
+
+    /// Format the synthetic "Other" group label with its member count.
+    pub fn other_group(&self, count: u64) -> Result<String, I18nError> {
+        self.counted(MessageId::OtherGroup, count)
+    }
+
+    /// Format the synthetic "Hidden" group label with its member count.
+    pub fn hidden_group(&self, count: u64) -> Result<String, I18nError> {
+        self.counted(MessageId::HiddenGroup, count)
+    }
+
+    fn counted(&self, id: MessageId, count: u64) -> Result<String, I18nError> {
         let mut arguments = FluentArgs::new();
         arguments.set("count", count);
-        self.resolve(MessageId::ItemCount, Some(&arguments)).map(Cow::into_owned)
+        self.resolve(id, Some(&arguments)).map(Cow::into_owned)
     }
 
     fn resolve<'a>(
