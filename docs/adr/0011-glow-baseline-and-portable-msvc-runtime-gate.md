@@ -184,3 +184,77 @@ Primary evidence:
 - [`static_vcruntime` 3.0.0](https://docs.rs/static_vcruntime/3.0.0/static_vcruntime/)
 - [Microsoft Universal CRT deployment](https://learn.microsoft.com/en-us/cpp/windows/universal-crt-deployment?view=msvc-170)
 - [Cargo release profile defaults](https://doc.rust-lang.org/cargo/reference/profiles.html#release)
+
+## Addendum 2026-09-03: release CRT linkage measurement and adoption
+
+This addendum records the first two of the three CRT variants named in the
+decision, measured from independent clean target directories on the branch
+that embeds the PE identity resources (`crates/diskpie/build.rs`).
+
+Environment:
+
+- Host and target: `x86_64-pc-windows-msvc` on Windows 11 Pro 10.0.26200.
+- Toolchain: `rustc 1.97.1 (8bab26f4f 2026-07-14)`, `cargo 1.97.1`
+  (`rust-toolchain.toml`), Cargo default release profile, `--locked`.
+- Inspection: `dumpbin.exe` from MSVC 14.51.36231, located with `vswhere`.
+- Launch test: `diskpie.exe --version` exit code. The release binary detaches
+  its console (`windows_subsystem = "windows"`), so the version text is not
+  observable; exit code 0 is the criterion, and `--definitely-not-a-flag`
+  exiting 2 confirms that argument parsing, not a stub, produced the 0.
+
+Exact commands:
+
+```text
+cargo build --release -p diskpie --locked
+$env:CARGO_TARGET_DIR = "<scratch>\target-crt-static"
+$env:RUSTFLAGS = "-C target-feature=+crt-static"
+cargo build --release -p diskpie --locked
+$dumpbin = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+  -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+  -find 'VC/Tools/MSVC/**/bin/Hostx64/x64/dumpbin.exe'
+& $dumpbin /NOLOGO /DEPENDENTS <exe> | Where-Object { $_ -match '\.dll' }
+(Get-Item <exe>).Length
+$p = Start-Process -FilePath <exe> -ArgumentList '--version' -PassThru
+$p.WaitForExit(20000); $p.ExitCode
+```
+
+Measured rows (imports are the `dumpbin /DEPENDENTS` list, de-duplicated
+case-insensitively):
+
+| Variant | EXE bytes | SHA-256 | CRT imports | Other imports | `--version` exit |
+|---|---|---|---|---|---|
+| 1. Default dynamic linkage | 8,453,632 | `5B421B98…D3AE88` | `VCRUNTIME140.dll`, `api-ms-win-crt-{math,string,runtime,stdio,locale,heap}-l1-1-0.dll` | `kernel32`, `user32`, `gdi32`, `shell32`, `shlwapi`, `advapi32`, `ole32`, `oleaut32`, `combase`, `ntdll`, `bcryptprimitives`, `uiautomationcore`, `opengl32`, `imm32`, `dwmapi`, `uxtheme`, `api-ms-win-core-synch-l1-2-0` | 0 |
+| 2. Full `+crt-static` | 8,631,296 (+177,664, +2.1%) | `77E5EFCE…035B454` | none | identical to row 1 | 0 |
+
+Row 1 confirms the concern in the decision: Rust's default MSVC linkage leaves
+a `VCRUNTIME140.dll` prerequisite, so it fails the portable contract on any
+client without the Visual C++ Redistributable. Its exit code 0 on the
+developer machine is not portability evidence because that machine has the
+redistributable installed; only the import list is evidence. Row 2 removes
+every `VCRUNTIME*`, `MSVCP*`, and `api-ms-win-crt-*` import, adds no
+`libgcc*`, renderer, or DXC DLL, keeps the identical inbox import set, still
+launches, and costs 2.1% of binary size.
+
+Decision: **adopt full `+crt-static`** now, through
+`.cargo/config.toml` under `[target.x86_64-pc-windows-msvc] rustflags`, as the
+"fallback and reconsideration" clause already allows. The static build imports
+no CRT DLL and launches, which were the two adoption gates for this pass.
+
+Still pending, and required before any release notes claim "no VCRedist
+needed":
+
+- Variant 3 (`static_vcruntime` plus `+crt-static`) was not measured in this
+  pass; it stays an open experiment and can still displace variant 2 if it
+  passes every criterion above with a material advantage.
+- Clean-VM validation as a standard user on Windows 10 22H2, Windows 11 24H2,
+  and Windows 11 25H2 with no developer tools or redistributable.
+- Compile/link time, startup, scan and render benchmarks, BinSkim/mitigation
+  output, and the ADR 0012 two-checkout reproducibility gate under the new
+  flags.
+
+Operational note: Cargo replaces, never merges, `[target.*].rustflags` when
+`RUSTFLAGS` or `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS` is set. The
+release workflow that adds `--remap-path-prefix` (ADR 0012) must therefore
+re-include `-C target-feature=+crt-static` explicitly, and the release
+import-list inspection remains the backstop that catches a silent regression
+to dynamic linkage.

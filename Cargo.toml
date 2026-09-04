@@ -38,7 +38,6 @@ tracing-subscriber = { version = "=0.3.23", default-features = false, features =
     "tracing-log",
 ] }
 unic-langid = "=0.9.6"
-winresource = { version = "=0.1.31", default-features = false }
 windows = { version = "=0.62.2", default-features = false, features = [
     "std",
     "Wdk_Storage_FileSystem",
@@ -55,6 +54,7 @@ windows = { version = "=0.62.2", default-features = false, features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+winresource = { version = "=0.1.31", default-features = false }
 
 [workspace.lints.rust]
 rust_2018_idioms = { level = "deny", priority = -1 }

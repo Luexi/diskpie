@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 use std::env;
+use std::fs;
 use std::path::Path;
 
 /// Manifest embedded as resource ID 1, relative to this crate's manifest dir.
@@ -33,6 +34,8 @@ fn main() {
 
     println!("cargo:rerun-if-changed={MANIFEST_FILE}");
     println!("cargo:rerun-if-changed={ICON_FILE}");
+    // `winresource` honors `RC_PATH` but emits no rerun directive of its own.
+    println!("cargo:rerun-if-env-changed=RC_PATH");
 
     let manifest_dir = env::var("CARGO_MANIFEST_DIR")
         .expect("cargo always sets CARGO_MANIFEST_DIR for build scripts");
@@ -41,6 +44,7 @@ fn main() {
     let icon_path = manifest_dir.join(ICON_FILE);
 
     let version = env::var("CARGO_PKG_VERSION").expect("cargo always sets CARGO_PKG_VERSION");
+    check_manifest_identity_version(&manifest_path);
     let description =
         env::var("CARGO_PKG_DESCRIPTION").expect("cargo always sets CARGO_PKG_DESCRIPTION");
     let authors = env::var("CARGO_PKG_AUTHORS").expect("cargo always sets CARGO_PKG_AUTHORS");
@@ -64,4 +68,25 @@ fn main() {
         // toolchain files but never user data.
         panic!("failed to compile the Windows resources for diskpie.exe: {error}");
     }
+}
+
+/// Fails the build when the manifest's `assemblyIdentity` version drifts from
+/// the package version.
+///
+/// The manifest is a verbatim copy of the documented template, so its
+/// `version` attribute is a literal rather than a build-time substitution.
+/// `VERSIONINFO` is derived from `CARGO_PKG_VERSION`; this guard keeps the two
+/// identities in step across version bumps instead of letting them
+/// desynchronize silently.
+fn check_manifest_identity_version(manifest_path: &Path) {
+    let manifest = fs::read_to_string(manifest_path)
+        .unwrap_or_else(|error| panic!("failed to read {MANIFEST_FILE}: {error}"));
+    let major = env::var("CARGO_PKG_VERSION_MAJOR").expect("cargo sets CARGO_PKG_VERSION_MAJOR");
+    let minor = env::var("CARGO_PKG_VERSION_MINOR").expect("cargo sets CARGO_PKG_VERSION_MINOR");
+    let patch = env::var("CARGO_PKG_VERSION_PATCH").expect("cargo sets CARGO_PKG_VERSION_PATCH");
+    let expected = format!("version=\"{major}.{minor}.{patch}.0\"");
+    assert!(
+        manifest.contains(&expected),
+        "{MANIFEST_FILE} assemblyIdentity must declare {expected} to match CARGO_PKG_VERSION"
+    );
 }

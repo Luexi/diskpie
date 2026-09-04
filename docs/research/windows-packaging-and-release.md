@@ -111,7 +111,9 @@ graph plus actual binary can be release evidence.
 
 The version resource must set at least:
 
-- `FileDescription`: `DiskPie - visual disk usage scanner`;
+- `FileDescription`: the binary crate's `package.description`, embedded from
+  `CARGO_PKG_DESCRIPTION` so the PE string and the crate metadata cannot drift
+  (currently `A fast visual disk usage scanner`);
 - `ProductName`: `DiskPie`;
 - `InternalName`: `diskpie`;
 - `OriginalFilename`: `diskpie.exe`;
@@ -184,24 +186,44 @@ The manifest must never request elevation merely to scan.
 ### Resource compiler dependency record (2026-09-03)
 
 This record satisfies the `AGENTS.md` dependency rule for the build-script
-crate that embeds the manifest, icon group, and `VERSIONINFO` above. Both
-candidates are MIT, both were checked against crates.io metadata and the
-vendored 0.1.31/3.0.11 sources on 2026-09-03, and neither has a pure-Rust
-resource compiler: on the MSVC target both invoke the Windows SDK `rc.exe`,
-which is preinstalled on the GitHub `windows-2022` image and on any machine
-with the Visual Studio C++ workload. The requirement "no external tool" is
-therefore unsatisfiable for a full resource set; the only pure-Rust option
-found, `embed-manifest`, writes a manifest resource but no icon group or
-version block, so it cannot deliver this contract alone.
+crate that embeds the manifest, icon group, and `VERSIONINFO` above. Evidence
+basis, stated exactly:
+
+- `winresource` 0.1.31: crates.io metadata and the registry-vendored source
+  (`lib.rs`, one file) were inspected on 2026-09-03. Zero `unsafe`
+  occurrences; `rc.exe` is located through `RC_PATH` (`lib.rs:733`), then the
+  toolkit path, then `reg query` of
+  `HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots` (`lib.rs:797`);
+  the manifest line is written as `<FILETYPE> 24 "<file>"` (`lib.rs:578-587`).
+- `embed-resource` 3.0.11: crates.io metadata and the registry-vendored source
+  were inspected on 2026-09-03 after fetching the crate into a scratch probe
+  crate (`cargo fetch` with `embed-resource = "=3.0.11"` as the only
+  build-dependency). The MSVC resolver is `src/windows_msvc.rs`: `RC_<target>`
+  or `RC` overrides, then `winreg` lookups of `KitsRoot10`/`KitsRoot81`/
+  `KitsRoot`, then `vswhom`. `embed-resource` itself has zero `unsafe`;
+  `vswhom` 0.1.0 has three `unsafe` sites and `vswhom-sys` 0.1.3 compiles
+  `ext/vswhom.cpp` with `cc` on every clean MSVC build; `winreg` 0.55.0 has
+  `unsafe` in five source files. `cargo tree -e build,normal` on the probe
+  resolves 22 packages on `x86_64-pc-windows-msvc`.
+- Release dates and cadence come from the crates.io API on 2026-09-03.
+
+Both candidates are MIT, and neither has a pure-Rust resource compiler: on the
+MSVC target both invoke the Windows SDK `rc.exe`, which is preinstalled on the
+GitHub `windows-2022` image and on any machine with the Visual Studio C++
+workload. The requirement "no external tool" is therefore unsatisfiable for a
+full resource set; the only pure-Rust option found, `embed-manifest`, is
+documented as writing a manifest resource but no icon group or version block
+(crates.io description only; its source was not audited because it cannot
+deliver this contract alone).
 
 | Criterion | `winresource` 0.1.31 | `embed-resource` 3.0.11 |
 |---|---|---|
 | License | MIT | MIT |
-| Maintenance | Released 2026-03-16; five releases in the preceding year | Released 2026-07-02; five releases in the preceding year |
-| Unsafe footprint | Zero `unsafe` in the crate; one runtime dependency (`version_check`, already in `Cargo.lock`) once the `toml` feature is disabled | Adds `cc`, `rustc_version`, `toml`, `memchr`, `vswhom`, and `winreg`; `vswhom` and `winreg` contain FFI/registry `unsafe` |
-| External tools on MSVC | Windows SDK `rc.exe`, located through `reg query` of `HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots` (both are inbox on `windows-2022`); `RC_PATH` overrides | Windows SDK `rc.exe`, located through `vswhere`/registry; `RC` environment overrides; LLVM-RC mode needs a C preprocessor via `cc` |
-| Platform support | Windows MSVC, Windows GNU (`windres`), and Linux/macOS cross builds; the crate compiles on every host so a plain `[build-dependencies]` entry keeps `cargo check` portable | Same platforms; also compiles on every host |
-| Build and binary impact | One extra build-script crate; `Cargo.lock` grows by exactly one package; the PE grows only by the resource section | Six extra build-script packages, a `cc` probe, and toolchain discovery on each clean build; identical PE growth |
+| Maintenance | Released 2026-03-16; six releases in the preceding year | Released 2026-07-02; five releases in the preceding year |
+| Unsafe footprint | Zero `unsafe` in the crate; one runtime dependency (`version_check`, already in `Cargo.lock`) once the `toml` feature is disabled | Zero `unsafe` in the crate; MSVC-target dependencies `vswhom` (FFI `unsafe`, C++ compiled by `cc`) and `winreg` (registry FFI `unsafe`), plus `cc`, `rustc_version`, and `toml` on every target |
+| External tools on MSVC | Windows SDK `rc.exe`, located through `RC_PATH`, then `reg query` of `HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots` (both inbox on `windows-2022`) | Windows SDK `rc.exe`, located through `RC_<target>`/`RC`, then `winreg` Kits-root lookups, then `vswhom`; cross-compilation uses `llvm-rc` with a C preprocessor step through `cc` |
+| Platform support | Windows MSVC (`rc.exe`), Windows GNU (`windres`), and Linux/macOS cross builds; the crate compiles on every host so a plain `[build-dependencies]` entry keeps `cargo check` portable | Same platforms; also compiles on every host |
+| Build and binary impact | One extra build-script crate; `Cargo.lock` grows by exactly one package; the PE grows only by the resource section | Seven packages new to `Cargo.lock` (`embed-resource`, `toml`, `toml_writer`, `serde_spanned`, `vswhom`, `vswhom-sys`, `winreg`), one C++ compile, and registry/COM toolchain discovery on each clean MSVC build; identical PE growth |
 | Local-alternative cost | Hand-writing a `.res` emitter in `build.rs` (~300 lines of PE resource layout) is possible but duplicates a tested crate | Same |
 | Lock-in and fallback | The crate only emits `resource.rc` plus `cargo:rustc-link-arg`; the manifest and property list stay project-owned, so a switch to `embed-resource` or a direct `rc.exe` call keeps every input | Lower-level API; equally replaceable |
 
@@ -217,17 +239,38 @@ Implementation notes recorded from the first embedding:
 - `crates/diskpie/build.rs` returns early unless `CARGO_CFG_TARGET_OS` is
   `windows`, so the Linux portable-core job never needs an SDK.
 - `cargo:rerun-if-changed` covers `build.rs`, `diskpie.manifest`, and
-  `assets/brand/diskpie-icon.ico`.
+  `assets/brand/diskpie-icon.ico`; `cargo:rerun-if-env-changed=RC_PATH` covers
+  the resource-compiler override because `winresource` emits no rerun
+  directive of its own.
 - The manifest is embedded as resource ID 1 (`RT_MANIFEST`) verbatim from
   `crates/diskpie/diskpie.manifest`; `mt.exe -validate_manifest` on the
   extracted resource reports "Parsing of manifest successful" and the only
   differences from the source file are `mt.exe`'s canonical re-serialization
   of self-closing tags.
+- `winresource` quirk: the `RT_MANIFEST` resource ID is the numeric value of
+  `VersionInfo::FILETYPE` (`lib.rs:578-587`). The manifest lands on ID 1 only
+  because `FILETYPE` defaults to `VFT_APP` (`0x1`). Never call
+  `set_version_info(VersionInfo::FILETYPE, ...)` in `build.rs`; doing so moves
+  the manifest to another ID and breaks the resource ID 1 contract that the
+  release-inspection gate checks with `mt.exe -inputresource:diskpie.exe;#1`.
 - `winresource` derives the fixed PE version as `major.minor.patch.0` from
   `CARGO_PKG_VERSION_*`, matching the contract above.
+- The manifest `assemblyIdentity` version is a literal in the template file,
+  not a build-time substitution. `build.rs` reads the manifest and fails the
+  build unless it contains `version="<major>.<minor>.<patch>.0"` for the
+  current `CARGO_PKG_VERSION`, so a workspace version bump must edit
+  `crates/diskpie/diskpie.manifest` in the same commit; the guard turns a
+  silent identity mismatch into a build error.
 - `CompanyName` is populated from `CARGO_PKG_AUTHORS`, which currently names
   the individual publisher recorded in `LICENSE-MIT`; re-check it against the
   validated publisher identity before any signing stage is enabled.
+- Reproducibility note for the ADR 0012 two-checkout gate: the generated
+  `OUT_DIR/resource.rc` names the icon and manifest by absolute worktree path
+  and `winresource` passes `/I<CARGO_MANIFEST_DIR>` to `rc.exe`. Only the icon
+  and manifest bytes enter the `.res`, so the PE is expected to be path-free,
+  but this is exactly the "build scripts may introduce absolute paths" case
+  above and must be confirmed by the byte-compare of two differently rooted
+  builds rather than assumed.
 
 ## Portable runtime and renderer gate
 
