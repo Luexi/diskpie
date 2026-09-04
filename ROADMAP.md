@@ -91,7 +91,7 @@ native actions, end-to-end verification, packaging, and release evidence.
 | Panic marker | Contract only | Pure contract and standalone tests exist; module is not declared or integrated, and native retained-handle transport is absent. |
 | English and Spanish infrastructure | Partially implemented | Typed Fluent IDs and both bundles exist; final connected UI strings and completeness checks remain. |
 | Visual shell | Scaffold only | It renders an original responsive instrument shell, but still shows calibration/demo data and disabled actions. |
-| Open/recycle/delete/empty recycle bin/Installed Apps | Not implemented | Research and ADR contracts exist; native requests and confirmations remain. |
+| Open/recycle/delete/empty recycle bin/Installed Apps | Implemented below the UI | ADR 0008 confirmation flow, single-use capabilities, STA requests/outcomes, late identity validation, and cancellation exist; the egui binding and the disposable-VM provider matrix remain. |
 | Explorer integration | Not implemented | ADR exists; reversible per-user adapter and UI remain. |
 | Benchmarks and release evidence | Not implemented as a complete gate | Some lower-level tests exist; required benchmark suite/report and portable binary measurements remain. |
 | Stable GitHub release | Not implemented | Repository and draft PR exist; no release or portable asset exists. |
