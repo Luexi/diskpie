@@ -195,3 +195,33 @@ Primary evidence:
 - [Microsoft SignTool](https://learn.microsoft.com/en-us/windows/win32/seccrypto/signtool)
 - [CA/B Forum Code Signing Baseline Requirements](https://cabforum.org/working-groups/code-signing/requirements/)
 - [Microsoft deterministic PE debug entry](https://learn.microsoft.com/en-us/dotnet/fundamentals/runtime-libraries/system-reflection-portableexecutable-debugdirectoryentrytype)
+
+## Implementation note (2026-09-03)
+
+`.github/workflows/release.yml` implements stages 1, 2, and 4 and the
+explicitly unsigned branch. Deviations and refinements from the text above:
+
+- Stage 3 (optional signing) has no job yet because no eligible provider
+  exists; the pipeline always takes the documented `unsigned` state and says so
+  in `README-RUN.txt`, the release notes, and `build-info.json`.
+- Stage 5 is a manual step: the workflow creates a **draft** release with
+  `gh release create --draft --verify-tag` and never publishes it. The Windows
+  client smoke tests, PE resource/manifest inspection, BinSkim, and
+  `gh attestation verify` checks listed under Validation remain maintainer
+  actions before the draft is published. The attestation job receives only
+  `id-token: write` and `attestations: write`; `artifact-metadata: write` is
+  unnecessary without registry storage records.
+- The reproducibility build passes `-Clink-arg=/Brepro` in addition to the
+  `--remap-path-prefix` flags so `link.exe` derives PE and PDB timestamps from
+  content. rustc already emits only the PDB file name via `/PDBALTPATH`.
+- `cargo-cyclonedx` 0.5.9 embeds Cargo package ids for workspace crates
+  (`path+file:///<checkout>/crates/<name>`), so the SBOM step remaps that
+  prefix to `path+file:///diskpie/`, the same virtual root used for source
+  paths, before hashing and attesting it.
+- The canonical ZIP is written with `System.IO.Compression.ZipArchive`
+  (fixed entry order, `SOURCE_DATE_EPOCH` timestamps clamped to the MS-DOS
+  range, zero external attributes, no comment) and built twice in the job; the
+  raw EXE digest is listed in `SHA256SUMS.txt` and attested but the EXE is not
+  attached as a separate release asset because the app has no legal view yet.
+- `workflow_dispatch` is a dry run: it performs every build and packaging gate
+  and uploads workflow artifacts, but creates no attestation or release.
