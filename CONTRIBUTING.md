@@ -1,76 +1,84 @@
 # Contributing to DiskPie
 
-Thank you for helping make disk usage understandable, fast, and safe.
+DiskPie is a free, open-source Windows application. Start with [AGENTS.md](AGENTS.md)
+and the relevant task in [ROADMAP.md](ROADMAP.md). Older Scanner analysis and
+research explain history; they do not define current product scope.
 
-## Before starting
+## Development setup
 
-1. Read `AGENTS.md` and `docs/legacy-scanner-analysis.md`.
-2. Search existing issues and open a focused issue for substantial behavior or
-   architecture changes.
-3. Keep proprietary Scanner artifacts outside this repository. Do not submit
-   recovered code, copied strings, images, translations, or bundled binaries.
-4. For a nontrivial dependency, add or update a research note using the rubric
-   in `docs/research/README.md` before integrating it.
-
-## Local setup
-
-Use stable Rust with the MSVC target on Windows:
+Use Windows with MSVC build tools and the Rust toolchain pinned by
+rust-toolchain.toml. Do not change the user's global default toolchain as a
+setup step. From the repository root:
 
 ```powershell
-rustup default stable-x86_64-pc-windows-msvc
-cargo build --workspace
+cargo build -p diskpie --locked
+cargo run -p diskpie --locked
 ```
 
-Portable core work should remain testable without Windows UI or shell APIs.
-Windows-specific behavior still requires a Windows 10 or 11 verification pass.
+The product target is Windows 10/11 x86-64. Existing Linux checks exercise
+neutral logic, not a Linux application release.
 
-## Change workflow
+## Scope and workflow
 
-- Branch from `main` using a short name such as `feat/scan-progress` or
-  `fix/reparse-loop`.
-- Keep commits focused and use conventional prefixes such as `feat`, `fix`,
-  `perf`, `test`, `docs`, `build`, and `ci`.
-- Add tests at the smallest useful level. Filesystem-action tests may operate
-  only on temporary fixtures created by the test itself.
-- Record user-visible changes under `Unreleased` in `CHANGELOG.md`.
-- Update requirements, architecture, user documentation, and translations when
-  behavior changes.
+- Preserve unrelated changes. Use focused branches/commits for pull requests,
+  or the integration workflow explicitly assigned by the owner.
+- Reuse Rust/egui and existing adapters. Ordinary edits do not need a new issue,
+  research report or ADR. Explain lasting decisions and significant dependency
+  tradeoffs in the relevant document or review description.
+- Define an outcome and acceptance evidence. An adapter alone is not a finished
+  feature; connect the interface when that is part of the assignment.
+- Simplify incrementally for demonstrated benefits. Consult the owner before
+  migration, broad rewrites, scope changes or new spending.
+- Keep meaningful tests. Automated mutations target only temporary fixtures
+  created by the test, never personal files.
+- Update traceability, user docs, translations or the changelog only when their
+  corresponding contract or status changes.
 
-## Third-party notices
+## Verification
 
-`THIRD-PARTY-NOTICES.md` is generated from `Cargo.lock` for the shipped
-`x86_64-pc-windows-msvc` target and ships inside every release ZIP. Regenerate
-and commit it whenever `Cargo.lock`, `about.toml`, or `about.hbs` changes:
+Start with focused checks. For stable code integration, use the applicable
+existing gates in .github/workflows/ci.yml:
+
+```powershell
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --all-features --locked
+cargo test --workspace --doc --locked
+$env:RUSTDOCFLAGS = "-D warnings"; cargo doc --workspace --no-deps --locked
+cargo build --release -p diskpie --locked
+```
+
+Native behavior needs Windows fixture/UI verification. Releases also need the
+pending clean-machine, accessibility and performance evidence recorded in the
+roadmap and traceability matrix. Report actual checks and material checks not
+run, with a reason; old evidence is not a new runtime pass.
+
+Documentation-only edits need link, consistency, status and mirrored-skill
+checks, not a local Rust rebuild. Remote workflows may run automatically.
+
+## Recycling and privacy
+
+Cleanup moves reviewed items to the Recycle Bin only. Too-large items,
+unsupported providers or an inability to ensure recycling must produce a
+refusal with an explanation. Do not connect legacy permanent-delete/empty-bin
+commands or offer their native fallback prompts. Preserve native target
+identity and keep I/O outside the UI thread. App management uses the official
+Windows interface; leftover files follow the same recycle-only contract.
+
+Use [SECURITY.md](SECURITY.md) for vulnerability reports. Scans and diagnostics
+stay local; do not introduce telemetry or uploads without an owner decision.
+
+## Third-party notices and original work
+
+Do not copy proprietary Scanner/DiskBuddy code, text or assets. Preserve the
+project's MIT OR Apache-2.0 terms and CODE_OF_CONDUCT.md.
+THIRD-PARTY-NOTICES.md is generated from the locked Windows dependency graph
+and ships in release ZIPs. When Cargo.lock, about.toml or about.hbs changes:
 
 ```powershell
 cargo install --locked --version 0.9.1 --features cli cargo-about
 cargo about generate --locked --fail about.hbs -o THIRD-PARTY-NOTICES.md
 ```
 
-The `License notices` job in `.github/workflows/security.yml` regenerates the
-file with the same pinned `cargo-about` and fails with a diff when the
-committed copy is stale.
-
-## Required checks
-
-Run before opening a pull request:
-
-```powershell
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-```
-
-Run relevant benchmarks or Windows integration tests for changes that affect
-scanning, layout, rendering, cancellation, allocation accounting, or shell
-operations. State every check run and any check not run in the pull request.
-
-## Safety and reporting
-
-Never build a shell command by concatenating a path. Keep destructive actions
-behind the confirmation policy and platform adapter. Report vulnerabilities
-privately according to `SECURITY.md`.
-
-By contributing, you agree that your contribution is licensed under the
-project's `MIT OR Apache-2.0` terms and that you will follow
-`CODE_OF_CONDUCT.md`.
+The security workflow checks notices drift. Documentation edits alone do not
+require regenerating dependency notices.

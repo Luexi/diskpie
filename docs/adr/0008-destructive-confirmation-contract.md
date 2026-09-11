@@ -1,10 +1,26 @@
 # ADR 0008: Bind destructive actions to exact confirmed targets
 
-- Status: Accepted
+- Status: Partially superseded by the 2026-09-11 owner decisions in ROADMAP.md
 - Date: 2026-08-02
 - Owners: DiskPie maintainers
 
-## Context
+## Current applicability (2026-09-11)
+
+The [current roadmap](../../ROADMAP.md) supersedes this record's permanent-delete
+and empty-bin product requirements. Cleanup is recycle-only: if Windows cannot
+recycle, including oversized items or unsupported providers, the application
+must refuse and explain why. It must not show or accept a permanent-delete
+fallback, including a native Shell dialog offering it.
+
+Exact native paths, target identity, review, stale-target rejection and honest
+outcomes still apply to recycling. The evidence and implementation notes below
+describe historical code, including dormant delete/empty-bin APIs that still
+exist. Do not wire those APIs or treat their historical tests as verification
+of the new end-to-end recycle-only experience. Verify native refusal behavior
+with disposable fixtures before enabling recycling in the UI.
+
+
+## Historical context
 
 DiskPie exposes recycling, permanent deletion, and emptying the Recycle Bin
 from a disk-usage visualization. A chart selection can become stale while a

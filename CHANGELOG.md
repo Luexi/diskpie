@@ -42,6 +42,18 @@ Versioning after its first stable release.
 
 ### Changed
 
+- Documentation direction updated on 2026-09-11: permanent Windows-only scope,
+  free/open-source distribution, Rust/egui, portable staged deliveries and the
+  expanded visual disk-management feature plan. Planned features are not
+  represented as implemented.
+- Agent guidance now favors complete scoped tasks, incremental simplification
+  and proportional verification. Legacy scope and process requirements are
+  marked as historical.
+- Product cleanup policy is now Recycle Bin only, with refusal when recycling
+  is unavailable. Permanent-delete and empty-bin features are excluded. This
+  is a documentation change: dormant legacy APIs remain and the new complete
+  recycling flow still requires implementation/Windows verification.
+
 - Partial snapshots are paced by the cost of rebuilding them, so very large
   scans no longer spend the supervisor's time materializing snapshots.
 - Pending scan directories are queued per volume, avoiding a quadratic search

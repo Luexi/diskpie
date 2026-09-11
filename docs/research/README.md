@@ -1,22 +1,20 @@
 # Research records
 
-Research notes justify significant reuse and platform choices before the code
-depends on them. Prefer official documentation, crates.io metadata, upstream
-repositories, release notes, and original research papers over secondary posts.
+These notes preserve evidence behind existing choices. Their proposals,
+mandatory investigation sequences and platform ambitions are historical unless
+adopted by the current [roadmap](../../ROADMAP.md) and
+[architecture](../architecture.md). Read a note only for the question at hand.
+The active [UI direction](ui-product-direction.md) is maintained separately.
 
-Every candidate review should record:
+Research an unresolved decision when it can materially change the result.
+Use primary documentation and inspect the actual repository versions. For a
+significant dependency, briefly record its concrete benefit, license
+compatibility, maintenance and material Windows/build/runtime costs. Use an
+existing note or change description; do not require an exhaustive report for
+every edit.
 
-1. exact version or API baseline and research date;
-2. license compatibility with `MIT OR Apache-2.0`;
-3. recent maintenance and release activity;
-4. advisories, unsafe-code footprint, and security boundary;
-5. Windows 10/11 and portable-core compatibility;
-6. compile-time and binary-size implications;
-7. concrete benefit over a small local implementation; and
-8. abandonment, lock-in, and fallback risks.
-
-Finish each note with an actionable recommendation: adopt, prototype behind an
-adapter, defer pending benchmarks, study without copying, or reject.
-
-Product-facing UI decisions are recorded in
-[`ui-product-direction.md`](ui-product-direction.md).
+Windows 10/11 x86-64 is the only product target. Cleanup is recycle-only, without
+permanent-delete fallback or an empty-bin feature. Older research cannot
+authorize those features or other platforms. Parallel agents and independent
+review are tools for bounded work and meaningful risk, not prerequisites for
+each task. Follow [AGENTS.md](../../AGENTS.md).

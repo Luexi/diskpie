@@ -1,67 +1,47 @@
 ---
 name: diskpie-rust-egui
-description: Implement or review Rust changes in DiskPie across crate boundaries, the egui frame loop, bounded scanning, and Windows adapters. Use only in the DiskPie repository.
+description: Implement or review a scoped Rust, egui, scanner, or Windows integration change in the DiskPie repository under its current product contract.
 ---
 
-# DiskPie Rust and egui engineering
+# DiskPie Rust and egui
 
-Use this skill for DiskPie implementation and review. Preserve the explicit
-task scope and load only the canon relevant to the affected area.
+Read repository-root AGENTS.md for authority, workflow, the recycle-only policy
+and verification rules. Load only the roadmap task, status rows, code and
+architectural references relevant to the assignment. Legacy Scanner analysis
+is historical evidence, not the current product specification.
 
-## Route context
+## Place the change correctly
 
-- Always read `AGENTS.md` first.
-- For product behavior, read `docs/legacy-scanner-analysis.md`.
-- For architecture or crate placement, read `docs/architecture.md`.
-- For egui interaction and visual behavior, read
-  `docs/research/ui-product-direction.md`.
-- For deep runtime or dependency decisions, read
-  `docs/research/rust-egui-architecture.md`.
-- Record a deliberate architectural deviation in an ADR. Follow the
-  dependency-research and documentation rules in `AGENTS.md`.
+- diskpie-core: domain model, accounting and layout; no UI or I/O.
+- diskpie-scan: bounded coordination, batching and cancellation.
+- diskpie-app: UI-independent runtime, navigation, action policy and settings.
+- diskpie-platform: Windows filesystem/Shell adapters and isolated unsafe code.
+- diskpie: composition and egui interface, without project-authored unsafe code.
 
-## Keep crate boundaries intact
+Reuse those boundaries. Windows 10/11 x86-64 is the only product target.
+Keep Rust/egui; a migration or broad rewrite requires the owner's decision.
 
-- `diskpie-core`: portable domain model and layout only; no egui, eframe,
-  Windows APIs, or filesystem traversal.
-- `diskpie-scan`: portable bounded blocking scan orchestration, with one
-  coordinator, fixed workers, bounded channels, batching, cancellation, and
-  generation identity.
-- `diskpie-app`: UI-independent policy, runtime, navigation, settings, and
-  diagnostics; it may own traits, but not egui, eframe, COM, Win32, or HWND.
-- `diskpie-platform`: target-gated OS adapters and the only normal home for
-  project-authored `unsafe`.
-- `diskpie`: composition and egui UI only; keep it free of `unsafe`.
+## Preserve relevant invariants
 
-Do not introduce a reverse dependency or move policy into an adapter merely
-for convenience.
+- Keep blocking work outside frame callbacks. Submit bounded work, consume
+  coherent results and repaint only when needed.
+- Preserve scan generations, bounded queues/workers and cancellation.
+- Keep native paths in Path/PathBuf/OsStr/OsString. Display strings and
+  synthetic sectors cannot become filesystem targets.
+- Cleanup is recycle-only after review and identity validation. If Windows
+  cannot recycle, including oversized items, refuse without permanent deletion
+  or a native fallback prompt. Do not connect legacy permanent-delete/empty-bin
+  paths. The new end-to-end refusal guarantee still needs native verification.
+- Preserve hard-link, reparse and cloud-placeholder semantics. Mutating tests
+  act only on temporary paths created by that test.
 
-## Preserve runtime and safety invariants
+## Finish the slice
 
-- Never block an egui callback or renderer on filesystem, shell, COM, layout,
-  settings, diagnostics, or thread joins. Submit work off-thread, use bounded
-  nonblocking poll/drain, request repaint only while needed, and render a
-  coherent immutable committed revision.
-- Keep scanning bounded: one coordinator, fixed/bounded workers and channels,
-  batched events, cancellation, and generation checks. Never spawn one task per
-  file.
-- Preserve path identity with `Path`, `PathBuf`, `OsStr`, and `OsString`.
-  Display strings must never become action paths, and synthetic sunburst
-  sectors must never become filesystem targets.
-- Put Windows behavior behind `diskpie-platform` adapters. Keep each `unsafe`
-  block minimal, document its `SAFETY` invariant, and convert raw resources to
-  RAII immediately.
-- Put open, recycle, permanent-delete, and recycle-bin operations behind the
-  testable actions interface. Confirm the exact native path before recycle or
-  delete, require stronger confirmation for permanent deletion, and never
-  build `cmd.exe` commands from untrusted paths.
-- Destructive tests may act only on exact temporary fixture paths created by
-  that test. Never target user data, repository fixtures, or legacy Scanner
-  artifacts.
+Connect the requested outcome through its actual flow, reusing existing
+adapters. Simplify only for that task or a demonstrated problem; do not expand
+diagnostics, panic handling or generic infrastructure by default. Follow the
+proportional checks in CONTRIBUTING.md and report limitations honestly.
+Implemented, connected and verified are distinct states in traceability.
 
-## Verify proportionally
-
-Run the smallest focused tests for the owning crate, then the workspace gates
-required by `AGENTS.md` when the task permits. Report every skipped or blocked
-check. Update requirements, traceability, ADRs, changelog, or translations only
-when the corresponding contract changed.
+This is the canonical skill text. Keep its .claude/skills/ counterpart
+byte-identical; do not maintain different product rules for different agents.

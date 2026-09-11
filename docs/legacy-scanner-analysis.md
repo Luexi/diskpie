@@ -1,5 +1,20 @@
 # Scanner 2.13: análisis y plan de modernización
 
+> **Referencia histórica; alcance y proceso sustituidos el 2026-09-11.**
+> Este documento conserva el análisis del Scanner original y la propuesta de
+> aquella etapa. La dirección vigente está en [ROADMAP.md](../ROADMAP.md), las
+> reglas de ejecución en [AGENTS.md](../AGENTS.md) y los hechos comprobados en
+> [la matriz de estado](requirements-traceability.md).
+> DiskPie será exclusivamente Windows 10/11 x86-64, gratuito y de código
+> abierto, con Rust/egui y entregas utilizables por etapas. La limpieza será
+> solo mediante papelera: sin eliminación permanente, sin vaciar la papelera
+> y sin alternativa destructiva si Windows no puede reciclar.
+> Las referencias siguientes a Linux/macOS, eliminación definitiva, cumplimiento
+> íntegro de Scanner antes de publicar, investigación continua o revisiones
+> multiagente obligatorias son históricas y no instrucciones para nuevos agentes.
+> Se conserva la prohibición de copiar o redistribuir material propietario.
+> Esta actualización de documentación no modifica ni verifica el código.
+
 Fecha del análisis: 2026-08-02  
 Carpeta analizada: `C:\Users\Luis\Desktop\scan`  
 Objetivo futuro: construir **DiskPie**, una reimplementación limpia en Rust + egui.

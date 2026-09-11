@@ -1,5 +1,14 @@
 # Windows shell actions research
 
+> **Historical research, scoped by the 2026-09-11 owner decisions.**
+> The active contract is [ROADMAP.md](../../ROADMAP.md) and
+> [AGENTS.md](../../AGENTS.md). Permanent deletion and emptying the Recycle Bin
+> are excluded. Recycling must fail without a destructive fallback, including
+> oversized files and native prompts offering permanent deletion. Existing
+> native APIs and experiments below are evidence, not authorization to expose
+> excluded actions. Preserve path identity and other applicable safeguards;
+> verify the new complete recycling flow separately.
+
 - Research date: 2026-08-02
 - Target: Windows 10/11 x86-64, portable executable, standard user
 - Scope: open/reveal, recycle and permanent deletion, empty Recycle Bin,

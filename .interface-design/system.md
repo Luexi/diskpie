@@ -1,93 +1,55 @@
-# DiskPie interface system
+# DiskPie interface implementation summary
+
+This is a compact working reference, subordinate to
+[product direction](../ROADMAP.md) and
+[UI product direction](../docs/research/ui-product-direction.md). Update it when
+the implemented design changes; it does not create separate product policy.
 
 ## Direction
 
-DiskPie is a calm storage instrument for someone who needs to identify what is
-filling a drive and act without uncertainty. The interface should feel spatial,
-precise, responsive, and trustworthy rather than playful or dashboard-like.
+An approachable, polished Windows storage explorer with a shared inspector and
+reviewable cleanup flow. Preserve Rust/egui and improve a connected slice. The
+sunburst remains a useful view, but other views have equal access to selection,
+navigation and the inspector. The earlier industrial radial-only composition
+is not mandatory. Use existing components before introducing a new design layer.
 
-Domain vocabulary: volume topology, radial sectors, rings, scan waves,
-allocation, reclaimable space, hidden branches, omissions, and exact paths.
+## Starting resources
 
-The signature element is the **radial lens**: the sunburst is the primary
-workspace, and its center anchors the current path, selected-size summary,
-navigation target, and live scan state. The same identity follows a branch into
-the synchronized textual view.
+| Role | Existing anchor |
+| --- | --- |
+| Primary dark/brand | Midnight `#062F57` |
+| Primary controls and focus | Cyan `#05BCEB` |
+| Warm data emphasis | Ember `#F79A1E` |
+| Light neutral | Porcelain `#FEFBF0` |
+| Dark base | Slate `#20242B` |
+| Risk/error | Red `#D95B67` |
 
-Avoid these defaults:
+These are starting resources, not a rebrand mandate. Derive coherent light,
+dark and system themes from semantic roles; distinguish selection, data colors
+and risk. State must also be expressed with labels or shape.
 
-- A permanent generic sidebar. Use a compact top command/path rail and a
-  responsive inspection panel that can collapse below the radial lens.
-- A grid of disconnected metric cards. Put volume context in a narrow telemetry
-  strip and selection context in the radial-lens center/details.
-- A rainbow visualization. Derive stable branch families from identity using
-  the brand anchors, and reserve semantic colors for status and risk.
+Use the existing proportional face for text, the monospace family for aligned
+metrics, and the already implemented Windows fallback fonts for native names.
+Keep paths inspectable and copyable. Use a consistent 4-point spacing rhythm,
+readable control targets, visible focus and restrained borders/surface contrast.
 
-## Palette
+## Components and behavior
 
-Every color maps to a named role; components do not introduce arbitrary colors.
+- A clear location/navigation area, one primary exploration view, a view
+  switcher, synchronized textual access and a responsive inspector.
+- A staged cleanup list with explicit review and per-item outcomes, governed
+  by the canonical recycle-only policy. Unsupported recycling leaves files
+  untouched; there are no permanent-delete or empty-bin controls.
+- Shared real-node identity across all views. Aggregate chart sectors are not
+  filesystem action targets.
+- Keyboard/list alternatives, sensible focus order and shortcuts that yield
+  to text input and open dialogs. Verify changes against the implemented
+  command mapping instead of inventing a conflicting shortcut scheme.
+- Wide layouts may place an inspector beside the view; narrow layouts keep
+  essential actions reachable and may relocate/collapse secondary panels.
+- Cache chart geometry, virtualize lists, respect reduced motion and avoid
+  continuous idle repaint. Never perform filesystem/Shell I/O in a frame.
 
-- `platter-midnight` `#062F57`: brand silhouette and dark chart families.
-- `scan-current` `#05BCEB`: primary action, focus, and active progress.
-- `sector-ember` `#F79A1E`: warm data families and important non-destructive
-  emphasis; it is not a second control accent.
-- `separator-porcelain` `#FEFBF0`: high-contrast dividers on dark chart areas.
-- `chassis-slate` `#20242B`: dark-mode base surface.
-- `danger-stop` `#D95B67`: destructive actions only, desaturated for dark mode.
-
-Theme adapters derive foreground hierarchy, surfaces, borders, controls, and
-status colors from these anchors while meeting contrast requirements in light
-and dark themes.
-
-## Depth and surfaces
-
-Use borders plus whisper-quiet same-hue surface shifts. Do not use decorative
-drop shadows or dramatic elevation jumps.
-
-- `bed`: window background and navigation rail.
-- `deck`: radial canvas and main content surface.
-- `tray`: inspection/list surface.
-- `popover`: menus, dialogs, and tooltips above their parent.
-- `well`: controls and inputs inset slightly darker than their surface.
-
-Borders progress from soft separation to normal structure, emphasis, and a
-high-contrast keyboard focus ring. Side panels share the canvas hue and are
-separated by one subtle border.
-
-## Typography
-
-- Use the bundled egui proportional family for UI copy until a reviewed
-  permissive Unicode fallback is selected.
-- Use the monospace family with tabular alignment for bytes, percentages,
-  counts, rates, and timings.
-- Maintain four text levels: primary, secondary, metadata, and disabled.
-- Prefer weight and contrast over large size jumps. Exact paths may wrap or
-  elide visually but remain fully available to copy and accessibility APIs.
-
-## Spacing and shape
-
-The base unit is 4 logical pixels. Common gaps are 4, 8, 12, 16, 24, and 32.
-Controls use 8px internal horizontal padding and at least a 32px target height;
-important toolbar targets are 36px or larger. Radius stays technical: 4px for
-controls, 6px for trays, and 8px for modals. The radial lens itself is circular,
-not placed inside a decorative rounded card.
-
-## Interaction patterns
-
-- Every control has default, hover, pressed, focus, disabled, loading, and error
-  behavior where applicable.
-- The chart and textual view share selection and focus by stable node ID.
-- Backspace or Alt+Up moves to the parent; browser-style Back returns through
-  history; Enter zooms/opens according to focus; Space toggles branch visibility.
-- Reduced-motion preference disables navigation interpolation. Scan updates are
-  coalesced and swap as coherent generations rather than constantly animating.
-- Synthetic Other/Hidden sectors never expose filesystem mutation actions.
-- Recycle/delete confirmations show the exact path. Permanent deletion has a
-  visually stronger, separately worded confirmation.
-
-## Responsive structure
-
-Wide windows place the radial lens beside a 320-420px inspection rail. Narrow
-windows put the inspection view below the lens and keep path/navigation commands
-reachable. The lens size follows available space and DPI; toolbar actions move
-into an overflow menu before labels become illegible.
+Verify the actual screen at relevant window sizes, Windows scaling and themes.
+Document planned components as planned until they are connected and checked;
+this summary is not evidence that the expanded interface already exists.
