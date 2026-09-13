@@ -4360,12 +4360,17 @@ mod tests {
             if let Some(drain) = report.drain {
                 assert!(drain.consumed <= 2);
             }
-            if report.layout_submitted.is_some()
-                && runtime
+            // A submitted frame is still staged unless its layout already
+            // completed within this same tick, in which case the committed
+            // snapshot is the frame that was just submitted.
+            let submitted_state = report.layout_submitted.and_then(|_| {
+                runtime
                     .staged
                     .as_ref()
-                    .is_some_and(|staged| staged.data.snapshot.state() == ScanState::Partial)
-            {
+                    .map(|staged| staged.data.snapshot.state())
+                    .or_else(|| runtime.snapshot().map(TreeSnapshot::state))
+            });
+            if submitted_state == Some(ScanState::Partial) {
                 partial_layout_times.push(clock);
             }
             if report.snapshot_published
