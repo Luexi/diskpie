@@ -64,12 +64,14 @@ use windows::{
                 CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
                 CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize,
             },
+            SystemInformation::GetSystemTime,
             Threading::{CreateEventW, SetEvent},
         },
         UI::{
             Shell::{
-                FILEOPENDIALOGOPTIONS, FOS_DONTADDTORECENT, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST,
-                FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, SIGDN_FILESYSPATH,
+                FILEOPENDIALOGOPTIONS, FOS_DONTADDTORECENT, FOS_FORCEFILESYSTEM,
+                FOS_OVERWRITEPROMPT, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FileOpenDialog,
+                FileSaveDialog, IFileDialog, IFileOpenDialog, IFileSaveDialog, SIGDN_FILESYSPATH,
             },
             WindowsAndMessaging::{
                 DispatchMessageW, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_REMOVE,
@@ -92,6 +94,7 @@ pub const MAX_REQUEST_CAPACITY: usize = 256;
 /// Windows dialog implementation. It is therefore persistent application data
 /// even though DiskPie clears that data after every invocation.
 const FOLDER_DIALOG_CLIENT_GUID: GUID = GUID::from_u128(0x4b48f36d_68bf_49be_9e08_c08ca5afbd60);
+const EXPORT_DIALOG_CLIENT_GUID: GUID = GUID::from_u128(0x24f6a984_475e_4873_b6d7_1aaae53e6bb5);
 
 const WORKER_THREAD_NAME: &str = "diskpie-shell-sta";
 const REAPER_THREAD_NAME: &str = "diskpie-shell-reaper";
@@ -271,6 +274,7 @@ impl EmptyBinShellRequest {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ShellRequestKind {
     PickFolder,
+    SaveExport,
     Open,
     Reveal,
     InstalledApps,
@@ -288,6 +292,8 @@ pub enum ShellRequestKind {
 pub enum ShellRequest {
     /// Select one existing filesystem folder or drive root.
     PickFolder(FolderDialogRequest),
+    /// Choose a native .txt destination; this does not create or replace a file.
+    SaveExport(FolderDialogRequest),
     Open(OpenRequest),
     Reveal(RevealRequest),
     InstalledApps(InstalledAppsRequest),
@@ -298,6 +304,13 @@ pub enum ShellRequest {
 }
 
 impl ShellRequest {
+    /// The caller must preflight the returned path and confirm its real
+    /// transport and existing identity before committing an export.
+    #[must_use]
+    pub const fn save_export(owner: OwnerWindow) -> Self {
+        Self::SaveExport(FolderDialogRequest { owner })
+    }
+
     /// Builds an open request from a target validated for opening.
     #[must_use]
     pub fn open(owner: OwnerWindow, item: &OpenItem) -> Self {
@@ -374,6 +387,7 @@ impl ShellRequest {
     pub const fn kind(&self) -> ShellRequestKind {
         match self {
             Self::PickFolder(_) => ShellRequestKind::PickFolder,
+            Self::SaveExport(_) => ShellRequestKind::SaveExport,
             Self::Open(_) => ShellRequestKind::Open,
             Self::Reveal(_) => ShellRequestKind::Reveal,
             Self::InstalledApps(_) => ShellRequestKind::InstalledApps,
@@ -393,6 +407,7 @@ impl ShellRequest {
         matches!(
             self.kind(),
             ShellRequestKind::PickFolder
+                | ShellRequestKind::SaveExport
                 | ShellRequestKind::Recycle
                 | ShellRequestKind::DeletePermanently
                 | ShellRequestKind::EmptyRecycleBin
@@ -529,6 +544,7 @@ impl DialogEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ShellEvent {
     Dialog(DialogEvent),
+    SaveExport(DialogEvent),
     Open { request_id: DialogRequestId, outcome: DispatchOutcome },
     Reveal { request_id: DialogRequestId, outcome: DispatchOutcome },
     InstalledApps { request_id: DialogRequestId, outcome: DispatchOutcome },
@@ -542,7 +558,7 @@ impl ShellEvent {
     /// Returns the request ID shared by every terminal outcome.
     pub const fn request_id(&self) -> DialogRequestId {
         match self {
-            Self::Dialog(event) => event.request_id(),
+            Self::Dialog(event) | Self::SaveExport(event) => event.request_id(),
             Self::Open { request_id, .. }
             | Self::Reveal { request_id, .. }
             | Self::InstalledApps { request_id, .. }
@@ -1495,6 +1511,17 @@ fn execute_request(queued: QueuedRequest) -> ShellEvent {
         return cancelled_before_start_event(meta);
     }
     match request {
+        ShellRequest::SaveExport(request) => {
+            ShellEvent::SaveExport(match show_export_dialog(request.owner) {
+                Ok((DialogOutcome::Selected(path), cleanup_hresult)) => {
+                    DialogEvent::Selected { request_id: id, path, cleanup_hresult }
+                }
+                Ok((DialogOutcome::Cancelled, cleanup_hresult)) => {
+                    DialogEvent::Cancelled { request_id: id, cleanup_hresult }
+                }
+                Err(error) => DialogEvent::Failed { request_id: id, error },
+            })
+        }
         ShellRequest::PickFolder(request) => {
             ShellEvent::Dialog(match show_folder_dialog(request.owner) {
                 Ok((DialogOutcome::Selected(path), cleanup_hresult)) => {
@@ -1568,6 +1595,9 @@ fn cancelled_before_start_event(meta: RequestMeta) -> ShellEvent {
     let request_id = meta.id;
     let not_run = DispatchOutcome::not_run(DispatchStage::CancelledBeforeDispatch);
     match meta.kind {
+        ShellRequestKind::SaveExport => {
+            ShellEvent::SaveExport(DialogEvent::Cancelled { request_id, cleanup_hresult: None })
+        }
         ShellRequestKind::PickFolder => {
             ShellEvent::Dialog(DialogEvent::Cancelled { request_id, cleanup_hresult: None })
         }
@@ -1614,6 +1644,9 @@ fn failed_request_event(meta: RequestMeta, error: DialogError) -> ShellEvent {
         DestructiveOutcome::CancelledBeforeMutation
     };
     match meta.kind {
+        ShellRequestKind::SaveExport => {
+            ShellEvent::SaveExport(DialogEvent::Failed { request_id, error })
+        }
         ShellRequestKind::PickFolder => {
             ShellEvent::Dialog(DialogEvent::Failed { request_id, error })
         }
@@ -1750,6 +1783,51 @@ fn show_folder_dialog(owner: OwnerWindow) -> Result<(DialogOutcome, Option<i32>)
     cleanup.finish(show_and_extract(&dialog, owner))
 }
 
+fn show_export_dialog(owner: OwnerWindow) -> Result<(DialogOutcome, Option<i32>), DialogError> {
+    // SAFETY: COM was initialized on this STA, and the interface never leaves it.
+    let dialog: IFileSaveDialog =
+        unsafe { CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER) }.map_err(
+            |error| DialogError::from_hresult(DialogErrorStage::CreateDialog, error.code().0),
+        )?;
+    // SAFETY: the interface is live and owned by this STA.
+    let existing = unsafe { dialog.GetOptions() }
+        .map_err(|error| DialogError::from_hresult(DialogErrorStage::GetOptions, error.code().0))?;
+    // Handle-bound preflight will ask the user for a new name if it exists;
+    // create-only exports must never offer an overwrite confirmation here.
+    let options = (existing | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT)
+        & !FOS_OVERWRITEPROMPT;
+    // SAFETY: every pointer below is a live NUL-terminated local buffer for
+    // synchronous COM calls. Only fixed product text and UTC digits are used.
+    unsafe { dialog.SetOptions(options) }
+        .map_err(|error| DialogError::from_hresult(DialogErrorStage::SetOptions, error.code().0))?;
+    // SAFETY: the fixed GUID outlives the synchronous call.
+    unsafe { dialog.SetClientGuid(&EXPORT_DIALOG_CLIENT_GUID) }.map_err(|error| {
+        DialogError::from_hresult(DialogErrorStage::SetClientGuid, error.code().0)
+    })?;
+    let cleanup = CleanupGuard::new(|| {
+        // SAFETY: the guard runs before releasing the interface on this STA.
+        unsafe { dialog.ClearClientData() }.map_err(|error| error.code().0)
+    });
+    let result = (|| {
+        // SAFETY: GetSystemTime returns a plain initialized SYSTEMTIME value.
+        let utc = unsafe { GetSystemTime() };
+        let name = format!(
+            "DiskPie-diagnostics-{:04}-{:02}-{:02}-{:02}{:02}{:02}.txt",
+            utc.wYear, utc.wMonth, utc.wDay, utc.wHour, utc.wMinute, utc.wSecond
+        );
+        let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let extension = [b't' as u16, b'x' as u16, b't' as u16, 0];
+        // SAFETY: both buffers are NUL-terminated and live for these calls.
+        unsafe {
+            dialog.SetFileName(PCWSTR(name.as_ptr()))?;
+            dialog.SetDefaultExtension(PCWSTR(extension.as_ptr()))?;
+        }
+        Ok::<(), windows::core::Error>(())
+    })()
+    .map_err(|error| DialogError::from_hresult(DialogErrorStage::SetOptions, error.code().0));
+    cleanup.finish(result.and_then(|()| show_and_extract(&dialog, owner)))
+}
+
 struct CleanupGuard<F>
 where
     F: FnMut() -> Result<(), i32>,
@@ -1812,7 +1890,7 @@ fn folder_dialog_options(existing: FILEOPENDIALOGOPTIONS) -> FILEOPENDIALOGOPTIO
 }
 
 fn show_and_extract(
-    dialog: &IFileOpenDialog,
+    dialog: &IFileDialog,
     owner: OwnerWindow,
 ) -> Result<DialogOutcome, DialogError> {
     // SAFETY: the HWND is a borrowed owner value supplied by the UI and is used
@@ -2691,6 +2769,7 @@ mod tests {
     fn terminal_event_mapping_covers_every_request_kind() {
         let kinds = [
             ShellRequestKind::PickFolder,
+            ShellRequestKind::SaveExport,
             ShellRequestKind::Open,
             ShellRequestKind::Reveal,
             ShellRequestKind::InstalledApps,
@@ -2706,6 +2785,15 @@ mod tests {
             let shutdown = failed_request_event(meta, DialogError::service_shutdown());
             let panicked = failed_request_event(meta, DialogError::worker_panicked());
             match kind {
+                ShellRequestKind::SaveExport => {
+                    assert!(matches!(
+                        cancelled,
+                        ShellEvent::SaveExport(DialogEvent::Cancelled { .. })
+                    ));
+                    assert!(matches!(shutdown, ShellEvent::SaveExport(DialogEvent::Failed { .. })));
+                    assert!(matches!(panicked, ShellEvent::SaveExport(DialogEvent::Failed { .. })));
+                    assert!(ShellRequest::save_export(owner()).is_modal());
+                }
                 ShellRequestKind::PickFolder => {
                     assert!(matches!(cancelled, ShellEvent::Dialog(DialogEvent::Cancelled { .. })));
                     assert!(matches!(shutdown, ShellEvent::Dialog(DialogEvent::Failed { .. })));

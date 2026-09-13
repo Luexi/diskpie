@@ -14,6 +14,8 @@ const MIN_LAYOUT_DEPTH: u8 = 1;
 const MAX_LAYOUT_DEPTH: u8 = 16;
 const MAX_MINIMUM_SWEEP: f64 = 0.1;
 const MAX_WORKERS: u16 = 64;
+pub const MIN_ITEM_LIST_WIDTH_POINTS: u16 = 260;
+pub const MAX_ITEM_LIST_WIDTH_POINTS: u16 = 400;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -59,6 +61,9 @@ pub struct Settings {
     pub theme: UiTheme,
     pub size_preference: SizePreference,
     pub show_both_sizes: bool,
+    /// The textual companion is available on demand beside the chart.
+    pub show_item_list: bool,
+    pub item_list_width_points: u16,
     pub ui_scale: Option<f32>,
     pub layout_max_sectors: u32,
     pub layout_max_depth: u8,
@@ -76,6 +81,8 @@ impl Default for Settings {
             theme: UiTheme::System,
             size_preference: SizePreference::Allocated,
             show_both_sizes: true,
+            show_item_list: false,
+            item_list_width_points: 300,
             ui_scale: None,
             layout_max_sectors: 10_000,
             layout_max_depth: 8,
@@ -128,6 +135,13 @@ impl Settings {
             self.scan_workers = MAX_WORKERS;
             corrections.insert(SettingsCorrections::SCAN_WORKERS);
         }
+        let width = self
+            .item_list_width_points
+            .clamp(MIN_ITEM_LIST_WIDTH_POINTS, MAX_ITEM_LIST_WIDTH_POINTS);
+        if self.item_list_width_points != width {
+            self.item_list_width_points = width;
+            corrections.insert(SettingsCorrections::ITEM_LIST);
+        }
         (self, corrections)
     }
 }
@@ -156,6 +170,7 @@ impl SettingsCorrections {
     pub const UI_SCALE: Self = Self(1 << 0);
     pub const LAYOUT: Self = Self(1 << 1);
     pub const SCAN_WORKERS: Self = Self(1 << 2);
+    pub const ITEM_LIST: Self = Self(1 << 3);
 
     #[must_use]
     pub const fn is_empty(self) -> bool {
@@ -370,6 +385,7 @@ mod tests {
             layout_max_depth: 0,
             layout_minimum_sweep: f64::INFINITY,
             scan_workers: u16::MAX,
+            item_list_width_points: u16::MAX,
             ..Settings::default()
         };
         let (settings, corrections) = invalid.validated();
@@ -379,9 +395,47 @@ mod tests {
         assert_eq!(settings.layout_max_depth, MIN_LAYOUT_DEPTH);
         assert_eq!(settings.layout_minimum_sweep, Settings::default().layout_minimum_sweep);
         assert_eq!(settings.scan_workers, MAX_WORKERS);
+        assert_eq!(settings.item_list_width_points, MAX_ITEM_LIST_WIDTH_POINTS);
         assert!(corrections.contains(SettingsCorrections::UI_SCALE));
         assert!(corrections.contains(SettingsCorrections::LAYOUT));
         assert!(corrections.contains(SettingsCorrections::SCAN_WORKERS));
+        assert!(corrections.contains(SettingsCorrections::ITEM_LIST));
+    }
+
+    #[test]
+    fn additive_list_preferences_preserve_old_settings_and_default_to_hidden() {
+        let old = serde::de::value::MapDeserializer::<_, serde::de::value::Error>::new(
+            [("theme", "dark"), ("size_preference", "logical")].into_iter(),
+        );
+        let settings = Settings::deserialize(old).unwrap();
+        assert_eq!(settings.theme, UiTheme::Dark);
+        assert_eq!(settings.size_preference, SizePreference::Logical);
+        assert!(!settings.show_item_list);
+        assert_eq!(settings.item_list_width_points, 300);
+        let defaults = Settings::default();
+        assert_eq!(defaults.theme, UiTheme::System);
+        assert_eq!(defaults.size_preference, SizePreference::Allocated);
+        for (width, expected) in [(0, 260), (260, 260), (300, 300), (400, 400), (u16::MAX, 400)] {
+            let (validated, corrections) =
+                Settings { item_list_width_points: width, ..defaults.clone() }.validated();
+            assert_eq!(validated.item_list_width_points, expected);
+            assert_eq!(corrections.contains(SettingsCorrections::ITEM_LIST), width != expected);
+        }
+    }
+
+    #[test]
+    fn item_list_preferences_persist_only_after_an_explicit_edit() {
+        let mut store = FakeStore::default();
+        let mut session = SettingsSession::load(&mut store);
+        let edited = Settings {
+            show_item_list: true,
+            item_list_width_points: 360,
+            ..session.settings().clone()
+        };
+        session.replace(edited.clone());
+        assert_eq!(session.save(&mut store), Ok(SettingsSaveOutcome::Saved));
+        assert_eq!(store.writes[0].settings, edited);
+        assert_eq!(store.writes[0].schema_version, 1);
     }
 
     #[test]

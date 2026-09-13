@@ -30,5 +30,10 @@ tracing-subscriber.workspace = true
 [build-dependencies]
 winresource.workspace = true
 
+[target.'cfg(windows)'.dev-dependencies]
+# Already locked through eframe; needed only for native screenshot fixtures on
+# the libtest worker thread, using EventLoopBuilderExtWindows::with_any_thread.
+winit = { version = "=0.30.13", default-features = false }
+
 [lints]
 workspace = true

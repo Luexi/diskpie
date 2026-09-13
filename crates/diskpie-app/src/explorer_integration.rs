@@ -936,6 +936,10 @@ pub enum RollbackReport {
     Clean,
     /// Rollback itself failed; a staging or previous sibling may remain.
     Failed(RegistryError),
+    /// Removal is not transactional. This many whole subtrees were removed,
+    /// and the failing deletion may also have removed part of its subtree.
+    /// No attempt was made to recreate registry content from an old snapshot.
+    RemovalIncomplete { removed_subtrees: usize },
 }
 
 /// Failure of an inspection or a request.
@@ -992,6 +996,21 @@ impl fmt::Display for IntegrationError {
 }
 
 impl Error for IntegrationError {}
+
+impl IntegrationError {
+    /// Whether an attempted request may have changed registry contents even
+    /// though it returned an error. A clean rollback still made transient
+    /// changes that Explorer may have observed.
+    #[must_use]
+    pub fn may_have_mutated(&self) -> bool {
+        match self {
+            Self::Verification { rollback, .. }
+            | Self::ConcurrentModification { rollback, .. }
+            | Self::Registry { rollback, .. } => *rollback != RollbackReport::NotNeeded,
+            _ => false,
+        }
+    }
+}
 
 impl From<ExecutablePathError> for IntegrationError {
     fn from(error: ExecutablePathError) -> Self {
@@ -1117,11 +1136,14 @@ pub fn apply(
             Err(IntegrationError::StaleRequiresDecision(Box::new(status)))
         }
         Decision::Perform(plan) => {
-            let report = perform(registry, &plan, &record, token)?;
-            if report.outcome.mutated() {
+            let result = perform(registry, &plan, &record, token);
+            if result
+                .as_ref()
+                .map_or_else(|error| error.may_have_mutated(), |report| report.outcome.mutated())
+            {
                 registry.notify_association_changed();
             }
-            Ok(report)
+            result
         }
     }
 }
@@ -1144,34 +1166,46 @@ fn perform_remove(
     plan: &Plan,
     record: &VerbRecord,
 ) -> Result<IntegrationReport, IntegrationError> {
+    let mut removed_subtrees = 0;
     for (target, _) in plan.actions() {
         let state = classify_target(registry, *target, record).map_err(|error| {
-            IntegrationError::Registry { error, rollback: RollbackReport::NotNeeded }
+            IntegrationError::Registry { error, rollback: removal_progress(removed_subtrees) }
         })?;
         if !state.is_owned() {
             return Err(IntegrationError::ConcurrentModification {
                 target: *target,
-                rollback: RollbackReport::NotNeeded,
+                rollback: removal_progress(removed_subtrees),
             });
         }
         registry.delete_tree(&verb_key(*target)).map_err(|error| IntegrationError::Registry {
             error,
-            rollback: RollbackReport::NotNeeded,
+            // A failed recursive delete can mutate part of the subtree.
+            rollback: RollbackReport::RemovalIncomplete { removed_subtrees },
         })?;
+        removed_subtrees += 1;
     }
     for stray in plan.strays() {
         // Re-verify the marker immediately before each exact deletion.
         let owned = is_marked_owned(registry, stray).map_err(|error| {
-            IntegrationError::Registry { error, rollback: RollbackReport::NotNeeded }
+            IntegrationError::Registry { error, rollback: removal_progress(removed_subtrees) }
         })?;
         if owned {
             registry.delete_tree(stray).map_err(|error| IntegrationError::Registry {
                 error,
-                rollback: RollbackReport::NotNeeded,
+                rollback: RollbackReport::RemovalIncomplete { removed_subtrees },
             })?;
+            removed_subtrees += 1;
         }
     }
     Ok(IntegrationReport { outcome: plan.outcome(), incomplete_cleanup: None })
+}
+
+fn removal_progress(removed_subtrees: usize) -> RollbackReport {
+    if removed_subtrees == 0 {
+        RollbackReport::NotNeeded
+    } else {
+        RollbackReport::RemovalIncomplete { removed_subtrees }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2138,6 +2172,59 @@ mod tests {
     }
 
     #[test]
+    fn failed_removal_reports_progress_and_notifies_after_a_partial_change() {
+        let mut seed = installed(EXE);
+        seed.clear_operations();
+        let mut probe = seed.clone();
+        apply(&mut probe, IntegrationRequest::Remove, Path::new(EXE), &token()).unwrap();
+        let operations = probe.operations();
+        let second_delete = operations
+            .iter()
+            .enumerate()
+            .filter(|(_, operation)| **operation == RegistryOperation::Delete)
+            .nth(1)
+            .unwrap()
+            .0;
+        let initial_notifications = seed.notifications();
+        seed.fail_operation(second_delete, RegistryErrorKind::AccessDenied);
+        let error =
+            apply(&mut seed, IntegrationRequest::Remove, Path::new(EXE), &token()).unwrap_err();
+        assert!(matches!(
+            error,
+            IntegrationError::Registry {
+                rollback: RollbackReport::RemovalIncomplete { removed_subtrees: 1 },
+                ..
+            }
+        ));
+        assert!(error.may_have_mutated());
+        assert_eq!(seed.notifications(), initial_notifications + 1);
+        let status = inspect(&seed, Path::new(EXE)).unwrap();
+        assert_eq!(status.key_state(VerbTarget::Directory), &KeyState::NotInstalled);
+        assert_eq!(status.key_state(VerbTarget::Drive), &KeyState::OwnedCurrent);
+        assert!(matches!(decide(IntegrationRequest::Repair, &status), Decision::Perform(_)));
+    }
+
+    #[test]
+    fn every_removal_failure_after_mutation_preserves_a_reconciliation_signal() {
+        let mut seed = installed(EXE);
+        seed.clear_operations();
+        let mut probe = seed.clone();
+        apply(&mut probe, IntegrationRequest::Remove, Path::new(EXE), &token()).unwrap();
+        for index in 0..probe.operations().len() {
+            let mut registry = seed.clone();
+            registry.fail_operation(index, RegistryErrorKind::AccessDenied);
+            let before = registry.snapshot();
+            let notifications = registry.notifications();
+            let error = apply(&mut registry, IntegrationRequest::Remove, Path::new(EXE), &token())
+                .unwrap_err();
+            if registry.snapshot() != before {
+                assert!(error.may_have_mutated(), "missing partial progress at operation {index}");
+                assert_eq!(registry.notifications(), notifications + 1);
+            }
+        }
+    }
+
+    #[test]
     fn staging_collision_refuses_without_writing() {
         let mut registry = FakeRegistry::new();
         registry.create_key(&staging_verb_key(VerbTarget::Drive, &token())).expect("create");
@@ -2212,7 +2299,11 @@ mod tests {
                     seed.snapshot(),
                     "step {step} {kind:?} restores state"
                 );
-                assert_eq!(registry.notifications(), seed.notifications(), "step {step}");
+                assert_eq!(
+                    registry.notifications(),
+                    seed.notifications() + usize::from(error.may_have_mutated()),
+                    "step {step}: notify whenever Explorer may have observed transient changes"
+                );
             }
         }
     }
@@ -2365,7 +2456,7 @@ mod tests {
             }
         );
         assert_eq!(registry.inner.snapshot(), before);
-        assert_eq!(registry.inner.notifications(), 0);
+        assert_eq!(registry.inner.notifications(), 1, "rollback follows observable staged writes");
     }
 
     #[test]
@@ -2433,7 +2524,7 @@ mod tests {
         assert!(
             matches!(rollback, RollbackReport::Failed(failed) if failed.operation == RegistryOperation::Delete)
         );
-        assert_eq!(failing.inner.notifications(), 0);
+        assert_eq!(failing.inner.notifications(), 1, "a failed rollback requires Explorer refresh");
     }
 
     #[test]

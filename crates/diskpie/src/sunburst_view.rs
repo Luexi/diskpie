@@ -4,6 +4,7 @@
 
 use std::{borrow::Cow, sync::Arc};
 
+use diskpie_app::presentation::ColorIdentity;
 use diskpie_core::{
     NodeId,
     sunburst::{FULL_TURN, OtherCause, Sector, SectorKind, SizeBasis, SunburstLayout},
@@ -133,12 +134,18 @@ impl SunburstMeshCache {
         options: SunburstMeshOptions,
         pixels_per_point: f32,
         dark_mode: bool,
-        color_key: &dyn Fn(NodeId) -> u64,
+        color_identity: &dyn Fn(NodeId) -> ColorIdentity,
     ) -> PreparedMesh {
         let options = options.sanitized();
         let pixels_per_point = sanitize_pixels_per_point(pixels_per_point);
-        let key =
-            MeshCacheKey::new(layout, geometry, options, pixels_per_point, dark_mode, color_key);
+        let key = MeshCacheKey::new(
+            layout,
+            geometry,
+            options,
+            pixels_per_point,
+            dark_mode,
+            color_identity,
+        );
 
         if let Some(entry) = self.entry.as_ref().filter(|entry| entry.key == key) {
             return PreparedMesh {
@@ -149,7 +156,7 @@ impl SunburstMeshCache {
         }
 
         let (mesh, stats) =
-            build_base_mesh(layout, geometry, options, pixels_per_point, dark_mode, color_key);
+            build_base_mesh(layout, geometry, options, pixels_per_point, dark_mode, color_identity);
         let mesh = Arc::new(mesh);
         self.build_count = self.build_count.saturating_add(1);
         self.entry = Some(CachedMesh { key, mesh: Arc::clone(&mesh), stats });
@@ -235,11 +242,11 @@ pub enum NodeChange {
 /// Typed interaction requests emitted during a chart frame.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SunburstRequests {
-    /// Primary activation of a real sector.
-    pub clicked: Option<NodeId>,
-    /// Pointer double-click of a real sector.
-    pub double_clicked: Option<NodeId>,
-    /// Zoom request from double-click or keyboard Enter.
+    /// Single primary click outside the center; the shell decides file/folder policy.
+    pub primary_click: Option<NodeId>,
+    /// Primary click on the center, subject to the shell's parent availability.
+    pub parent: bool,
+    /// Zoom request from keyboard Enter.
     pub zoom: Option<NodeId>,
     /// Context-menu request from secondary-click or Shift+F10.
     pub context_menu: Option<NodeId>,
@@ -250,8 +257,8 @@ pub struct SunburstRequests {
 impl SunburstRequests {
     #[must_use]
     pub const fn is_empty(self) -> bool {
-        self.clicked.is_none()
-            && self.double_clicked.is_none()
+        self.primary_click.is_none()
+            && !self.parent
             && self.zoom.is_none()
             && self.context_menu.is_none()
             && self.selection.is_none()
@@ -270,6 +277,7 @@ pub struct SunburstResponse {
     pub cache_rebuilt: bool,
     pub chart_center: Pos2,
     pub chart_radius: f32,
+    pub center_radius_normalized: f64,
 }
 
 /// One-frame view over an immutable layout and a caller-owned mesh cache.
@@ -280,7 +288,7 @@ pub struct SunburstView<'a> {
     focused: Option<NodeId>,
     desired_size: Option<Vec2>,
     options: SunburstMeshOptions,
-    color_key: Option<&'a dyn Fn(NodeId) -> u64>,
+    color_identity: Option<&'a dyn Fn(NodeId) -> ColorIdentity>,
     accessibility_label: Cow<'a, str>,
 }
 
@@ -294,7 +302,7 @@ impl<'a> SunburstView<'a> {
             focused: None,
             desired_size: None,
             options: SunburstMeshOptions::default(),
-            color_key: None,
+            color_identity: None,
             accessibility_label: Cow::Borrowed("Disk usage sunburst"),
         }
     }
@@ -323,11 +331,11 @@ impl<'a> SunburstView<'a> {
         self
     }
 
-    /// Supplies a deterministic identity key, normally derived from a stable
-    /// root-relative path. The callback must be pure for the duration of `show`.
+    /// Supplies immutable family/path identities and absolute ancestry depth.
+    /// The callback must be pure and constant-time for the duration of `show`.
     #[must_use]
-    pub fn color_key(mut self, color_key: &'a dyn Fn(NodeId) -> u64) -> Self {
-        self.color_key = Some(color_key);
+    pub fn color_identity(mut self, color_identity: &'a dyn Fn(NodeId) -> ColorIdentity) -> Self {
+        self.color_identity = Some(color_identity);
         self
     }
 
@@ -364,7 +372,7 @@ impl<'a> SunburstView<'a> {
             focused,
             desired_size,
             options,
-            color_key,
+            color_identity,
             accessibility_label,
         } = self;
         let options = options.sanitized();
@@ -373,13 +381,27 @@ impl<'a> SunburstView<'a> {
         let geometry = ChartGeometry::from_rect(rect, options);
         let pixels_per_point = sanitize_pixels_per_point(ui.ctx().pixels_per_point());
         let dark_mode = ui.visuals().dark_mode;
-        let default_color_key = |node: NodeId| u64::from(node.raw());
-        let color_key = color_key.unwrap_or(&default_color_key);
+        let default_color_identity = |node: NodeId| ColorIdentity {
+            family_key: u64::from(node.raw()),
+            variant_key: u64::from(node.raw()),
+            depth: 0,
+        };
+        let color_identity = color_identity.unwrap_or(&default_color_identity);
 
         let prepared =
-            cache.prepare(layout, geometry, options, pixels_per_point, dark_mode, color_key);
+            cache.prepare(layout, geometry, options, pixels_per_point, dark_mode, color_identity);
         if !prepared.mesh.indices.is_empty() {
             ui.painter().add(Shape::Mesh(Arc::clone(&prepared.mesh)));
+        }
+        if let Some(hub) =
+            layout.sectors().first().and_then(|sector| visible_sector(sector, geometry, options))
+        {
+            let border = if dark_mode {
+                Color32::from_rgb(64, 67, 73)
+            } else {
+                Color32::from_rgb(222, 223, 225)
+            };
+            ui.painter().circle_stroke(geometry.center, hub.outer_radius, Stroke::new(1.0, border));
         }
 
         let hovered_sector = response
@@ -430,6 +452,10 @@ impl<'a> SunburstView<'a> {
             cache_rebuilt: prepared.rebuilt,
             chart_center: geometry.center,
             chart_radius: geometry.radius,
+            center_radius_normalized: layout
+                .sectors()
+                .first()
+                .map_or(1.0, |sector| sector.outer_radius),
         }
     }
 }
@@ -593,7 +619,7 @@ fn build_base_mesh(
     options: SunburstMeshOptions,
     pixels_per_point: f32,
     dark_mode: bool,
-    color_key: &dyn Fn(NodeId) -> u64,
+    color_identity: &dyn Fn(NodeId) -> ColorIdentity,
 ) -> (Mesh, SunburstMeshStats) {
     let mut mesh = Mesh::default();
     let reserve_vertices = layout.sectors().len().saturating_mul(8).min(options.max_vertices);
@@ -609,7 +635,7 @@ fn build_base_mesh(
         };
         let desired_subdivisions =
             subdivisions(visible.sweep_angle, visible.outer_radius, pixels_per_point, options);
-        let color = sector_fill_color(sector, dark_mode, color_key);
+        let color = sector_fill_color(sector, dark_mode, color_identity);
         let append =
             append_sector(&mut mesh, geometry, visible, desired_subdivisions, color, options);
         match append {
@@ -899,6 +925,7 @@ struct InteractionSignals {
     double_clicked: bool,
     secondary_clicked: bool,
     enter: bool,
+    space: bool,
     escape: bool,
     context_key: bool,
     navigation: Option<Navigation>,
@@ -923,6 +950,7 @@ fn collect_interaction_signals(ui: &egui::Ui, response: &egui::Response) -> Inte
     if response.has_focus() {
         ui.input(|input| {
             signals.enter = input.key_pressed(Key::Enter);
+            signals.space = input.key_pressed(Key::Space);
             signals.escape = input.key_pressed(Key::Escape);
             signals.context_key = input.modifiers.shift && input.key_pressed(Key::F10);
             signals.navigation = if input.key_pressed(Key::ArrowLeft) {
@@ -952,28 +980,33 @@ fn resolve_interactions(
     let hovered_target = hovered.and_then(Sector::action_target);
     let current = current_action_target(layout, focused, selected);
 
-    if signals.primary_clicked {
+    // The first click already activates a directory. A recognized second click
+    // must not activate the newly zoomed content underneath the same pointer.
+    if signals.primary_clicked && !signals.double_clicked && !signals.enter && !signals.space {
         let target = if signals.pointer_present { hovered_target } else { current };
         if let Some(target) = target {
-            requests.clicked = Some(target);
-            requests.selection = Some(NodeChange::Set(target));
-            requests.focus = Some(NodeChange::Set(target));
+            if target == layout.root() {
+                requests.parent = true;
+            } else {
+                requests.primary_click = Some(target);
+                requests.focus = Some(NodeChange::Set(target));
+            }
         } else if signals.pointer_present && hovered.is_none() {
             requests.selection = Some(NodeChange::Clear);
             requests.focus = Some(NodeChange::Clear);
         }
-    }
-    if signals.double_clicked
-        && let Some(target) = hovered_target
-    {
-        requests.double_clicked = Some(target);
-        requests.zoom = Some(target);
     }
     if signals.secondary_clicked {
         requests.context_menu = hovered_target;
     }
     if signals.enter {
         requests.zoom = current;
+    }
+    if signals.space
+        && let Some(target) = current
+    {
+        requests.selection = Some(NodeChange::Set(target));
+        requests.focus = Some(NodeChange::Set(target));
     }
     if signals.context_key {
         requests.context_menu = current;
@@ -1070,42 +1103,52 @@ fn radial_neighbor(layout: &SunburstLayout, current: &Sector, outward: bool) -> 
         .next()
 }
 
-/// Stable, restrained sector color for a caller-provided identity key.
-/// The same key selects the same family in light and dark themes.
+/// Stable branch-family color shared by the chart and the optional item list.
+/// Absolute ancestry depth keeps the tone unchanged when the view root changes.
 #[must_use]
-pub fn stable_sector_color(identity_key: u64, depth: u32, dark_mode: bool) -> Color32 {
-    const DARK: [[u8; 3]; 6] = [
-        [48, 145, 183],
-        [44, 130, 169],
-        [55, 141, 136],
-        [92, 140, 187],
-        [198, 130, 43],
-        [176, 109, 60],
-    ];
-    const LIGHT: [[u8; 3]; 6] =
-        [[0, 91, 121], [11, 80, 112], [18, 91, 86], [45, 74, 116], [132, 75, 4], [117, 62, 30]];
-    let mixed = mix64(identity_key);
-    let slot = mixed as usize % DARK.len();
-    let base = if dark_mode { DARK[slot] } else { LIGHT[slot] };
-    let variation = ((mixed >> 32) & 0x0f) as i16 - 7;
-    let depth_shift = i16::try_from(depth % 5).unwrap_or(0) - 2;
-    let shift = if dark_mode { variation + depth_shift * 3 } else { variation - depth_shift * 2 };
-    Color32::from_rgb(
-        shift_channel(base[0], shift),
-        shift_channel(base[1], shift),
-        shift_channel(base[2], shift),
-    )
+pub fn stable_sector_color(identity: ColorIdentity, dark_mode: bool) -> Color32 {
+    // Use the full hue circle rather than a handful of palette slots: unrelated
+    // branches should not routinely collapse to identical colors. Native-path
+    // identity, never ordering or the visible siblings, determines the hue.
+    let hue = (mix64(identity.family_key) >> 40) as f32 * (360.0 / 16_777_216.0);
+    let variation = ((mix64(identity.variant_key) >> 32) & 15) as f32 / 15.0 - 0.5;
+    let depth = identity.depth.min(4) as f32;
+    let (saturation, lightness) = if dark_mode {
+        (0.45, 0.55 + depth * 0.05 + variation * 0.02)
+    } else {
+        (0.52, 0.43 + depth * 0.07 + variation * 0.02)
+    };
+    // CSS HSL works in sRGB; egui's Hsva is linear, so convert explicitly.
+    let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+    let section = hue / 60.0;
+    let secondary = chroma * (1.0 - (section % 2.0 - 1.0).abs());
+    let channels = match section as u8 {
+        0 => [chroma, secondary, 0.0],
+        1 => [secondary, chroma, 0.0],
+        2 => [0.0, chroma, secondary],
+        3 => [0.0, secondary, chroma],
+        4 => [secondary, 0.0, chroma],
+        _ => [chroma, 0.0, secondary],
+    };
+    let offset = lightness - chroma * 0.5;
+    let [red, green, blue] = channels.map(|channel| ((channel + offset) * 255.0).round() as u8);
+    Color32::from_rgb(red, green, blue)
 }
 
 fn sector_fill_color(
     sector: &Sector,
     dark_mode: bool,
-    color_key: &dyn Fn(NodeId) -> u64,
+    color_identity: &dyn Fn(NodeId) -> ColorIdentity,
 ) -> Color32 {
+    // The hub carries text and parent navigation, never a misleading colored
+    // "usage" fill for an empty or entirely unknown snapshot.
+    if sector.depth == 0 {
+        return if dark_mode { Color32::from_rgb(32, 33, 36) } else { Color32::WHITE };
+    }
     match sector.kind {
         SectorKind::Real => sector.action_target().map_or_else(
             || synthetic_hidden_color(dark_mode),
-            |node| stable_sector_color(color_key(node), sector.depth, dark_mode),
+            |node| stable_sector_color(color_identity(node), dark_mode),
         ),
         SectorKind::Hidden { .. } => synthetic_hidden_color(dark_mode),
         SectorKind::Other { .. } => synthetic_other_color(dark_mode),
@@ -1118,10 +1161,6 @@ fn synthetic_hidden_color(dark_mode: bool) -> Color32 {
 
 fn synthetic_other_color(dark_mode: bool) -> Color32 {
     if dark_mode { Color32::from_rgb(147, 118, 79) } else { Color32::from_rgb(103, 79, 48) }
-}
-
-fn shift_channel(channel: u8, shift: i16) -> u8 {
-    (i16::from(channel) + shift).clamp(0, 255) as u8
 }
 
 fn mix64(mut value: u64) -> u64 {
@@ -1154,10 +1193,10 @@ impl MeshCacheKey {
         options: SunburstMeshOptions,
         pixels_per_point: f32,
         dark_mode: bool,
-        color_key: &dyn Fn(NodeId) -> u64,
+        color_identity: &dyn Fn(NodeId) -> ColorIdentity,
     ) -> Self {
         Self {
-            layout_fingerprint: layout_fingerprint(layout, color_key),
+            layout_fingerprint: layout_fingerprint(layout, color_identity),
             center_x: geometry.center.x.to_bits(),
             center_y: geometry.center.y.to_bits(),
             radius: geometry.radius.to_bits(),
@@ -1172,10 +1211,14 @@ impl MeshCacheKey {
     }
 }
 
-fn layout_fingerprint(layout: &SunburstLayout, color_key: &dyn Fn(NodeId) -> u64) -> u64 {
+fn layout_fingerprint(
+    layout: &SunburstLayout,
+    color_identity: &dyn Fn(NodeId) -> ColorIdentity,
+) -> u64 {
     let mut fingerprint = Fingerprint::new();
     fingerprint.write_u64(layout.source_generation().get());
     fingerprint.write_u32(layout.root().raw());
+    fingerprint.write_u32(layout.effective_depth());
     fingerprint.write_u8(match layout.size_basis() {
         SizeBasis::Logical => 0,
         SizeBasis::Allocated => 1,
@@ -1196,7 +1239,10 @@ fn layout_fingerprint(layout: &SunburstLayout, color_key: &dyn Fn(NodeId) -> u64
             SectorKind::Real => {
                 fingerprint.write_u8(0);
                 if let Some(node) = sector.action_target() {
-                    fingerprint.write_u64(color_key(node));
+                    let identity = color_identity(node);
+                    fingerprint.write_u64(identity.family_key);
+                    fingerprint.write_u64(identity.variant_key);
+                    fingerprint.write_u32(identity.depth);
                 }
             }
             SectorKind::Hidden { members } => {
@@ -1329,8 +1375,9 @@ mod tests {
         ChartGeometry { center: Pos2::new(240.0, 240.0), radius: 220.0 }
     }
 
-    fn key(node: NodeId) -> u64 {
-        u64::from(node.raw()).wrapping_mul(0x9e37_79b9)
+    fn key(node: NodeId) -> ColorIdentity {
+        let identity = u64::from(node.raw()).wrapping_mul(0x9e37_79b9);
+        ColorIdentity { family_key: identity, variant_key: identity, depth: 0 }
     }
 
     #[test]
@@ -1425,17 +1472,28 @@ mod tests {
     }
 
     #[test]
-    fn palette_is_stable_and_contrasts_with_both_chart_surfaces() {
+    fn palette_is_stable_and_uses_lighter_descendant_tones_in_both_themes() {
         let dark_surface = Color32::from_rgb(32, 36, 43);
         let light_surface = Color32::from_rgb(244, 247, 249);
         for identity in 0..128_u64 {
             for depth in 0..20 {
-                let dark = stable_sector_color(identity, depth, true);
-                let light = stable_sector_color(identity, depth, false);
-                assert_eq!(dark, stable_sector_color(identity, depth, true));
-                assert_eq!(light, stable_sector_color(identity, depth, false));
-                assert!(contrast_ratio(dark, dark_surface) >= 3.0, "{dark:?}");
-                assert!(contrast_ratio(light, light_surface) >= 3.0, "{light:?}");
+                let color = ColorIdentity { family_key: identity, variant_key: identity, depth };
+                let dark = stable_sector_color(color, true);
+                let light = stable_sector_color(color, false);
+                assert_eq!(dark, stable_sector_color(color, true));
+                assert_eq!(light, stable_sector_color(color, false));
+                // Sector fills carry hierarchy; text and interaction outlines
+                // remain separate. Outer tones intentionally become pastel.
+                assert!(contrast_ratio(dark, dark_surface) >= 2.5, "{dark:?}");
+                assert!(contrast_ratio(light, light_surface) >= 1.3, "{light:?}");
+                let base = ColorIdentity { depth: 0, ..color };
+                assert!(
+                    relative_luminance(dark) >= relative_luminance(stable_sector_color(base, true))
+                );
+                assert!(
+                    relative_luminance(light)
+                        >= relative_luminance(stable_sector_color(base, false))
+                );
             }
         }
         assert!(contrast_ratio(synthetic_hidden_color(true), dark_surface) >= 3.0);
@@ -1502,9 +1560,8 @@ mod tests {
 
         let real = sector_for_node(&layout, large).unwrap();
         let requests = resolve_interactions(&layout, Some(real), None, None, signals);
-        assert_eq!(requests.clicked, Some(large));
-        assert_eq!(requests.double_clicked, Some(large));
-        assert_eq!(requests.zoom, Some(large));
+        assert_eq!(requests.primary_click, None, "second click is suppressed");
+        assert_eq!(requests.zoom, None);
         assert_eq!(requests.context_menu, Some(large));
         assert_ne!(large, small);
     }
@@ -1528,6 +1585,18 @@ mod tests {
         );
         assert_eq!(enter.zoom, Some(child));
 
+        let space = resolve_interactions(
+            &layout,
+            None,
+            None,
+            Some(child),
+            InteractionSignals { space: true, primary_clicked: true, ..Default::default() },
+        );
+        assert_eq!(space.selection, Some(NodeChange::Set(child)));
+        assert_eq!(space.zoom, None);
+        assert_eq!(space.primary_click, None);
+        assert!(!space.parent);
+
         let up = resolve_interactions(
             &layout,
             None,
@@ -1549,6 +1618,140 @@ mod tests {
     }
 
     #[test]
+    fn primary_click_routes_real_nodes_and_hub_without_double_activation() {
+        let layout = layout_with_children(2);
+        let hub = sector_for_node(&layout, layout.root()).unwrap();
+        let child = layout.sectors().iter().find(|sector| sector.depth == 1).unwrap();
+        let click = InteractionSignals {
+            pointer_present: true,
+            primary_clicked: true,
+            ..Default::default()
+        };
+        let request = resolve_interactions(&layout, Some(child), None, None, click);
+        assert_eq!(request.primary_click, child.action_target());
+        assert_eq!(request.selection, None, "shell determines file/folder policy");
+        assert!(!request.parent);
+        assert_eq!(request.zoom, None);
+        let parent = resolve_interactions(&layout, Some(hub), None, None, click);
+        assert!(parent.parent);
+        assert_eq!(parent.primary_click, None);
+        for sector in [hub, child] {
+            let second = resolve_interactions(
+                &layout,
+                Some(sector),
+                None,
+                None,
+                InteractionSignals { double_clicked: true, ..click },
+            );
+            assert!(second.is_empty());
+        }
+    }
+
+    #[test]
+    fn ancestry_colors_remain_identical_when_zoom_changes_sector_depth() {
+        let mut builder = TreeBuilder::new(GenerationId::new(17));
+        let root = builder.add_root(NodeSpec::root("root")).unwrap();
+        let directory = builder.add_child(root, NodeSpec::directory("directory")).unwrap();
+        let leaf = builder.add_child(directory, NodeSpec::file("leaf", metrics(100))).unwrap();
+        let snapshot = builder.freeze().unwrap();
+        let presentation = diskpie_app::presentation::SnapshotPresentation::new(&snapshot).unwrap();
+        let original =
+            compute_layout(&snapshot, LayoutOptions::new(root), &HiddenBranches::new()).unwrap();
+        let zoomed =
+            compute_layout(&snapshot, LayoutOptions::new(directory), &HiddenBranches::new())
+                .unwrap();
+        let identity = |node| presentation.color_identity(node).unwrap();
+        let before = sector_for_node(&original, leaf).unwrap();
+        let after = sector_for_node(&zoomed, leaf).unwrap();
+        assert_ne!(before.depth, after.depth);
+        for dark_mode in [true, false] {
+            assert_eq!(
+                sector_fill_color(before, dark_mode, &identity),
+                sector_fill_color(after, dark_mode, &identity)
+            );
+        }
+    }
+
+    #[test]
+    fn visual_fixture_families_have_distinct_colors_independent_of_order() {
+        let build = |reversed: bool| {
+            let mut builder = TreeBuilder::new(GenerationId::new(29));
+            let root = builder.add_root(NodeSpec::root(r"C:\DiskPie-Visual-Fixture")).unwrap();
+            let mut names = ["Documentos", "Juegos", "Fotos", "Vídeos", "Trabajo"];
+            if reversed {
+                names.reverse();
+            }
+            let branches = names.map(|name| {
+                let node = builder.add_child(root, NodeSpec::directory(name)).unwrap();
+                builder.add_child(node, NodeSpec::file("leaf", metrics(1))).unwrap();
+                (name, node)
+            });
+            let snapshot = builder.freeze().unwrap();
+            let presentation =
+                diskpie_app::presentation::SnapshotPresentation::new(&snapshot).unwrap();
+            branches.map(|(name, node)| (name, presentation.color_identity(node).unwrap()))
+        };
+        let original = build(false);
+        let reordered = build(true);
+        for dark in [false, true] {
+            for (index, (name, identity)) in original.iter().enumerate() {
+                let color = stable_sector_color(*identity, dark);
+                let same = reordered.iter().find(|(other, _)| other == name).unwrap().1;
+                assert_eq!(color, stable_sector_color(same, dark));
+                for (_, other) in &original[index + 1..] {
+                    assert_ne!(color, stable_sector_color(*other, dark));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn family_variant_and_absolute_depth_invalidate_mesh_but_interaction_does_not() {
+        let layout = layout_with_children(2);
+        let mut cache = SunburstMeshCache::new();
+        let options = SunburstMeshOptions::default();
+        for identity in [
+            ColorIdentity { family_key: 1, variant_key: 2, depth: 0 },
+            ColorIdentity { family_key: 3, variant_key: 2, depth: 0 },
+            ColorIdentity { family_key: 3, variant_key: 4, depth: 0 },
+            ColorIdentity { family_key: 3, variant_key: 4, depth: 1 },
+        ] {
+            assert!(
+                cache.prepare(&layout, test_geometry(), options, 1.0, false, &|_| identity).rebuilt
+            );
+        }
+        assert_eq!(cache.build_count(), 4);
+
+        let ctx = egui::Context::default();
+        let child = layout.sectors()[1].action_target();
+        let mut cache = SunburstMeshCache::new();
+        for (selected, focused, pointer) in [
+            (None, None, false),
+            (child, None, false),
+            (child, child, false),
+            (None, child, true),
+            (None, None, false),
+        ] {
+            let mut input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(480.0))),
+                ..Default::default()
+            };
+            if pointer {
+                input.events.push(egui::Event::PointerMoved(Pos2::new(240.0, 50.0)));
+            }
+            let _ = ctx.run_ui(input, |ui| {
+                SunburstView::new(&layout, &mut cache)
+                    .desired_size(Vec2::splat(400.0))
+                    .selected(selected)
+                    .focused(focused)
+                    .color_identity(&key)
+                    .show(ui);
+            });
+        }
+        assert_eq!(cache.build_count(), 1);
+    }
+
+    #[test]
     fn zero_weight_partial_layout_still_builds_a_finite_center() {
         let layout = layout_with_children(0);
         let (mesh, stats) = build_base_mesh(
@@ -1560,6 +1763,13 @@ mod tests {
             &key,
         );
         assert_eq!(stats.rendered_sectors, 1);
+        assert_eq!(layout.effective_depth(), 0);
+        assert_eq!(layout.sectors()[0].outer_radius, 1.0);
+        assert_eq!(sector_fill_color(&layout.sectors()[0], false, &key), Color32::WHITE);
+        assert_eq!(
+            sector_fill_color(&layout.sectors()[0], true, &key),
+            Color32::from_rgb(32, 33, 36)
+        );
         assert!(!mesh.indices.is_empty());
         assert!(
             mesh.vertices.iter().all(|vertex| vertex.pos.x.is_finite() && vertex.pos.y.is_finite())

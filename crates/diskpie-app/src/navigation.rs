@@ -1213,11 +1213,7 @@ fn default_view_root(snapshot: &TreeSnapshot) -> Option<NodeId> {
 }
 
 fn filesystem_roots(snapshot: &TreeSnapshot) -> impl Iterator<Item = NodeId> + '_ {
-    snapshot.nodes().iter().enumerate().filter_map(|(index, record)| {
-        (record.kind() == EntryKind::Root)
-            .then(|| u32::try_from(index).ok().map(NodeId::from_raw))
-            .flatten()
-    })
+    snapshot.filesystem_roots()
 }
 
 fn is_ancestor_or_same(snapshot: &TreeSnapshot, ancestor: NodeId, node: NodeId) -> bool {
@@ -1846,5 +1842,36 @@ mod tests {
         );
         assert_eq!(state.generation(), GenerationId::new(20));
         assert_eq!(state.view_root(), original_root);
+    }
+
+    #[test]
+    fn full_rescan_uses_the_current_snapshots_root_index_after_replacement() {
+        let original = fixture(30);
+        let mut state = NavigationState::new(original.snapshot).unwrap();
+        assert!(state.availability(state.command(NavigationAction::RescanAll)).is_available());
+        let mut builder = TreeBuilder::new(GenerationId::new(31));
+        let summary = builder.add_root(NodeSpec::synthetic_group("replacement")).unwrap();
+        let first = builder.add_child(summary, NodeSpec::root("D:\\")).unwrap();
+        builder.add_child(first, NodeSpec::directory("data")).unwrap();
+        let second = builder.add_child(summary, NodeSpec::root("E:\\")).unwrap();
+        state.replace_snapshot(builder.freeze().unwrap()).unwrap();
+        let CommandOutcome::RescanRequested(request) =
+            state.execute(state.command(NavigationAction::RescanAll)).unwrap()
+        else {
+            panic!("full rescan returns its current roots")
+        };
+        assert_eq!(
+            request.full_roots().iter().map(RescanTarget::node).collect::<Vec<_>>(),
+            [first, second]
+        );
+        assert_eq!(request.full_roots()[0].path(), Path::new("D:\\"));
+
+        let mut unavailable = TreeBuilder::new(GenerationId::new(32));
+        let root = unavailable.add_root(NodeSpec::root("")).unwrap();
+        state.replace_snapshot(unavailable.freeze().unwrap()).unwrap();
+        assert_eq!(
+            state.availability(state.command(NavigationAction::RescanAll)).reason(),
+            Some(UnavailableReason::NoRealPath { node: root })
+        );
     }
 }

@@ -365,6 +365,7 @@ pub struct SessionReducer {
     omissions: Vec<ScanOmission>,
     progress: SessionProgress,
     had_partial_data: bool,
+    initial_omissions: u64,
     terminal: Option<ScanTerminal>,
     revision: u64,
     last_snapshot_revision: u64,
@@ -390,6 +391,7 @@ impl SessionReducer {
             omissions: Vec::new(),
             progress: SessionProgress::default(),
             had_partial_data: false,
+            initial_omissions: 0,
             terminal: None,
             revision: 0,
             last_snapshot_revision: 0,
@@ -404,6 +406,14 @@ impl SessionReducer {
     #[must_use]
     pub const fn generation(&self) -> ScanGeneration {
         self.generation
+    }
+
+    /// Records roots omitted before the scanner started. These are deliberately
+    /// separate from protocol counters so terminal validation remains exact.
+    #[must_use]
+    pub fn with_initial_omissions(mut self, omissions: u64) -> Self {
+        self.initial_omissions = omissions;
+        self
     }
 
     #[must_use]
@@ -687,23 +697,34 @@ impl SessionReducer {
         if matches!(&self.phase, SessionPhase::AwaitingStart) {
             return Err(SessionError::MissingStarted);
         }
-        let mut builder = TreeBuilder::new(GenerationId::from(self.generation));
+        let mut builder = TreeBuilder::with_capacity(
+            GenerationId::from(self.generation),
+            self.nodes.len() + usize::from(self.has_multi_root_summary),
+        );
         let summary = if self.has_multi_root_summary {
             Some(builder.add_root(NodeSpec::synthetic_group(MULTI_ROOT_SUMMARY_NAME))?)
         } else {
             None
         };
-        let mut materialized = HashMap::with_capacity(self.nodes.len());
         for node in &self.nodes {
+            let state = if (cancelled || self.phase == SessionPhase::Cancelled)
+                && node.kind.can_have_children()
+                && !self.completed_directories.contains(&node.scan_id)
+            {
+                ScanState::Cancelled
+            } else {
+                node.local_state
+            };
             let mut spec = NodeSpec::new(node.name.clone(), node.kind, node.own_metrics)
                 .with_omissions(node.omissions)
-                .with_state(node.local_state);
+                .with_state(state);
             if let Some(identity) = node.identity {
                 spec = spec.with_file_identity(identity);
             }
             let actual = match (node.parent, summary) {
                 (Some(parent), _) => {
-                    let parent = materialized
+                    let parent = self
+                        .scan_to_core
                         .get(&parent)
                         .copied()
                         .ok_or(SessionError::UnknownScanNode { id: parent })?;
@@ -717,7 +738,10 @@ impl SessionReducer {
                     detail: "protocol-to-core NodeId mapping changed while materializing",
                 });
             }
-            materialized.insert(node.scan_id, actual);
+        }
+        if self.initial_omissions != 0 {
+            let owner = summary.unwrap_or(NodeId::from_raw(0));
+            builder.add_omissions(owner, self.initial_omissions)?;
         }
         builder.set_scan_state(if cancelled {
             ScanState::Cancelled
@@ -762,7 +786,7 @@ impl SessionReducer {
         if roots.is_empty() {
             return Err(SessionError::EmptyStartedRoots);
         }
-        let has_multi_root_summary = roots.len() >= 2;
+        let has_multi_root_summary = roots.len() >= 2 || self.initial_omissions != 0;
         ensure_node_id_capacity(
             self.nodes.len(),
             roots.len(),
@@ -911,7 +935,13 @@ impl SessionReducer {
         observed.directories_completed =
             checked_counter(observed.directories_completed, 1, CounterField::DirectoriesCompleted)?;
         self.nodes[index].local_state = match completion.state {
-            DirectoryState::Complete => self.nodes[index].local_state,
+            DirectoryState::Complete => {
+                if self.nodes[index].omissions == 0 {
+                    ScanState::Complete
+                } else {
+                    ScanState::Partial
+                }
+            }
             DirectoryState::Partial => {
                 self.had_partial_data = true;
                 ScanState::Partial
@@ -954,6 +984,7 @@ impl SessionReducer {
             }
         }
         self.phase = match &terminal.state {
+            TerminalState::Complete if self.initial_omissions != 0 => SessionPhase::Partial,
             TerminalState::Complete => SessionPhase::Complete,
             TerminalState::Partial => SessionPhase::Partial,
             TerminalState::Cancelled => SessionPhase::Cancelled,
@@ -1019,7 +1050,11 @@ impl SessionReducer {
             own_metrics,
             identity,
             omissions: 0,
-            local_state: ScanState::Complete,
+            local_state: if kind.can_have_children() {
+                ScanState::Partial
+            } else {
+                ScanState::Complete
+            },
         });
         self.scan_to_core.insert(scan_id, core_id);
         Ok(core_id)
@@ -1318,6 +1353,67 @@ mod tests {
 
     fn apply(reducer: &mut SessionReducer, event: ScanEvent) {
         assert_eq!(reducer.apply_event(event).expect("apply event"), ApplyOutcome::Applied);
+    }
+
+    #[test]
+    fn unvisited_directories_are_partial_then_cancelled_but_completed_siblings_stay_complete() {
+        let mut reducer = SessionReducer::new(generation(1));
+        apply(&mut reducer, started(1, &[(10, "root")]));
+        apply(
+            &mut reducer,
+            batch_event(
+                1,
+                10,
+                vec![
+                    entry(11, 10, "done", EntryKind::Directory),
+                    entry(12, 10, "pending", EntryKind::Directory),
+                ],
+                Vec::new(),
+            ),
+        );
+        apply(
+            &mut reducer,
+            completion_event(1, 11, ScanCounters::default(), DirectoryState::Complete),
+        );
+        let pending = reducer.core_id(ScanNodeId::from_raw(12)).unwrap();
+        let done = reducer.core_id(ScanNodeId::from_raw(11)).unwrap();
+        let snapshot = reducer.materialize_snapshot().unwrap();
+        assert_eq!(snapshot.node(pending).unwrap().local_state(), ScanState::Partial);
+        assert_eq!(snapshot.node(done).unwrap().local_state(), ScanState::Complete);
+        let publication = reducer.publish_cancelled_snapshot(Duration::ZERO).unwrap();
+        assert_eq!(
+            publication.snapshot.node(pending).unwrap().aggregate().state(),
+            ScanState::Cancelled
+        );
+        assert_eq!(
+            publication.snapshot.node(done).unwrap().aggregate().state(),
+            ScanState::Complete
+        );
+        let counters = reducer.progress().observed();
+        apply(&mut reducer, terminal_event(1, TerminalState::Cancelled, counters));
+        assert_eq!(
+            reducer.materialize_snapshot().unwrap().node(pending).unwrap().local_state(),
+            ScanState::Cancelled
+        );
+    }
+
+    #[test]
+    fn resolver_omissions_stay_on_summary_without_changing_protocol_counters() {
+        let mut reducer = SessionReducer::new(generation(1)).with_initial_omissions(2);
+        apply(&mut reducer, started(1, &[(10, "available")]));
+        apply(
+            &mut reducer,
+            completion_event(1, 10, ScanCounters::default(), DirectoryState::Complete),
+        );
+        let counters = reducer.progress().observed();
+        apply(&mut reducer, terminal_event(1, TerminalState::Complete, counters));
+        assert_eq!(reducer.phase(), &SessionPhase::Partial);
+        assert_eq!(reducer.progress().effective().omissions, 0);
+        let snapshot = reducer.materialize_snapshot().unwrap();
+        assert_eq!(snapshot.state(), ScanState::Partial);
+        assert_eq!(snapshot.nodes()[0].kind(), EntryKind::SyntheticGroup);
+        assert_eq!(snapshot.nodes()[0].own_omissions(), 2);
+        assert_eq!(snapshot.nodes()[1].local_state(), ScanState::Complete);
     }
 
     #[test]

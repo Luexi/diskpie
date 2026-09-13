@@ -10,7 +10,7 @@ use std::{
     ffi::{OsStr, OsString},
     fmt,
     fs::File,
-    io::{self, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     mem::{offset_of, size_of, size_of_val},
     os::windows::{
         ffi::{OsStrExt, OsStringExt},
@@ -2138,6 +2138,161 @@ const fn is_leap_year(year: u32) -> bool {
     year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
 }
 
+/// Bounded source bytes ordered oldest to newest. Debug never prints log data.
+pub struct DiagnosticLogSnapshot {
+    pub sources: Vec<Option<Vec<u8>>>,
+    pub omitted_files: u64,
+    pub omitted_bytes: u64,
+}
+
+impl fmt::Debug for DiagnosticLogSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiagnosticLogSnapshot")
+            .field("sources", &self.sources.len())
+            .field("omitted_files", &self.omitted_files)
+            .field("omitted_bytes", &self.omitted_bytes)
+            .finish()
+    }
+}
+
+/// Reads at most eight local, regular, single-link managed logs. Each source
+/// keeps a 1 MiB tail; total retained content never exceeds the export budget.
+/// Sources larger than 16 MiB are refused; at most a 1 MiB tail is read from
+/// each of eight verified handles. Directory enumeration is capped separately.
+/// No filesystem entry is changed.
+pub fn collect_diagnostic_logs(
+    directory: &Path,
+) -> Result<DiagnosticLogSnapshot, DiagnosticFileError> {
+    let root = DirectoryGuard::open(directory, DiagnosticFileOperation::ReadLogDirectory)?;
+    if !root.is_local() {
+        return Err(DiagnosticFileError::new(
+            DiagnosticFileOperation::ReadLogDirectory,
+            DiagnosticFileErrorKind::InvalidDestination,
+        ));
+    }
+    let (mut records, _) = bounded_log_records(&root)?;
+    records.sort_unstable_by(|left, right| left.name_key.cmp(&right.name_key));
+    let omitted_files = records.len().saturating_sub(MAX_RETAINED_LOG_FILES) as u64;
+    let mut sources = Vec::with_capacity(records.len().min(MAX_RETAINED_LOG_FILES));
+    let mut omitted_bytes = 0_u64;
+    for record in records.iter().skip(omitted_files as usize) {
+        match read_log_tail(&root, record) {
+            Ok((bytes, omitted)) => {
+                omitted_bytes = omitted_bytes.saturating_add(omitted);
+                sources.push(Some(bytes));
+            }
+            Err(_) => sources.push(None),
+        }
+    }
+    Ok(DiagnosticLogSnapshot { sources, omitted_files, omitted_bytes })
+}
+
+fn bounded_log_records(
+    root: &DirectoryGuard,
+) -> Result<(Vec<DirectoryRecord>, u64), DiagnosticFileError> {
+    let mut buffer = DirectoryQueryBuffer::new();
+    let mut restart = true;
+    let mut scanned_total = 0_u64;
+    let mut collected = Vec::new();
+    for _ in 0..MAX_SYNCHRONOUS_RETENTION_STEPS {
+        match query_directory_records(root, restart, &mut buffer)? {
+            DirectoryQuery::Done => return Ok((collected, scanned_total)),
+            DirectoryQuery::Records { records, scanned } => {
+                scanned_total = scanned_total.saturating_add(scanned as u64);
+                if scanned_total > MAX_DIRECTORY_ENTRIES_PER_CYCLE {
+                    break;
+                }
+                collected.extend(records);
+            }
+        }
+        restart = false;
+    }
+    // A partial enumeration cannot establish complete ownership protection.
+    Err(DiagnosticFileError::new(
+        DiagnosticFileOperation::ReadLogDirectory,
+        DiagnosticFileErrorKind::TooLarge,
+    ))
+}
+
+fn read_log_tail(
+    root: &DirectoryGuard,
+    record: &DirectoryRecord,
+) -> Result<(Vec<u8>, u64), DiagnosticFileError> {
+    let operation = DiagnosticFileOperation::InspectLogEntry;
+    if record.attributes & (FILE_ATTRIBUTE_DIRECTORY.0 | FILE_ATTRIBUTE_REPARSE_POINT.0) != 0 {
+        return Err(DiagnosticFileError::new(operation, DiagnosticFileErrorKind::ReparsePoint));
+    }
+    let mut raw =
+        root.absolute_child_units_for(&os_units(OsStr::new(&record.name_key)), operation)?;
+    raw.push(0);
+    let file = open_native_file(
+        &raw,
+        FILE_READ_DATA.0 | FILE_READ_ATTRIBUTES.0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+        operation,
+    )?;
+    let inspection = inspect_handle(&file, operation)?;
+    validate_regular_non_reparse(&inspection, operation)?;
+    let (volume, _) = root.extended_identity(operation)?;
+    if inspection.link_count != 1 || inspection.identity.extended != Some((volume, record.file_id))
+    {
+        return Err(DiagnosticFileError::new(
+            operation,
+            DiagnosticFileErrorKind::InvalidDestination,
+        ));
+    }
+    root.validate_direct_child_handle_named(
+        file_handle(&file),
+        OsStr::new(&record.name_key),
+        operation,
+    )?;
+    let mut size = 0_i64;
+    // SAFETY: the file is retained and size is a writable i64 for the call.
+    unsafe { GetFileSizeEx(file_handle(&file), &raw mut size) }
+        .map_err(|error| DiagnosticFileError::from_windows(operation, &error))?;
+    let size = u64::try_from(size).map_err(|_| {
+        DiagnosticFileError::new(operation, DiagnosticFileErrorKind::InvalidContent)
+    })?;
+    if size > MAX_DAILY_LOG_BYTES {
+        return Err(DiagnosticFileError::new(operation, DiagnosticFileErrorKind::TooLarge));
+    }
+    read_bounded_log_tail(&mut &file, size)
+}
+
+fn read_bounded_log_tail(
+    reader: &mut (impl Read + Seek),
+    size: u64,
+) -> Result<(Vec<u8>, u64), DiagnosticFileError> {
+    const TAIL_BYTES: usize = MAX_DIAGNOSTIC_EXPORT_BYTES / MAX_RETAINED_LOG_FILES;
+    let operation = DiagnosticFileOperation::InspectLogEntry;
+    // Read only the bounded tail of the initial size through the same verified
+    // handle. Appends after this size observation cannot enlarge the read, and
+    // a short read still fails instead of exporting an incomplete snapshot.
+    let mut omitted = size.saturating_sub(TAIL_BYTES as u64);
+    reader
+        .seek(SeekFrom::Start(omitted))
+        .map_err(|error| DiagnosticFileError::from_io(operation, &error))?;
+    let mut tail = vec![0_u8; (size - omitted) as usize];
+    reader.read_exact(&mut tail).map_err(|error| {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            DiagnosticFileError::new(operation, DiagnosticFileErrorKind::InvalidContent)
+        } else {
+            DiagnosticFileError::from_io(operation, &error)
+        }
+    })?;
+    if omitted > 0 {
+        // The first retained byte may be inside a record or UTF-8 scalar.
+        let incomplete =
+            tail.iter().position(|byte| *byte == b'\n').map_or(tail.len(), |index| index + 1);
+        omitted += incomplete as u64;
+        tail.drain(..incomplete);
+    }
+    Ok((tail, omitted))
+}
+
 /// Classifies a native absolute path without opening it.
 ///
 /// UNC classification is exposed before export so the UI can state that the
@@ -2166,10 +2321,14 @@ pub fn classify_export_destination(
 ///
 /// `owned_files` lists settings, logs, and crash markers that an export must
 /// never overwrite. Both normalized path equality and existing-file identity
-/// (including hard links) are checked and locked through replacement. A newly
+/// (including hard links) are checked and retained through final revalidation. A newly
 /// created, exclusively held file object is renamed over the destination, so
 /// alternate streams from a previous destination object are not inherited.
-/// The native Save dialog remains responsible for overwrite confirmation.
+/// This eager compatibility entry point can replace an existing file: Windows
+/// requires releasing its deny-delete handle immediately before the native
+/// rename, so that final interval does not provide compare-and-replace semantics.
+/// Interactive exports must use `prepare_diagnostic_export` and its create-only
+/// `commit` method instead.
 pub fn write_diagnostic_export(
     destination: &Path,
     bytes: &[u8],
@@ -2185,6 +2344,45 @@ pub fn write_diagnostic_export(
         return Err(DiagnosticFileError::new(
             DiagnosticFileOperation::WriteTemporary,
             DiagnosticFileErrorKind::InvalidContent,
+        ));
+    }
+    prepare_diagnostic_export(destination, owned_files)?.commit_inner(bytes)
+}
+
+/// Retained preflight capability. No temporary file is created until commit.
+/// The parent and existing destination stay identity-bound while the UI asks
+/// for actual-network-transport consent. Existing files require a different
+/// destination; this capability never replaces them. Dropping cancels it.
+pub struct PreparedDiagnosticExport {
+    parent_guard: DirectoryGuard,
+    file_name: OsString,
+    destination_name: Vec<u16>,
+    destination_inspection: Option<InspectedFile>,
+    owned_file_guards: Vec<InspectedFile>,
+    _owned_parent_guards: Vec<DirectoryGuard>,
+    destination_kind: ExportDestinationKind,
+}
+
+impl fmt::Debug for PreparedDiagnosticExport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedDiagnosticExport")
+            .field("destination_kind", &self.destination_kind)
+            .field("replaces_existing", &self.replaces_existing())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Validates a destination without writing, and reports transport resolved
+/// through its retained parent handle (including mapped network drives).
+pub fn prepare_diagnostic_export(
+    destination: &Path,
+    owned_files: &[&Path],
+) -> Result<PreparedDiagnosticExport, DiagnosticFileError> {
+    if owned_files.len() > MAX_DIRECTORY_ENTRIES_PER_CYCLE as usize {
+        return Err(DiagnosticFileError::new(
+            DiagnosticFileOperation::InspectOwnedPath,
+            DiagnosticFileErrorKind::TooLarge,
         ));
     }
     classify_export_destination(destination)?;
@@ -2206,10 +2404,10 @@ pub fn write_diagnostic_export(
     let parent_guard = DirectoryGuard::open(parent, DiagnosticFileOperation::InspectDestination)?;
     let destination_kind = parent_guard.transport;
     let current_destination = parent_guard.current_child_path(file_name)?;
-    let destination_inspection = inspect_optional_file(
+    let destination_inspection = inspect_export_destination(
         &current_destination,
         DiagnosticFileOperation::InspectDestination,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
     )?;
 
     let mut owned_file_guards = Vec::with_capacity(owned_files.len());
@@ -2242,10 +2440,11 @@ pub fn write_diagnostic_export(
             }
             owned_parent_guards.push(owned_parent_guard);
         }
-        if let Some(owned_file) = inspect_optional_file(
+        if let Some(owned_file) = inspect_export_file_guard(
             owned,
             DiagnosticFileOperation::InspectOwnedPath,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
+            false,
         )? {
             if destination_inspection.as_ref().is_some_and(|destination_file| {
                 destination_file.identity.same_file(&owned_file.identity)
@@ -2271,55 +2470,143 @@ pub fn write_diagnostic_export(
         ));
     }
 
-    let mut temporary = TemporarySibling::create(&parent_guard)?;
-    temporary.write_all(bytes)?;
-    temporary.flush_and_sync()?;
-    temporary.verify_complete(bytes.len() as u64, &parent_guard)?;
+    Ok(PreparedDiagnosticExport {
+        parent_guard,
+        file_name: file_name.to_owned(),
+        destination_name,
+        destination_inspection,
+        owned_file_guards,
+        _owned_parent_guards: owned_parent_guards,
+        destination_kind,
+    })
+}
 
-    let expected_destination = destination_inspection.as_ref().map(|file| file.identity);
-    let revalidated_path = parent_guard.current_child_path(file_name)?;
-    let revalidated_destination = inspect_optional_file(
-        &revalidated_path,
-        DiagnosticFileOperation::InspectDestination,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-    )?;
-    match (expected_destination, revalidated_destination.as_ref()) {
-        (None, None) => {}
-        (Some(expected), Some(current)) if expected.same_file(&current.identity) => {}
-        (None, Some(_)) => {
-            return Err(DiagnosticFileError::new(
-                DiagnosticFileOperation::InspectDestination,
-                DiagnosticFileErrorKind::AlreadyExists,
-            ));
-        }
-        _ => {
-            return Err(DiagnosticFileError::new(
-                DiagnosticFileOperation::InspectDestination,
-                DiagnosticFileErrorKind::InvalidDestination,
-            ));
-        }
+impl PreparedDiagnosticExport {
+    #[must_use]
+    pub const fn destination_kind(&self) -> ExportDestinationKind {
+        self.destination_kind
     }
-    for owned in &owned_file_guards {
-        if revalidated_destination
-            .as_ref()
-            .is_some_and(|destination| destination.identity.same_file(&owned.identity))
-        {
+
+    #[must_use]
+    pub fn replaces_existing(&self) -> bool {
+        self.destination_inspection.is_some()
+    }
+
+    /// Protects a managed directory and every enumerated log identity, including
+    /// aliases outside it. Enumeration has the same explicit ceiling as retention.
+    pub fn protect_log_directory(&mut self, directory: &Path) -> Result<(), DiagnosticFileError> {
+        let Some(root) =
+            DirectoryGuard::open_optional(directory, DiagnosticFileOperation::InspectOwnedPath)?
+        else {
+            return Ok(());
+        };
+        if !root.is_local() || self.parent_guard.identity.same_file(&root.identity) {
             return Err(DiagnosticFileError::new(
                 DiagnosticFileOperation::InspectOwnedPath,
                 DiagnosticFileErrorKind::OwnedDestination,
             ));
         }
+        if let Some(target) = &self.destination_inspection {
+            let (volume, _) = root.extended_identity(DiagnosticFileOperation::InspectOwnedPath)?;
+            for record in bounded_log_records(&root)?.0 {
+                if target.identity.extended == Some((volume, record.file_id)) {
+                    return Err(DiagnosticFileError::new(
+                        DiagnosticFileOperation::InspectOwnedPath,
+                        DiagnosticFileErrorKind::OwnedDestination,
+                    ));
+                }
+            }
+        }
+        self._owned_parent_guards.push(root);
+        Ok(())
     }
-    let destination_existed = expected_destination.is_some();
-    drop(revalidated_destination);
-    drop(destination_inspection);
-    temporary.replace(&parent_guard, &destination_name, destination_existed)?;
 
-    Ok(ExportWriteOutcome {
-        destination_kind,
-        replaced_existing: destination_existed,
-        bytes_written: bytes.len() as u64,
-    })
+    /// Publishes exactly the accepted preview to a previously absent name.
+    /// Existing destinations are refused before creating a temporary file. The
+    /// final native rename also forbids replacement, so another process cannot
+    /// redirect this operation onto a protected file between revalidation and
+    /// publication. Bytes must be the artifact whose preview the user accepted.
+    pub fn commit(self, bytes: &[u8]) -> Result<ExportWriteOutcome, DiagnosticFileError> {
+        if self.replaces_existing() {
+            return Err(DiagnosticFileError::new(
+                DiagnosticFileOperation::InspectDestination,
+                DiagnosticFileErrorKind::AlreadyExists,
+            ));
+        }
+        self.commit_inner(bytes)
+    }
+
+    fn commit_inner(self, bytes: &[u8]) -> Result<ExportWriteOutcome, DiagnosticFileError> {
+        if bytes.len() > MAX_DIAGNOSTIC_EXPORT_BYTES || std::str::from_utf8(bytes).is_err() {
+            return Err(DiagnosticFileError::new(
+                DiagnosticFileOperation::WriteTemporary,
+                if bytes.len() > MAX_DIAGNOSTIC_EXPORT_BYTES {
+                    DiagnosticFileErrorKind::TooLarge
+                } else {
+                    DiagnosticFileErrorKind::InvalidContent
+                },
+            ));
+        }
+        let Self {
+            parent_guard,
+            file_name,
+            destination_name,
+            destination_inspection,
+            owned_file_guards,
+            _owned_parent_guards,
+            destination_kind,
+        } = self;
+        parent_guard.ensure_location_stable(DiagnosticFileOperation::InspectDestination)?;
+        let mut temporary = TemporarySibling::create(&parent_guard)?;
+        temporary.write_all(bytes)?;
+        temporary.flush_and_sync()?;
+        temporary.verify_complete(bytes.len() as u64, &parent_guard)?;
+
+        let expected_destination = destination_inspection.as_ref().map(|file| file.identity);
+        let revalidated_path = parent_guard.current_child_path(&file_name)?;
+        let revalidated_destination = inspect_export_destination(
+            &revalidated_path,
+            DiagnosticFileOperation::InspectDestination,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )?;
+        match (expected_destination, revalidated_destination.as_ref()) {
+            (None, None) => {}
+            (Some(expected), Some(current)) if expected.same_file(&current.identity) => {}
+            (None, Some(_)) => {
+                return Err(DiagnosticFileError::new(
+                    DiagnosticFileOperation::InspectDestination,
+                    DiagnosticFileErrorKind::AlreadyExists,
+                ));
+            }
+            _ => {
+                return Err(DiagnosticFileError::new(
+                    DiagnosticFileOperation::InspectDestination,
+                    DiagnosticFileErrorKind::InvalidDestination,
+                ));
+            }
+        }
+        for owned in &owned_file_guards {
+            if revalidated_destination
+                .as_ref()
+                .is_some_and(|destination| destination.identity.same_file(&owned.identity))
+            {
+                return Err(DiagnosticFileError::new(
+                    DiagnosticFileOperation::InspectOwnedPath,
+                    DiagnosticFileErrorKind::OwnedDestination,
+                ));
+            }
+        }
+        let destination_existed = expected_destination.is_some();
+        drop(revalidated_destination);
+        drop(destination_inspection);
+        temporary.replace(&parent_guard, &destination_name, destination_existed)?;
+
+        Ok(ExportWriteOutcome {
+            destination_kind,
+            replaced_existing: destination_existed,
+            bytes_written: bytes.len() as u64,
+        })
+    }
 }
 
 pub(super) fn os_units(value: &OsStr) -> Vec<u16> {
@@ -2440,6 +2727,43 @@ pub(super) fn inspect_optional_file(
     let info = inspect_handle(&file, operation)?;
     validate_regular_non_reparse(&info, operation)?;
     Ok(Some(InspectedFile { _file: file, identity: info.identity }))
+}
+
+fn inspect_export_destination(
+    path: &Path,
+    operation: DiagnosticFileOperation,
+    share_mode: FILE_SHARE_MODE,
+) -> Result<Option<InspectedFile>, DiagnosticFileError> {
+    inspect_export_file_guard(path, operation, share_mode, true)
+}
+
+fn inspect_export_file_guard(
+    path: &Path,
+    operation: DiagnosticFileOperation,
+    share_mode: FILE_SHARE_MODE,
+    reject_multiple_links: bool,
+) -> Result<Option<InspectedFile>, DiagnosticFileError> {
+    let raw = extended_native_path_units_with_nul(path)?;
+    // FILE_READ_DATA makes delete-share denial effective; metadata-only
+    // handles do not necessarily participate in Windows sharing checks.
+    let file = match open_native_file(
+        &raw,
+        FILE_READ_DATA.0 | FILE_READ_ATTRIBUTES.0,
+        share_mode,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        operation,
+    ) {
+        Ok(file) => file,
+        Err(error) if error.kind == DiagnosticFileErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let info = inspect_handle(&file, operation)?;
+    validate_regular_non_reparse(&info, operation)?;
+    if reject_multiple_links && info.link_count != 1 {
+        return Err(DiagnosticFileError::new(operation, DiagnosticFileErrorKind::OwnedDestination));
+    }
+    Ok(Some(InspectedFile::new(file, info.identity)))
 }
 
 pub(super) fn inspect_handle(
@@ -3981,6 +4305,193 @@ mod tests {
         assert!(classify_export_destination(Path::new(r"\\.\PhysicalDrive0")).is_err());
         assert!(classify_export_destination(Path::new("//./PhysicalDrive0")).is_err());
         assert!(classify_export_destination(Path::new("//?/GLOBALROOT/Device/Harddisk0")).is_err());
+    }
+
+    #[test]
+    fn prepared_export_does_not_write_until_commit_and_refuses_new_destination() {
+        let directory = TestDirectory::new("export-preflight");
+        let destination = directory.path().join("report.txt");
+        let prepared = prepare_diagnostic_export(&destination, &[]).expect("prepare export");
+        assert_eq!(prepared.destination_kind(), ExportDestinationKind::Local);
+        assert!(!prepared.replaces_existing());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+        fs::write(&destination, b"created after consent").unwrap();
+        let error = prepared
+            .commit(b"must not overwrite")
+            .expect_err("new destination invalidates consent");
+        assert_eq!(error.kind, DiagnosticFileErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&destination).unwrap(), b"created after consent");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn prepared_export_retains_existing_identity_and_protects_log_aliases() {
+        let directory = TestDirectory::new("export-locked");
+        let logs = directory.path().join("logs");
+        fs::create_dir(&logs).unwrap();
+        let source = logs.join("diskpie.2026-09-06.log");
+        fs::write(&source, b"private diagnostic source\n").unwrap();
+        let alias = directory.path().join("alias.txt");
+        fs::hard_link(&source, &alias).unwrap();
+        assert_eq!(
+            prepare_diagnostic_export(&alias, &[]).unwrap_err().kind,
+            DiagnosticFileErrorKind::OwnedDestination
+        );
+        let target = directory.path().join("output.txt");
+        fs::write(&target, b"old").unwrap();
+        let prepared = prepare_diagnostic_export(&target, &[]).unwrap();
+        assert!(prepared.replaces_existing());
+        assert!(fs::rename(&target, directory.path().join("moved.txt")).is_err());
+        assert_eq!(
+            prepared.commit(b"new").unwrap_err().kind,
+            DiagnosticFileErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn prepared_export_retains_owned_source_and_refuses_late_alias() {
+        let directory = TestDirectory::new("export-protected-source");
+        let source = directory.path().join("settings.json");
+        fs::write(&source, b"owned contents").unwrap();
+        let destination = directory.path().join("report.txt");
+        let prepared = prepare_diagnostic_export(&destination, &[&source]).unwrap();
+        assert!(fs::rename(&source, directory.path().join("moved.json")).is_err());
+        // Adding a hard link does not delete the held source name. The public
+        // create-only commit must still refuse this late destination alias.
+        if fs::hard_link(&source, &destination).is_ok() {
+            assert!(prepared.commit(b"must not overwrite").is_err());
+            assert_eq!(fs::read(&destination).unwrap(), b"owned contents");
+        } else {
+            drop(prepared);
+        }
+        assert_eq!(fs::read(&source).unwrap(), b"owned contents");
+        assert!(!directory.path().join("moved.json").exists());
+    }
+
+    #[test]
+    fn export_native_create_only_publication_refuses_a_final_interval_alias() {
+        let directory = TestDirectory::new("export-late-publication-alias");
+        let parent =
+            DirectoryGuard::open(directory.path(), DiagnosticFileOperation::InspectDestination)
+                .unwrap();
+        let source = directory.path().join("settings.json");
+        fs::write(&source, b"owned contents").unwrap();
+        let destination = directory.path().join("report.txt");
+        let mut temporary = TemporarySibling::create(&parent).unwrap();
+        temporary.write_all(b"new export").unwrap();
+        temporary.flush_and_sync().unwrap();
+        temporary.verify_complete(10, &parent).unwrap();
+        // Simulates the other process winning after our last revalidation but
+        // before the native rename. Publication must never replace this alias.
+        fs::hard_link(&source, &destination).unwrap();
+        assert!(temporary.replace(&parent, &os_units(OsStr::new("report.txt")), false).is_err());
+        drop(temporary);
+        assert_eq!(fs::read(&source).unwrap(), b"owned contents");
+        assert_eq!(fs::read(&destination).unwrap(), b"owned contents");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn diagnostic_collection_uses_recent_bounded_non_alias_sources() {
+        let directory = TestDirectory::new("export-sources");
+        for day in 1..=10 {
+            fs::write(
+                directory.path().join(format!("diskpie.2026-08-{day:02}.log")),
+                format!("line {day}\n"),
+            )
+            .unwrap();
+        }
+        fs::write(directory.path().join("unrelated.txt"), b"must not export\n").unwrap();
+        let snapshot = collect_diagnostic_logs(directory.path()).expect("collect sources");
+        assert_eq!(snapshot.sources.len(), MAX_RETAINED_LOG_FILES);
+        assert_eq!(snapshot.omitted_files, 2);
+        assert_eq!(snapshot.sources[0].as_deref(), Some(b"line 3\n".as_slice()));
+        assert_eq!(snapshot.sources[7].as_deref(), Some(b"line 10\n".as_slice()));
+        let last = directory.path().join("diskpie.2026-08-10.log");
+        fs::hard_link(&last, directory.path().join("alias.txt")).unwrap();
+        let snapshot = collect_diagnostic_logs(directory.path()).unwrap();
+        assert!(snapshot.sources[7].is_none());
+        assert_eq!(fs::read(last).unwrap(), b"line 10\n");
+    }
+
+    #[test]
+    fn diagnostic_collection_discards_partial_prefix_records_under_tail_cap() {
+        let directory = TestDirectory::new("export-source-tail");
+        let source = directory.path().join("diskpie.2026-09-06.log");
+        let mut input = vec![b'a'; MAX_DIAGNOSTIC_EXPORT_BYTES / MAX_RETAINED_LOG_FILES + 20];
+        input.extend_from_slice(b"\nlatest complete record\npartial trailing");
+        fs::write(&source, &input).unwrap();
+        let snapshot = collect_diagnostic_logs(directory.path()).expect("bounded tail");
+        assert_eq!(
+            snapshot.sources[0].as_deref(),
+            Some(b"latest complete record\npartial trailing".as_slice())
+        );
+        assert!(snapshot.omitted_bytes > 0);
+        assert_eq!(
+            snapshot.sources[0].as_ref().unwrap().len() as u64 + snapshot.omitted_bytes,
+            input.len() as u64
+        );
+        assert_eq!(fs::read(source).unwrap(), input);
+    }
+
+    #[test]
+    fn tail_reader_seeks_once_reads_only_initial_tail_and_refuses_a_short_read() {
+        struct ObservedReader {
+            bytes: io::Cursor<Vec<u8>>,
+            read_bytes: usize,
+            seeks: Vec<SeekFrom>,
+        }
+        impl Read for ObservedReader {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                let count = self.bytes.read(output)?;
+                self.read_bytes += count;
+                Ok(count)
+            }
+        }
+        impl Seek for ObservedReader {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                self.seeks.push(position);
+                self.bytes.seek(position)
+            }
+        }
+        let tail_cap = MAX_DIAGNOSTIC_EXPORT_BYTES / MAX_RETAINED_LOG_FILES;
+        let mut input = vec![b'x'; tail_cap * 3];
+        input.extend_from_slice(b"\nlatest\n");
+        let initial_size = input.len() as u64;
+        input.extend_from_slice(b"appended after size query\n");
+        let mut reader =
+            ObservedReader { bytes: io::Cursor::new(input), read_bytes: 0, seeks: Vec::new() };
+        let (tail, omitted) = read_bounded_log_tail(&mut reader, initial_size).unwrap();
+        assert_eq!(tail, b"latest\n");
+        assert_eq!(tail.len() as u64 + omitted, initial_size);
+        assert_eq!(reader.read_bytes, tail_cap);
+        assert_eq!(reader.seeks, [SeekFrom::Start(initial_size - tail_cap as u64)]);
+        let mut shortened = io::Cursor::new(vec![0; 20]);
+        assert_eq!(
+            read_bounded_log_tail(&mut shortened, 30).unwrap_err().kind,
+            DiagnosticFileErrorKind::InvalidContent
+        );
+    }
+
+    #[test]
+    fn collection_rejects_a_source_replaced_after_directory_enumeration() {
+        let directory = TestDirectory::new("export-source-replaced");
+        let source = directory.path().join("diskpie.2026-09-06.log");
+        fs::write(&source, b"original\n").unwrap();
+        let root =
+            DirectoryGuard::open(directory.path(), DiagnosticFileOperation::ReadLogDirectory)
+                .unwrap();
+        let records = bounded_log_records(&root).unwrap().0;
+        assert_eq!(records.len(), 1);
+        fs::rename(&source, directory.path().join("original-kept.txt")).unwrap();
+        fs::write(&source, b"replacement must not be exported\n").unwrap();
+        assert_eq!(
+            read_log_tail(&root, &records[0]).unwrap_err().kind,
+            DiagnosticFileErrorKind::InvalidDestination
+        );
+        assert_eq!(fs::read(source).unwrap(), b"replacement must not be exported\n");
     }
 
     #[test]

@@ -132,7 +132,32 @@ pub struct LocalDiagnostics {
     initial_retention: InitialRetentionOutcome,
 }
 
+/// Read-only health counters; retaining this handle cannot keep a writer alive.
+#[derive(Clone)]
+pub struct DiagnosticsCounterReader {
+    dropped: Arc<AtomicU64>,
+    write_failures: Arc<AtomicU64>,
+    truncated_lines: Arc<AtomicU64>,
+}
+
+impl DiagnosticsCounterReader {
+    pub fn snapshot(&self) -> DiagnosticCounters {
+        DiagnosticCounters {
+            dropped_events: self.dropped.load(Ordering::Acquire),
+            write_failures: self.write_failures.load(Ordering::Acquire),
+            sink_truncated_lines: self.truncated_lines.load(Ordering::Acquire),
+        }
+    }
+}
+
 impl LocalDiagnostics {
+    pub fn counter_reader(&self) -> DiagnosticsCounterReader {
+        DiagnosticsCounterReader {
+            dropped: Arc::clone(&self.dropped),
+            write_failures: Arc::clone(&self.write_failures),
+            truncated_lines: Arc::clone(&self.truncated_lines),
+        }
+    }
     /// Initializes daily local logging without any terminal or network sink.
     ///
     /// The directory must already have been resolved and explicitly created

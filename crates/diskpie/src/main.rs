@@ -14,6 +14,8 @@ mod scan_ui;
 mod shell;
 pub mod storage;
 pub mod sunburst_view;
+#[cfg(windows)]
+mod support_service;
 mod theme;
 
 use std::{
@@ -25,6 +27,7 @@ use std::{
 use eframe::egui;
 
 use diagnostic_sink::DiagnosticBridge;
+use diskpie_app::item_list_service::{ItemListFinish, ItemListService};
 use diskpie_app::{runtime::RuntimeController, settings::SettingsSession};
 use panic_marker::{CrashMarkerError, FinishCleanOutcome};
 use resolver::ResolverWorker;
@@ -144,6 +147,9 @@ pub struct ShutdownReceipts {
     pub resolver_joined: bool,
     /// Whether the diagnostic bridge thread was joined within its deadline.
     pub diagnostic_bridge_joined: bool,
+    /// The item-list service was absent or joined before its deadline.
+    pub item_list_joined: bool,
+    pub support_joined: bool,
     /// Events the UI dropped because the bounded diagnostic queue was full.
     pub diagnostic_events_dropped: u64,
 }
@@ -169,6 +175,8 @@ impl ShutdownReceipts {
             shell_stopped: self.shell_stopped(),
             resolver_joined: self.resolver_joined,
             bridge_joined: self.diagnostic_bridge_joined,
+            item_list_joined: self.item_list_joined,
+            support_joined: self.support_joined,
         })
     }
 }
@@ -181,8 +189,9 @@ fn run(startup: cli::StartupRequest) -> (eframe::Result<ShutdownReceipts>, Crash
     let prepared = match services.prepare_ui_services(&settings) {
         Ok(prepared) => prepared,
         Err(error) => {
-            // No scan runtime, Shell STA, or worker was composed, so the
-            // "no runtime composed" receipt remains truthful here.
+            // Preparation can fail after starting some services. Without
+            // explicit join receipts their shutdown is unverified, even though
+            // their nonblocking Drops have requested retirement.
             let crash_marker_finish = services.finish(None);
             return (Err(error), crash_marker_finish);
         }
@@ -202,8 +211,13 @@ fn run(startup: cli::StartupRequest) -> (eframe::Result<ShutdownReceipts>, Crash
     // resolver and bridge joins), settings publication, diagnostics
     // stop/finish, then crash-marker reconciliation with a proof minted from
     // the diagnostics join and the receipts collected above.
-    let (receipts, session) =
-        finish_ui_services(exit, prepared.resolver, prepared.bridge, shell_service_started);
+    let (receipts, session) = finish_ui_services(
+        exit,
+        prepared.resolver,
+        prepared.bridge,
+        shell_service_started,
+        prepared.support,
+    );
     services.publish_settings(session);
     let crash_marker_finish = services.finish(Some(receipts));
     (result.map(|()| receipts), crash_marker_finish)
@@ -229,6 +243,7 @@ fn run(startup: cli::StartupRequest) -> (eframe::Result<ShutdownReceipts>, Crash
                 resolver: resolver_client,
                 diagnostics: bridge.sink(),
                 fonts: fonts::SystemFonts::default(),
+                item_list: ItemListService::new().ok(),
             },
             resolver,
             bridge,
@@ -252,6 +267,8 @@ struct PreparedUiServices {
     services: UiServices,
     resolver: ResolverWorker,
     bridge: DiagnosticBridge,
+    #[cfg(windows)]
+    support: Option<support_service::SupportWorker>,
 }
 
 /// Ordered, bounded finish of everything the shell handed back.
@@ -262,14 +279,23 @@ struct PreparedUiServices {
 /// the diagnostic bridge join. Settings publication and diagnostics finish
 /// follow in the caller.
 fn finish_ui_services(
-    exit: Option<ShellExit>,
+    mut exit: Option<ShellExit>,
     resolver: ResolverWorker,
     bridge: DiagnosticBridge,
     shell_service_started: bool,
+    #[cfg(windows)] support: Option<support_service::SupportWorker>,
 ) -> (ShutdownReceipts, Option<SettingsSession>) {
-    let (session, mut runtime, picker, clock_origin) = match exit {
-        Some(exit) => (Some(exit.settings), exit.runtime, exit.picker, exit.clock_origin),
-        None => (None, None, None, Instant::now()),
+    #[cfg(windows)]
+    let pending_action = exit.as_mut().and_then(|exit| exit.pending_action.take());
+    // Rejected snapshot/provider ownership is released after the event loop.
+    if let Some(exit) = exit.as_mut() {
+        exit.retired_resources.clear();
+    }
+    let (session, mut runtime, picker, clock_origin, item_list) = match exit {
+        Some(exit) => {
+            (Some(exit.settings), exit.runtime, exit.picker, exit.clock_origin, exit.item_list)
+        }
+        None => (None, None, None, Instant::now(), None),
     };
 
     let runtime_shutdown_complete =
@@ -281,9 +307,43 @@ fn finish_ui_services(
     drop(runtime);
 
     #[cfg(windows)]
+    if let Some(pending) = pending_action {
+        let deadline = Instant::now() + SERVICE_FINISH_TIMEOUT;
+        let event = loop {
+            let Some(picker) = picker.as_ref() else {
+                break None;
+            };
+            match picker.try_recv() {
+                Ok(Some(event)) if pending.matches(&event) => break Some(event),
+                Ok(Some(_)) => continue,
+                Err(_) => break None,
+                Ok(None) if Instant::now() >= deadline => break None,
+                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        };
+        let report = pending.settle(event);
+        let mut event = DiagnosticEvent::new(DiagnosticCode::ShellActionFailed);
+        let outcome = if report.requires_halt() { Outcome::Failed } else { Outcome::Degraded };
+        let _ = event.push_field(DiagnosticField::Outcome(outcome));
+        bridge.sink().emit(event);
+        // No snapshot survives exit. Its next use always requires a new scan,
+        // satisfying the retained obligation without mutating the closed UI.
+    }
+
+    #[cfg(windows)]
     let shell_service = picker.map(|picker| picker.finish(SERVICE_FINISH_TIMEOUT));
     #[cfg(not(windows))]
     drop(picker);
+
+    let item_list_joined = item_list
+        .is_none_or(|list| matches!(list.finish(SERVICE_FINISH_TIMEOUT), ItemListFinish::Joined));
+    #[cfg(windows)]
+    let support_joined = !support_service::has_quarantined_worker()
+        && support.is_none_or(|worker| {
+            matches!(worker.finish(SERVICE_FINISH_TIMEOUT), support_service::SupportFinish::Joined)
+        });
+    #[cfg(not(windows))]
+    let support_joined = true;
 
     let resolver_joined = resolver.finish(SERVICE_FINISH_TIMEOUT);
     let diagnostic_events_dropped = bridge.dropped_events();
@@ -298,6 +358,8 @@ fn finish_ui_services(
             shell_service,
             resolver_joined,
             diagnostic_bridge_joined,
+            item_list_joined,
+            support_joined,
             diagnostic_events_dropped,
         },
         session,
@@ -541,6 +603,23 @@ impl WindowsStartupServices {
         }
         .map_err(app_creation_error)?;
         let fonts = fonts::load_windows_fallbacks();
+        let mut owned_files = self.paths.settings_file.iter().cloned().collect::<Vec<_>>();
+        if let Some(directory) = &self.paths.crashes_directory {
+            owned_files.push(directory.join("last-panic.txt"));
+            owned_files.push(directory.join("last-panic.write"));
+        }
+        let (support_client, support) =
+            match support_service::start(support_service::SupportConfig {
+                executable: std::env::current_exe().ok(),
+                logs_directory: self.paths.logs_directory.clone(),
+                owned_files,
+            }) {
+                Ok((client, worker)) => (Some(client), Some(worker)),
+                Err(_) => {
+                    self.optional_services_unavailable = true;
+                    (None, None)
+                }
+            };
         Ok(PreparedUiServices {
             services: UiServices {
                 runtime,
@@ -548,9 +627,16 @@ impl WindowsStartupServices {
                 resolver: resolver_client,
                 diagnostics: bridge.sink(),
                 fonts,
+                item_list: ItemListService::new().ok(),
+                support: support_client,
+                diagnostic_counters: self
+                    .diagnostics
+                    .as_ref()
+                    .map(LocalDiagnostics::counter_reader),
             },
             resolver,
             bridge,
+            support,
         })
     }
 
@@ -600,8 +686,8 @@ impl WindowsStartupServices {
     /// includes a session whose diagnostics never started: no worker exists
     /// to join, but there is also no receipt to certify it, so a marker from
     /// a caught worker panic stays on disk and the next start records
-    /// `panic.marker_found`. `receipts` is `None` only when no scan runtime,
-    /// Shell STA, or worker was ever composed.
+    /// `panic.marker_found`. Missing UI receipts also cover partial startup
+    /// failures; they must never assert that no runtime was composed.
     fn finish(self, receipts: Option<ShutdownReceipts>) -> CrashMarkerFinish {
         let Self { diagnostics, crash_runtime, .. } = self;
         let diagnostics_receipt = diagnostics.and_then(|diagnostics| {
@@ -639,10 +725,7 @@ impl WindowsStartupServices {
             drop(runtime);
             return CrashMarkerFinish::PreservedWithoutProof;
         };
-        let runtime_receipt = match receipts {
-            None => Some(RuntimeQuiescenceReceipt::no_runtime_composed()),
-            Some(receipts) => receipts.runtime_quiescence(),
-        };
+        let runtime_receipt = verified_ui_quiescence(receipts);
         let Some(runtime_receipt) = runtime_receipt else {
             drop(runtime);
             return CrashMarkerFinish::PreservedWithoutProof;
@@ -656,6 +739,12 @@ impl WindowsStartupServices {
             diagnostics.record(event);
         }
     }
+}
+
+/// A missing exit/receipt set is not evidence that startup created no workers.
+#[cfg(windows)]
+fn verified_ui_quiescence(receipts: Option<ShutdownReceipts>) -> Option<RuntimeQuiescenceReceipt> {
+    receipts.and_then(|receipts| receipts.runtime_quiescence())
 }
 
 #[cfg(windows)]
@@ -824,7 +913,14 @@ mod shutdown_tests {
         let bridge = DiagnosticBridge::start(|_event| {}).expect("bridge starts");
         client.request_stop();
         drop(client);
-        let (receipts, session) = finish_ui_services(None, resolver, bridge, false);
+        let (receipts, session) = finish_ui_services(
+            None,
+            resolver,
+            bridge,
+            false,
+            #[cfg(windows)]
+            None,
+        );
         assert!(session.is_none());
         assert!(!receipts.runtime_shutdown_complete, "no runtime was handed back");
         assert_eq!(receipts.runtime_retiring_scans, usize::MAX, "unknown without a runtime");
@@ -841,7 +937,7 @@ mod shutdown_tests {
         let bridge = DiagnosticBridge::start(|_event| {}).expect("bridge starts");
         client.request_stop();
         drop(client);
-        let (receipts, _session) = finish_ui_services(None, resolver, bridge, true);
+        let (receipts, _session) = finish_ui_services(None, resolver, bridge, true, None);
         assert!(!receipts.shell_stopped(), "a started STA without a finish is not stopped");
         assert!(receipts.runtime_quiescence().is_none());
 
@@ -852,9 +948,12 @@ mod shutdown_tests {
             shell_service: Some(ShellServiceFinish::Exited { panicked: false }),
             resolver_joined: true,
             diagnostic_bridge_joined: true,
+            item_list_joined: true,
+            support_joined: true,
             diagnostic_events_dropped: 0,
         };
         assert!(clean.runtime_quiescence().is_some());
+        assert!(verified_ui_quiescence(Some(clean)).is_some());
         assert!(
             ShutdownReceipts { shell_service_started: false, shell_service: None, ..clean }
                 .runtime_quiescence()
@@ -874,8 +973,31 @@ mod shutdown_tests {
             ShutdownReceipts { runtime_shutdown_complete: false, ..clean },
             ShutdownReceipts { resolver_joined: false, ..clean },
             ShutdownReceipts { diagnostic_bridge_joined: false, ..clean },
+            ShutdownReceipts { item_list_joined: false, ..clean },
+            ShutdownReceipts { support_joined: false, ..clean },
         ] {
             assert!(degraded.runtime_quiescence().is_none(), "{degraded:?}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn startup_failure_after_starting_a_worker_has_no_clean_shutdown_proof() {
+        // Model an error at the next fallible startup step while an earlier
+        // worker is demonstrably alive. No native settings or marker is touched.
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let worker = std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let failed_startup: Result<ShutdownReceipts, std::io::Error> =
+            Err(std::io::Error::other("injected next-service startup failure"));
+        let receipts = failed_startup.ok();
+        assert!(!worker.is_finished());
+        assert!(verified_ui_quiescence(receipts).is_none());
+        drop(release_tx);
+        worker.join().unwrap();
     }
 }

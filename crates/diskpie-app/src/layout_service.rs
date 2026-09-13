@@ -8,13 +8,16 @@
 use crate::navigation::HiddenBranchesPlan;
 use diskpie_core::{
     GenerationId, TreeSnapshot,
-    sunburst::{LayoutError, LayoutOptions, SizeBasis, SunburstLayout, compute_layout},
+    sunburst::{LayoutError, LayoutOptions, SizeBasis, SunburstLayout, compute_layout_cancellable},
 };
 use std::{
     error::Error,
     fmt, io,
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::{Arc, Condvar, Mutex, MutexGuard},
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     thread::{self, JoinHandle},
 };
 
@@ -191,6 +194,7 @@ struct WorkerState {
 struct Shared {
     state: Mutex<WorkerState>,
     wake: Condvar,
+    latest: AtomicU64,
 }
 
 /// One background layout worker with a bounded, coalescing mailbox.
@@ -227,8 +231,8 @@ impl LayoutService {
 
     /// Replaces any queued or completed older request without waiting.
     ///
-    /// Work already executing is allowed to finish, but its result is discarded
-    /// if this request supersedes it before publication. Hidden branches stay
+    /// Work already executing observes supersession at traversal boundaries.
+    /// Obsolete geometry is discarded before publication. Hidden branches stay
     /// immutably shared with navigation rather than copying an unbounded set.
     pub fn submit<H>(
         &mut self,
@@ -296,6 +300,7 @@ impl LayoutService {
             retirement_probe: None,
         });
         state.latest = Some(id);
+        self.shared.latest.store(sequence, Ordering::Release);
         drop(state);
         self.shared.wake.notify_one();
         Ok(id)
@@ -325,6 +330,7 @@ impl Drop for LayoutService {
         {
             let mut state = lock_state(&self.shared);
             state.shutdown = true;
+            self.shared.latest.store(0, Ordering::Release);
         }
         self.shared.wake.notify_one();
         if let Some(worker) = self.worker.take() {
@@ -379,8 +385,10 @@ fn worker_loop(shared: &Shared) {
         let size_basis = job.options.size_basis;
         let result = catch_unwind(AssertUnwindSafe(|| {
             let hidden = job.hidden.materialize();
-            compute_layout(&job.snapshot, job.options, hidden.as_ref())
-                .map_err(LayoutTaskError::from)
+            compute_layout_cancellable(&job.snapshot, job.options, hidden.as_ref(), || {
+                shared.latest.load(Ordering::Acquire) != job.id.get()
+            })
+            .map_err(LayoutTaskError::from)
         }))
         .unwrap_or(Err(LayoutTaskError::WorkerPanicked));
 
@@ -392,6 +400,11 @@ fn worker_loop(shared: &Shared) {
             return;
         }
         if state.latest == Some(job.id) {
+            let result = match result {
+                Ok(Some(layout)) => Ok(layout),
+                Ok(None) => continue,
+                Err(error) => Err(error),
+            };
             let replaced = state.completed.replace(LayoutCompletion {
                 id: job.id,
                 source_generation,

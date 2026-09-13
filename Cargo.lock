@@ -682,6 +682,7 @@ dependencies = [
  "serde",
  "tracing",
  "tracing-subscriber",
+ "winit",
  "winresource",
 ]
 

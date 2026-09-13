@@ -1,6 +1,6 @@
 //! Conventional Windows filesystem adapter.
 //!
-//! The adapter deliberately performs a one-directory-at-a-time Win32 walk. It
+//! The adapter deliberately performs a one-directory-at-a-time Windows walk. It
 //! is the correctness baseline for every Windows filesystem; it does not make
 //! NTFS assumptions or use an MFT/USN shortcut. Names and paths remain native
 //! UTF-16 all the way to the portable `OsString`/`PathBuf` seam.
@@ -9,16 +9,18 @@
 //! are returned as non-traversable boundaries. Reparse-point files and offline
 //! or partial placeholders are never metadata-opened, so their allocation and
 //! identity remain explicitly unknown. Ordinary files use
-//! `FILE_STANDARD_INFO` and `FILE_ID_INFO` through a zero-access,
-//! non-inheritable handle opened with full sharing and
-//! `FILE_FLAG_OPEN_REPARSE_POINT`.
+//! `FILE_STANDARD_INFO` and `FILE_ID_INFO` through non-inheritable metadata
+//! handles opened relative to the retained directory, with full sharing,
+//! no-reparse name resolution and no-recall semantics. Enumeration uses that
+//! same directory handle, so renaming an ancestor cannot redirect later opens.
 //!
 //! Limitations:
 //! - the baseline opens every ordinary file and therefore favors correctness
 //!   and broad filesystem support over NTFS-specific throughput;
-//! - `WIN32_FIND_DATAW` has no allocation or 128-bit identity field, so policy-
-//!   blocked files cannot provide those values without weakening no-follow and
-//!   no-hydration guarantees;
+//! - enumeration metadata is used only for names, attributes, tags and logical
+//!   fallback sizes; the conventional per-file allocation/identity policy is
+//!   unchanged. Providers without extended directory information use the full
+//!   directory class; unavailable reparse tags remain explicit boundaries;
 //! - cancellation is checked between Win32 operations and every returned
 //!   entry, but an in-flight filesystem-driver call may still block;
 //! - reparse tags are retained in typed omission diagnostics because the
@@ -35,19 +37,28 @@ use diskpie_scan::{
 };
 use std::{
     ffi::{OsString, c_void},
-    fs::{File, OpenOptions},
+    fs::File,
     io,
-    mem::size_of,
+    mem::{offset_of, size_of},
     os::windows::{
         ffi::{OsStrExt, OsStringExt},
-        fs::OpenOptionsExt,
-        io::AsRawHandle,
+        io::{AsRawHandle, FromRawHandle},
     },
-    path::{Path, PathBuf},
+    path::Path,
 };
 use windows::{
+    Wdk::{
+        Foundation::OBJECT_ATTRIBUTES,
+        Storage::FileSystem::{
+            FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_NO_RECALL, FILE_OPEN_REPARSE_POINT,
+            FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+        },
+    },
     Win32::{
-        Foundation::HANDLE,
+        Foundation::{
+            HANDLE, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, RtlNtStatusToDosError,
+            STATUS_REPARSE_POINT_ENCOUNTERED, UNICODE_STRING,
+        },
         Storage::{
             CloudFilters::{
                 CF_PLACEHOLDER_STATE, CF_PLACEHOLDER_STATE_INVALID, CF_PLACEHOLDER_STATE_NO_STATES,
@@ -57,16 +68,18 @@ use windows::{
             FileSystem::{
                 FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_OFFLINE,
                 FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
-                FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
-                FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
-                FIND_FIRST_EX_FLAGS, FIND_FIRST_EX_LARGE_FETCH, FileIdInfo, FileStandardInfo,
-                FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW, FindNextFileW,
-                GetFileAttributesW, GetFileInformationByHandleEx, INVALID_FILE_ATTRIBUTES,
-                WIN32_FIND_DATAW,
+                FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
+                FILE_FLAGS_AND_ATTRIBUTES, FILE_FULL_DIR_INFO, FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO,
+                FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+                FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileBasicInfo,
+                FileFullDirectoryInfo, FileFullDirectoryRestartInfo, FileIdExtdDirectoryInfo,
+                FileIdExtdDirectoryRestartInfo, FileIdInfo, FileStandardInfo,
+                GetFileInformationByHandleEx, SYNCHRONIZE,
             },
         },
+        System::IO::IO_STATUS_BLOCK,
     },
-    core::PCWSTR,
+    core::PWSTR,
 };
 
 const ERROR_INVALID_FUNCTION_CODE: i32 = 1;
@@ -88,7 +101,7 @@ const WIDE_BACKSLASH: u16 = b'\\' as u16;
 const WIDE_SLASH: u16 = b'/' as u16;
 const WIDE_COLON: u16 = b':' as u16;
 const WIDE_QUESTION: u16 = b'?' as u16;
-const WIDE_STAR: u16 = b'*' as u16;
+const DIRECTORY_BUFFER_U64S: usize = 8_192;
 
 /// Conventional, filesystem-agnostic Windows implementation of [`ScanFs`].
 ///
@@ -123,71 +136,21 @@ impl WindowsFileSystem {
         Ok(())
     }
 
-    fn open_enumeration(
-        &self,
-        directory: &Path,
-        search: &WideCString,
-    ) -> Result<Option<(FindHandle, WIN32_FIND_DATAW)>, FsError> {
-        let mut use_large_fetch = true;
-        loop {
-            self.check_cancel(directory, FsOperation::EnumerateDirectory)?;
-            let mut data = WIN32_FIND_DATAW::default();
-            let flags =
-                if use_large_fetch { FIND_FIRST_EX_LARGE_FETCH } else { FIND_FIRST_EX_FLAGS(0) };
-
-            // SAFETY: `search` is NUL-terminated for the duration of the call;
-            // `data` is a correctly sized writable `WIN32_FIND_DATAW`; the
-            // returned owned search handle is immediately put under RAII.
-            let result = unsafe {
-                FindFirstFileExW(
-                    search.as_pcwstr(),
-                    FindExInfoBasic,
-                    (&raw mut data).cast::<c_void>(),
-                    FindExSearchNameMatch,
-                    None,
-                    flags,
-                )
-            };
-
-            match result {
-                Ok(handle) => return Ok(Some((FindHandle(handle), data))),
-                Err(error) => {
-                    let code = win32_code(&error);
-                    if code == ERROR_FILE_NOT_FOUND_CODE {
-                        // `directory\\*` reports this for an empty directory.
-                        return Ok(None);
-                    }
-                    if use_large_fetch && large_fetch_can_fallback(code) {
-                        use_large_fetch = false;
-                        continue;
-                    }
-                    return Err(fs_error_from_windows(
-                        directory,
-                        FsOperation::EnumerateDirectory,
-                        error,
-                    ));
-                }
-            }
-        }
-    }
-
     fn process_entry(
         &self,
         directory: &Path,
-        directory_wide: &ExtendedPath,
-        data: &WIN32_FIND_DATAW,
-        name_units: &[u16],
+        directory_handle: &File,
+        data: &EnumeratedEntry,
     ) -> Result<ProcessedEntry, FsError> {
-        let name = OsString::from_wide(name_units);
+        let name = OsString::from_wide(&data.name);
         let path = directory.join(&name);
         self.check_cancel(&path, FsOperation::ReadMetadata)?;
 
-        let attributes = data.dwFileAttributes;
-        let reparse_tag =
-            if attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 { data.dwReserved0 } else { 0 };
+        let attributes = data.attributes;
+        let reparse_tag = data.reparse_tag;
         let cloud_state = placeholder_state(attributes, reparse_tag);
         let classification = classify_entry(attributes, reparse_tag, cloud_state);
-        let logical_size = find_data_size(data);
+        let logical_size = data.logical_size;
 
         match classification.metadata {
             MetadataDisposition::DirectoryZero => {
@@ -212,8 +175,8 @@ impl WindowsFileSystem {
                 omissions: vec![policy_omission(&path, classification)],
             }),
             MetadataDisposition::QueryFile => {
-                let child_wide = directory_wide.join_component(name_units);
-                let queried = self.query_file_metadata(&path, &child_wide, logical_size)?;
+                let queried =
+                    self.query_file_metadata(&path, directory_handle, &data.name, logical_size)?;
                 let mut entry = FsEntry::new(name, classification.kind, queried.metrics);
                 if let Some(identity) = queried.identity {
                     entry = entry.with_file_identity(identity);
@@ -226,11 +189,12 @@ impl WindowsFileSystem {
     fn query_file_metadata(
         &self,
         path: &Path,
-        wide_path: &ExtendedPath,
+        directory_handle: &File,
+        name: &[u16],
         enumeration_logical_size: u64,
     ) -> Result<QueriedFileMetadata, FsError> {
         self.check_cancel(path, FsOperation::ReadMetadata)?;
-        let file = match open_metadata_file(wide_path) {
+        let file = match open_relative_metadata_file(directory_handle, name) {
             Ok(file) => file,
             Err(error) => {
                 let omission = fs_error_from_io(path, FsOperation::ReadMetadata, error);
@@ -250,6 +214,38 @@ impl WindowsFileSystem {
             }
         };
 
+        self.check_cancel(path, FsOperation::ReadMetadata)?;
+        // A file can become a reparse/cloud object after its directory record
+        // was returned. The relative open never follows it and NO_RECALL avoids
+        // recalling contents; verify its current attributes before size/ID reads.
+        let tag = match query_attribute_tag(&file) {
+            Ok(tag) => tag,
+            Err(error) => {
+                return Ok(QueriedFileMetadata {
+                    metrics: OwnMetrics::new(
+                        SizeMetric::known(enumeration_logical_size, MetricSource::PortableMetadata),
+                        SizeMetric::unknown(UnknownReason::NotAvailable, MetricSource::Policy),
+                    ),
+                    identity: None,
+                    omissions: vec![fs_error_from_windows(path, FsOperation::ReadMetadata, error)],
+                });
+            }
+        };
+        let current = classify_entry(
+            tag.FileAttributes,
+            tag.ReparseTag,
+            placeholder_state(tag.FileAttributes, tag.ReparseTag),
+        );
+        if current.metadata != MetadataDisposition::QueryFile {
+            return Ok(QueriedFileMetadata {
+                metrics: OwnMetrics::new(
+                    SizeMetric::known(enumeration_logical_size, MetricSource::PortableMetadata),
+                    SizeMetric::unknown(UnknownReason::NotAvailable, MetricSource::Policy),
+                ),
+                identity: None,
+                omissions: vec![policy_omission(path, current)],
+            });
+        }
         self.check_cancel(path, FsOperation::ReadMetadata)?;
         let standard_result = query_standard_info(&file);
         self.check_cancel(path, FsOperation::ReadIdentity)?;
@@ -299,36 +295,38 @@ impl ScanFs for WindowsFileSystem {
         })?;
 
         self.check_cancel(directory, FsOperation::EnumerateDirectory)?;
-        let attributes = query_path_attributes(&directory_wide)
+        let handle = open_directory(&directory_wide)
             .map_err(|error| fs_error_from_io(directory, FsOperation::EnumerateDirectory, error))?;
-
-        if attributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0 {
+        let attributes = query_attribute_tag(&handle).map_err(|error| {
+            fs_error_from_windows(directory, FsOperation::EnumerateDirectory, error)
+        })?;
+        if attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0 {
             return Err(FsError::new(directory, FsOperation::EnumerateDirectory, FsErrorKind::Io)
                 .with_detail("scan work item is not a directory"));
         }
-        if root_is_policy_boundary(attributes) {
+        if root_is_policy_boundary(attributes.FileAttributes) {
             return Err(FsError::new(
                 directory,
                 FsOperation::EnumerateDirectory,
                 FsErrorKind::NotSupported,
             )
-            .with_detail(format!(
-                "selected directory is a reparse/cloud boundary (attributes 0x{attributes:08X}); \
-                 it was not followed or enumerated"
-            )));
+            .with_detail(
+                "opened directory is a reparse/cloud boundary; content was not enumerated",
+            ));
         }
-
-        let search = directory_wide.search_pattern();
-        let Some((handle, mut data)) = self.open_enumeration(directory, &search)? else {
-            return Ok(());
-        };
+        let mut cursor = DirectoryCursor::new();
 
         loop {
             self.check_cancel(directory, FsOperation::EnumerateDirectory)?;
-            let name_units = find_name_units(&data);
-            if !is_dot_entry(name_units) {
-                let processed =
-                    self.process_entry(directory, &directory_wide, &data, name_units)?;
+            let Some(entries) = cursor.read(&handle).map_err(|error| {
+                fs_error_from_io(directory, FsOperation::EnumerateDirectory, error)
+            })?
+            else {
+                return Ok(());
+            };
+            for data in entries {
+                self.check_cancel(directory, FsOperation::EnumerateDirectory)?;
+                let processed = self.process_entry(directory, &handle, &data)?;
                 if visitor(DirectoryItem::Entry(processed.entry)) == VisitControl::Stop {
                     return Ok(());
                 }
@@ -338,39 +336,159 @@ impl ScanFs for WindowsFileSystem {
                     }
                 }
             }
+        }
+    }
+}
 
-            self.check_cancel(directory, FsOperation::EnumerateDirectory)?;
-            // SAFETY: `handle` owns a live find handle and `data` is a correctly
-            // sized writable record. No pointer escapes this call.
-            match unsafe { FindNextFileW(handle.raw(), &raw mut data) } {
-                Ok(()) => {}
-                Err(error) if win32_code(&error) == ERROR_NO_MORE_FILES_CODE => return Ok(()),
+/// The full class is a provider fallback, not a fallback to pathname traversal.
+/// Missing reparse tags use zero (unknown), which the policy rejects closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectoryClass {
+    Extended,
+    Full,
+}
+
+#[derive(Debug)]
+struct EnumeratedEntry {
+    name: Vec<u16>,
+    attributes: u32,
+    reparse_tag: u32,
+    logical_size: u64,
+}
+
+struct DirectoryCursor {
+    storage: Vec<u64>,
+    class: DirectoryClass,
+    restart: bool,
+}
+
+impl DirectoryCursor {
+    fn new() -> Self {
+        Self {
+            storage: vec![0; DIRECTORY_BUFFER_U64S],
+            class: DirectoryClass::Extended,
+            restart: true,
+        }
+    }
+
+    fn read(&mut self, directory: &File) -> io::Result<Option<Vec<EnumeratedEntry>>> {
+        loop {
+            self.storage.fill(0);
+            let class = match (self.class, self.restart) {
+                (DirectoryClass::Extended, true) => FileIdExtdDirectoryRestartInfo,
+                (DirectoryClass::Extended, false) => FileIdExtdDirectoryInfo,
+                (DirectoryClass::Full, true) => FileFullDirectoryRestartInfo,
+                (DirectoryClass::Full, false) => FileFullDirectoryInfo,
+            };
+            // SAFETY: the retained directory owns its enumeration cursor. The
+            // initialized u64 allocation supplies 64 KiB aligned to eight bytes,
+            // as both native directory record formats require. No pointer escapes.
+            let result = unsafe {
+                GetFileInformationByHandleEx(
+                    HANDLE(directory.as_raw_handle()),
+                    class,
+                    self.storage.as_mut_ptr().cast::<c_void>(),
+                    (DIRECTORY_BUFFER_U64S * size_of::<u64>()) as u32,
+                )
+            };
+            match result {
+                Ok(()) => {
+                    self.restart = false;
+                    // SAFETY: every byte of this owned allocation is initialized;
+                    // the immutable parser borrow ends before storage is reused.
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            self.storage.as_ptr().cast::<u8>(),
+                            self.storage.len() * size_of::<u64>(),
+                        )
+                    };
+                    return parse_directory_records(bytes, self.class).map(Some);
+                }
                 Err(error) => {
-                    return Err(fs_error_from_windows(
-                        directory,
-                        FsOperation::EnumerateDirectory,
-                        error,
-                    ));
+                    let code = win32_code(&error);
+                    if code == ERROR_NO_MORE_FILES_CODE {
+                        return Ok(None);
+                    }
+                    if self.restart
+                        && self.class == DirectoryClass::Extended
+                        && information_class_can_fallback(code)
+                    {
+                        self.class = DirectoryClass::Full;
+                        continue;
+                    }
+                    return Err(io::Error::from_raw_os_error(code));
                 }
             }
         }
     }
 }
 
-#[derive(Debug)]
-struct FindHandle(HANDLE);
-
-impl FindHandle {
-    const fn raw(&self) -> HANDLE {
-        self.0
-    }
+fn invalid_directory_record() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "invalid directory information record")
 }
 
-impl Drop for FindHandle {
-    fn drop(&mut self) {
-        // SAFETY: this wrapper is constructed only from a successful
-        // `FindFirstFileExW` call and owns that handle exactly once.
-        let _ = unsafe { FindClose(self.0) };
+fn parse_directory_records(
+    bytes: &[u8],
+    class: DirectoryClass,
+) -> io::Result<Vec<EnumeratedEntry>> {
+    let name_offset = match class {
+        DirectoryClass::Extended => offset_of!(FILE_ID_EXTD_DIR_INFO, FileName),
+        DirectoryClass::Full => offset_of!(FILE_FULL_DIR_INFO, FileName),
+    };
+    // Both classes have this common header; neither is cast to a native struct.
+    const EOF: usize = offset_of!(FILE_FULL_DIR_INFO, EndOfFile);
+    const ATTRIBUTES: usize = offset_of!(FILE_FULL_DIR_INFO, FileAttributes);
+    const NAME_LENGTH: usize = offset_of!(FILE_FULL_DIR_INFO, FileNameLength);
+    let mut entries = Vec::new();
+    let mut offset = 0;
+    loop {
+        let record = bytes.get(offset..).ok_or_else(invalid_directory_record)?;
+        if record.len() < name_offset {
+            return Err(invalid_directory_record());
+        }
+        let u32_at = |index| {
+            u32::from_le_bytes(record[index..index + 4].try_into().expect("validated header"))
+        };
+        let next = u32_at(0) as usize;
+        let name_length = u32_at(NAME_LENGTH) as usize;
+        if name_length == 0 || !name_length.is_multiple_of(2) {
+            return Err(invalid_directory_record());
+        }
+        let end = name_offset.checked_add(name_length).ok_or_else(invalid_directory_record)?;
+        let name_bytes = record.get(name_offset..end).ok_or_else(invalid_directory_record)?;
+        let name = name_bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        if !is_dot_entry(&name) {
+            validate_child_name(&name)?;
+            let attributes = u32_at(ATTRIBUTES);
+            let logical_size = if attributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
+                // Directory EOF is not a file measurement. Providers may leave
+                // it unspecified; directories retain the zero-by-policy model.
+                0
+            } else {
+                u64::try_from(i64::from_le_bytes(
+                    record[EOF..EOF + 8].try_into().expect("validated header"),
+                ))
+                .map_err(|_| invalid_directory_record())?
+            };
+            let reparse_tag = if attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+                && class == DirectoryClass::Extended
+            {
+                u32_at(offset_of!(FILE_ID_EXTD_DIR_INFO, ReparsePointTag))
+            } else {
+                0
+            };
+            entries.push(EnumeratedEntry { name, attributes, reparse_tag, logical_size });
+        }
+        if next == 0 {
+            return Ok(entries);
+        }
+        if next < end || !next.is_multiple_of(8) || next >= record.len() {
+            return Err(invalid_directory_record());
+        }
+        offset = offset.checked_add(next).ok_or_else(invalid_directory_record)?;
     }
 }
 
@@ -390,46 +508,12 @@ impl ExtendedPath {
         prefix_extended_absolute(&units).map(|units| Self { units })
     }
 
-    fn join_component(&self, component: &[u16]) -> Self {
-        let mut units = Vec::with_capacity(self.units.len() + component.len() + 1);
-        units.extend_from_slice(&self.units);
-        if units.last().copied() != Some(WIDE_BACKSLASH) {
-            units.push(WIDE_BACKSLASH);
-        }
-        units.extend_from_slice(component);
-        Self { units }
-    }
-
-    fn search_pattern(&self) -> WideCString {
-        let mut units = Vec::with_capacity(self.units.len() + 2);
-        units.extend_from_slice(&self.units);
-        if units.last().copied() != Some(WIDE_BACKSLASH) {
-            units.push(WIDE_BACKSLASH);
-        }
-        units.push(WIDE_STAR);
-        WideCString::new(units)
-    }
-
-    fn to_path_buf(&self) -> PathBuf {
-        PathBuf::from(OsString::from_wide(&self.units))
-    }
-
-    fn as_wide_c_string(&self) -> WideCString {
-        WideCString::new(self.units.clone())
-    }
-}
-
-#[derive(Clone, Debug)]
-struct WideCString(Vec<u16>);
-
-impl WideCString {
-    fn new(mut units: Vec<u16>) -> Self {
-        units.push(0);
-        Self(units)
-    }
-
-    const fn as_pcwstr(&self) -> PCWSTR {
-        PCWSTR(self.0.as_ptr())
+    fn nt_name(&self) -> Vec<u16> {
+        // Only DOS/UNC extended paths pass construction. Their NT equivalent
+        // changes \\?\ to \??\ without resolving any filesystem component.
+        let mut units = self.units.clone();
+        units[1] = WIDE_QUESTION;
+        units
     }
 }
 
@@ -693,11 +777,129 @@ struct QueriedFileMetadata {
     omissions: Vec<FsError>,
 }
 
-fn open_metadata_file(path: &ExtendedPath) -> io::Result<File> {
-    let share = (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0;
-    let mut options = OpenOptions::new();
-    options.access_mode(0).share_mode(share).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
-    options.open(path.to_path_buf())
+fn open_directory(path: &ExtendedPath) -> io::Result<File> {
+    open_no_follow(None, &path.nt_name(), true)
+}
+
+fn open_relative_metadata_file(directory: &File, name: &[u16]) -> io::Result<File> {
+    validate_child_name(name)?;
+    open_no_follow(Some(directory), name, false)
+}
+
+/// `RootDirectory` pins relative lookups to the same object being enumerated.
+/// OBJ_DONT_REPARSE rejects reparses in the initial absolute path too. No handle
+/// is inheritable, all opens are read-only and fully shared, and synchronous
+/// options keep the caller-owned IO_STATUS_BLOCK lifetime confined to this call.
+fn open_no_follow(parent: Option<&File>, name: &[u16], directory: bool) -> io::Result<File> {
+    let bytes = name.len().checked_mul(size_of::<u16>()).ok_or_else(invalid_directory_record)?;
+    let length = u16::try_from(bytes).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "native path exceeds UNICODE_STRING capacity")
+    })?;
+    let mut units = name.to_vec();
+    let name =
+        UNICODE_STRING { Length: length, MaximumLength: length, Buffer: PWSTR(units.as_mut_ptr()) };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: parent.map_or(HANDLE::default(), |file| HANDLE(file.as_raw_handle())),
+        ObjectName: &raw const name,
+        // The initial DOS/UNC path retains Win32's case-insensitive lookup.
+        // Relative children preserve exact enumerated spelling, including in
+        // case-sensitive directories, rather than forcing insensitive matching.
+        Attributes: if parent.is_some() {
+            OBJ_DONT_REPARSE
+        } else {
+            OBJ_DONT_REPARSE | OBJ_CASE_INSENSITIVE
+        },
+        ..Default::default()
+    };
+    let mut handle = HANDLE::default();
+    let mut status_block = IO_STATUS_BLOCK::default();
+    let access = if directory {
+        SYNCHRONIZE | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY
+    } else {
+        SYNCHRONIZE | FILE_READ_ATTRIBUTES
+    };
+    let kind = if directory {
+        // FILE_DIRECTORY_FILE is incompatible with FILE_OPEN_NO_RECALL. The
+        // caller validates directory kind and cloud policy on this same handle
+        // before performing any enumeration.
+        FILE_OPEN_NO_RECALL
+    } else {
+        FILE_NON_DIRECTORY_FILE | FILE_OPEN_NO_RECALL
+    };
+    // SAFETY: the name, object attributes and status output remain live for this
+    // synchronous call. The optional parent File retains its valid handle. Only
+    // FILE_OPEN is used, with no writes, no handle inheritance and no recall.
+    // Successful raw ownership is transferred immediately into File below.
+    let status = unsafe {
+        NtCreateFile(
+            &raw mut handle,
+            access,
+            &raw const attributes,
+            &raw mut status_block,
+            None,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            kind | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            None,
+            0,
+        )
+    };
+    if status == STATUS_REPARSE_POINT_ENCOUNTERED {
+        return Err(io::Error::from_raw_os_error(ERROR_NOT_SUPPORTED_CODE));
+    }
+    if status.is_err() {
+        // SAFETY: this pure conversion accepts any NTSTATUS and retains no
+        // pointers or handles; it preserves the native error for typed omissions.
+        return Err(io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32));
+    }
+    // SAFETY: NtCreateFile succeeded and returned this newly owned, valid file
+    // handle. File is now its unique closer, including unwinding/cancellation.
+    Ok(unsafe { File::from_raw_handle(handle.0) })
+}
+
+fn validate_child_name(name: &[u16]) -> io::Result<()> {
+    if name.is_empty()
+        || is_dot_entry(name)
+        || name.iter().any(|unit| matches!(*unit, 0 | WIDE_BACKSLASH | WIDE_SLASH | WIDE_COLON))
+    {
+        return Err(invalid_directory_record());
+    }
+    Ok(())
+}
+
+fn query_attribute_tag(file: &File) -> windows::core::Result<FILE_ATTRIBUTE_TAG_INFO> {
+    let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+    // SAFETY: File retains a valid handle and `info` is the correctly sized
+    // writable output for FileAttributeTagInfo. No pointer escapes this call.
+    let result = unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(file.as_raw_handle()),
+            FileAttributeTagInfo,
+            (&raw mut info).cast::<c_void>(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    };
+    match result {
+        Ok(()) => Ok(info),
+        Err(error) if information_class_can_fallback(win32_code(&error)) => {
+            let mut basic = FILE_BASIC_INFO::default();
+            // SAFETY: the same retained handle is queried into a correctly sized
+            // writable FileBasicInfo buffer. The missing reparse tag stays unknown;
+            // its reparse attribute still makes the policy fail closed.
+            unsafe {
+                GetFileInformationByHandleEx(
+                    HANDLE(file.as_raw_handle()),
+                    FileBasicInfo,
+                    (&raw mut basic).cast::<c_void>(),
+                    size_of::<FILE_BASIC_INFO>() as u32,
+                )?;
+            }
+            Ok(FILE_ATTRIBUTE_TAG_INFO { FileAttributes: basic.FileAttributes, ReparseTag: 0 })
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn query_standard_info(file: &File) -> windows::core::Result<FILE_STANDARD_INFO> {
@@ -772,32 +974,11 @@ fn file_identity(info: FILE_ID_INFO) -> FileIdentity {
     )
 }
 
-fn query_path_attributes(path: &ExtendedPath) -> io::Result<u32> {
-    let wide = path.as_wide_c_string();
-    // SAFETY: `wide` is a valid NUL-terminated UTF-16 path for the duration of
-    // the call. The API reads no caller-owned output buffer.
-    let attributes = unsafe { GetFileAttributesW(wide.as_pcwstr()) };
-    if attributes == INVALID_FILE_ATTRIBUTES {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(attributes)
-    }
-}
-
-fn find_name_units(data: &WIN32_FIND_DATAW) -> &[u16] {
-    let length = data.cFileName.iter().position(|&unit| unit == 0).unwrap_or(data.cFileName.len());
-    &data.cFileName[..length]
-}
-
 fn is_dot_entry(name: &[u16]) -> bool {
     name == [b'.' as u16] || name == [b'.' as u16, b'.' as u16]
 }
 
-const fn find_data_size(data: &WIN32_FIND_DATAW) -> u64 {
-    (data.nFileSizeHigh as u64) << 32 | data.nFileSizeLow as u64
-}
-
-fn large_fetch_can_fallback(code: i32) -> bool {
+fn information_class_can_fallback(code: i32) -> bool {
     matches!(
         code,
         ERROR_INVALID_FUNCTION_CODE | ERROR_NOT_SUPPORTED_CODE | ERROR_INVALID_PARAMETER_CODE
@@ -859,7 +1040,8 @@ mod tests {
     use std::{
         ffi::OsStr,
         fs,
-        os::windows::fs::{symlink_dir, symlink_file},
+        os::windows::fs::{OpenOptionsExt, symlink_dir, symlink_file},
+        path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
     };
 
@@ -887,6 +1069,77 @@ mod tests {
         }
     }
 
+    /// Exact test-owned junction, removed before its enclosing fixture. The
+    /// path is updated by tests that rename the junction itself.
+    struct Junction(PathBuf);
+
+    impl Drop for Junction {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir(&self.0);
+        }
+    }
+
+    fn create_junction(link: &Path, target: &Path) -> io::Result<Junction> {
+        use windows::Win32::{
+            Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT},
+            System::{IO::DeviceIoControl, Ioctl::FSCTL_SET_REPARSE_POINT},
+        };
+        #[repr(C)]
+        struct MountPointData {
+            tag: u32,
+            data_length: u16,
+            reserved: u16,
+            substitute_offset: u16,
+            substitute_length: u16,
+            print_offset: u16,
+            print_length: u16,
+            paths: [u16; 1_024],
+        }
+        let target = std::path::absolute(target)?;
+        let printable = target.as_os_str().encode_wide().collect::<Vec<_>>();
+        let substitute = ExtendedPath::from_path(&target).expect("fixture native path").nt_name();
+        let units = substitute.len() + printable.len() + 2;
+        assert!(units <= 1_024, "test junction path bound");
+        let mut data = MountPointData {
+            tag: IO_REPARSE_TAG_MOUNT_POINT_VALUE,
+            data_length: u16::try_from(8 + units * 2).expect("bounded fixture payload"),
+            reserved: 0,
+            substitute_offset: 0,
+            substitute_length: u16::try_from(substitute.len() * 2).expect("bounded target"),
+            print_offset: u16::try_from((substitute.len() + 1) * 2).expect("bounded target"),
+            print_length: u16::try_from(printable.len() * 2).expect("bounded target"),
+            paths: [0; 1_024],
+        };
+        data.paths[..substitute.len()].copy_from_slice(&substitute);
+        let print_start = substitute.len() + 1;
+        data.paths[print_start..print_start + printable.len()].copy_from_slice(&printable);
+        fs::create_dir(link)?;
+        let owned = Junction(link.to_path_buf());
+        let directory = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .open(link)?;
+        let mut returned = 0;
+        // SAFETY: only the directory just created by this fixture is modified.
+        // The repr(C) input has the mount-point reparse layout and a checked
+        // initialized length; its owned File stays live during this synchronous
+        // operation. Neither the input nor output pointers escape the call.
+        unsafe {
+            DeviceIoControl(
+                HANDLE(directory.as_raw_handle()),
+                FSCTL_SET_REPARSE_POINT,
+                Some((&raw const data).cast::<c_void>()),
+                8 + u32::from(data.data_length),
+                None,
+                0,
+                Some(&raw mut returned),
+                None,
+            )
+        }
+        .map_err(|error| io::Error::from_raw_os_error(win32_code(&error)))?;
+        Ok(owned)
+    }
+
     fn encode(value: &str) -> Vec<u16> {
         OsStr::new(value).encode_wide().collect()
     }
@@ -902,6 +1155,183 @@ mod tests {
             VisitControl::Continue
         })?;
         Ok(items)
+    }
+
+    #[test]
+    fn retained_directory_handle_supports_policy_and_enumeration_queries() {
+        let temp = TestDirectory::new("retained-handle");
+        fs::write(temp.path().join("one.bin"), b"one").expect("write own fixture");
+        let path = ExtendedPath::from_path(temp.path()).expect("native path");
+        let file = open_directory(&path).expect("open retained native directory");
+        let tag = query_attribute_tag(&file).expect("query retained directory attributes");
+        assert_eq!(tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0, FILE_ATTRIBUTE_DIRECTORY.0);
+        let mut cursor = DirectoryCursor::new();
+        let entries = cursor.read(&file).expect("read retained directory").expect("first batch");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, encode("one.bin"));
+        assert!(cursor.read(&file).expect("complete enumeration").is_none());
+    }
+
+    #[test]
+    fn full_directory_information_fallback_keeps_names_and_reparse_boundaries() {
+        let temp = TestDirectory::new("full-directory-class");
+        fs::write(temp.path().join("résumé-🚀.bin"), b"seven!!").expect("write fixture file");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).expect("create fixture directory");
+        let _junction = create_junction(&temp.path().join("link"), &outside).expect("junction");
+        let handle = open_directory(&ExtendedPath::from_path(temp.path()).unwrap()).unwrap();
+        let mut cursor = DirectoryCursor::new();
+        cursor.class = DirectoryClass::Full;
+        let entries = cursor.read(&handle).unwrap().unwrap();
+        let file = entries.iter().find(|entry| entry.name == encode("résumé-🚀.bin")).unwrap();
+        assert_eq!(file.logical_size, 7);
+        let link = entries.iter().find(|entry| entry.name == encode("link")).unwrap();
+        assert_eq!(link.reparse_tag, 0, "fallback cannot fabricate the missing tag");
+        let processed = WindowsFileSystem::new().process_entry(temp.path(), &handle, link).unwrap();
+        assert_eq!(processed.entry.kind, EntryKind::ReparsePoint(ReparseKind::Directory));
+        assert!(!processed.omissions.is_empty());
+    }
+
+    fn encoded_record(class: DirectoryClass, name: &[u16], attributes: u32) -> Vec<u8> {
+        let offset = match class {
+            DirectoryClass::Extended => offset_of!(FILE_ID_EXTD_DIR_INFO, FileName),
+            DirectoryClass::Full => offset_of!(FILE_FULL_DIR_INFO, FileName),
+        };
+        let mut bytes = vec![0; (offset + name.len() * 2).next_multiple_of(8)];
+        let name_length = offset_of!(FILE_FULL_DIR_INFO, FileNameLength);
+        bytes[name_length..name_length + 4].copy_from_slice(&(name.len() as u32 * 2).to_le_bytes());
+        let attribute_offset = offset_of!(FILE_FULL_DIR_INFO, FileAttributes);
+        bytes[attribute_offset..attribute_offset + 4].copy_from_slice(&attributes.to_le_bytes());
+        for (index, unit) in name.iter().enumerate() {
+            bytes[offset + index * 2..offset + index * 2 + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn directory_parser_preserves_native_names_and_rejects_malformed_buffers() {
+        for class in [DirectoryClass::Extended, DirectoryClass::Full] {
+            let raw_name = [0xd800, b'x' as u16];
+            let valid = encoded_record(class, &raw_name, 0);
+            assert_eq!(parse_directory_records(&valid, class).unwrap()[0].name, raw_name);
+            assert!(parse_directory_records(&[], class).is_err());
+            assert!(parse_directory_records(&valid[..8], class).is_err());
+            for next in [1_u32, 8, u32::MAX, valid.len() as u32] {
+                let mut malformed = valid.clone();
+                malformed[..4].copy_from_slice(&next.to_le_bytes());
+                assert!(parse_directory_records(&malformed, class).is_err());
+            }
+            for length in [0_u32, 1, u32::MAX] {
+                let mut malformed = valid.clone();
+                let offset = offset_of!(FILE_FULL_DIR_INFO, FileNameLength);
+                malformed[offset..offset + 4].copy_from_slice(&length.to_le_bytes());
+                assert!(parse_directory_records(&malformed, class).is_err());
+            }
+            for name in [encode("a\\b"), encode("a/b"), encode("a:b"), vec![0]] {
+                assert!(parse_directory_records(&encoded_record(class, &name, 0), class).is_err());
+            }
+            let mut negative = valid;
+            let offset = offset_of!(FILE_FULL_DIR_INFO, EndOfFile);
+            negative[offset..offset + 8].copy_from_slice(&(-1_i64).to_le_bytes());
+            assert!(parse_directory_records(&negative, class).is_err());
+            let attributes = offset_of!(FILE_FULL_DIR_INFO, FileAttributes);
+            negative[attributes..attributes + 4]
+                .copy_from_slice(&FILE_ATTRIBUTE_DIRECTORY.0.to_le_bytes());
+            assert_eq!(parse_directory_records(&negative, class).unwrap()[0].logical_size, 0);
+        }
+    }
+
+    #[test]
+    fn empty_directory_finishes_and_file_roots_are_rejected() {
+        let temp = TestDirectory::new("empty");
+        assert!(collect(temp.path()).unwrap().is_empty());
+        let file = temp.path().join("file.bin");
+        fs::write(&file, b"one").expect("write own fixture");
+        assert!(collect(&file).is_err());
+    }
+
+    #[test]
+    fn native_open_accepts_case_insensitive_dos_root_spelling() {
+        let temp = TestDirectory::new("root-case");
+        fs::write(temp.path().join("one.bin"), b"one").expect("write own fixture");
+        let mut units = temp.path().as_os_str().encode_wide().collect::<Vec<_>>();
+        let drive = ascii_upper(units[0]);
+        if !(u16::from(b'A')..=u16::from(b'Z')).contains(&drive) {
+            return;
+        }
+        units[0] = drive + u16::from(b'a' - b'A');
+        let lower_drive = PathBuf::from(OsString::from_wide(&units));
+        assert_eq!(entries(&collect(&lower_drive).unwrap()).len(), 1);
+    }
+
+    #[test]
+    fn retained_native_paths_support_long_directories_and_non_scalar_names() {
+        let temp = TestDirectory::new("long-native");
+        let initial =
+            prefix_extended_absolute(&temp.path().as_os_str().encode_wide().collect::<Vec<_>>())
+                .expect("extended fixture path");
+        let mut directory = PathBuf::from(OsString::from_wide(&initial));
+        for level in 0..12 {
+            directory.push(format!("level-{level:02}-{}", "資料".repeat(12)));
+            fs::create_dir(&directory).expect("create owned long-path component");
+        }
+        assert!(directory.as_os_str().encode_wide().count() > 260);
+        let native_name = OsString::from_wide(&[0xd800, b'x' as u16]);
+        fs::write(directory.join(&native_name), b"native").expect("write owned raw-UTF16 file");
+        let items = collect(&directory).expect("enumerate retained long directory");
+        let entries = entries(&items);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, native_name);
+        assert_eq!(entries[0].own_metrics.logical().known_bytes(), Some(6));
+        assert!(entries[0].file_identity.is_some());
+        assert!(omissions(&items).is_empty());
+    }
+
+    #[test]
+    fn cancellation_during_retained_batch_stops_before_the_next_entry() {
+        let temp = TestDirectory::new("cancel-batch");
+        for index in 0..8 {
+            fs::write(temp.path().join(format!("file-{index}.bin")), b"one").expect("own file");
+        }
+        let token = CancelToken::new();
+        let mut visited = 0;
+        let failure = WindowsFileSystem::with_cancel_token(token.clone())
+            .visit_directory(temp.path(), &mut |item| {
+                if matches!(item, DirectoryItem::Entry(_)) {
+                    visited += 1;
+                    token.cancel();
+                }
+                VisitControl::Continue
+            })
+            .expect_err("cancelled batch");
+        assert_eq!(visited, 1);
+        assert_eq!(failure.kind, FsErrorKind::Interrupted);
+        // All provider handles close on cancellation; an immediate fresh visit
+        // has its own cursor and can enumerate the complete untouched fixture.
+        assert_eq!(entries(&collect(temp.path()).unwrap()).len(), 8);
+    }
+
+    #[test]
+    fn disappearance_after_enumeration_reports_unknown_allocation_and_an_omission() {
+        let temp = TestDirectory::new("disappeared-record");
+        let disappearing = temp.path().join("gone.bin");
+        fs::write(&disappearing, b"old").expect("write disappearing fixture");
+        fs::write(temp.path().join("kept.bin"), b"kept").expect("write surviving fixture");
+        let handle = open_directory(&ExtendedPath::from_path(temp.path()).unwrap()).unwrap();
+        let records = DirectoryCursor::new().read(&handle).unwrap().unwrap();
+        fs::remove_file(&disappearing).expect("remove only the fixture file created above");
+        let gone = records.iter().find(|entry| entry.name == encode("gone.bin")).unwrap();
+        let processed = WindowsFileSystem::new().process_entry(temp.path(), &handle, gone).unwrap();
+        assert_eq!(processed.entry.own_metrics.logical().known_bytes(), Some(3));
+        assert_eq!(processed.entry.own_metrics.allocated().known_bytes(), None);
+        assert!(processed.entry.file_identity.is_none());
+        assert_eq!(processed.omissions.len(), 1);
+        assert_eq!(processed.omissions[0].kind, FsErrorKind::NotFound);
+        assert_eq!(processed.omissions[0].operation, FsOperation::ReadMetadata);
+        let kept = records.iter().find(|entry| entry.name == encode("kept.bin")).unwrap();
+        let processed = WindowsFileSystem::new().process_entry(temp.path(), &handle, kept).unwrap();
+        assert_eq!(processed.entry.own_metrics.logical().known_bytes(), Some(4));
+        assert!(processed.omissions.is_empty());
     }
 
     fn entries(items: &[DirectoryItem]) -> Vec<&FsEntry> {
@@ -1148,5 +1578,117 @@ mod tests {
             .expect_err("cancelled scan");
         assert!(!called);
         assert_eq!(error.kind, FsErrorKind::Interrupted);
+    }
+    fn assert_renamed_directory_cannot_redirect_metadata(replace_ancestor: bool) {
+        let temp = TestDirectory::new("retained-directory");
+        let parent = temp.path().join("parent");
+        let selected = parent.join("selected");
+        let outside_parent = temp.path().join("outside-own-fixture");
+        let outside = outside_parent.join("selected");
+        fs::create_dir_all(&selected).expect("create selected fixture");
+        fs::create_dir_all(&outside).expect("create outside fixture");
+        for name in ["a.bin", "b.bin", "c.bin"] {
+            fs::write(selected.join(name), b"old").expect("write original fixture file");
+            fs::write(outside.join(name), vec![0; 8_192]).expect("write outside sentinel");
+        }
+        let replace = if replace_ancestor { &parent } else { &selected };
+        let target = if replace_ancestor { &outside_parent } else { &outside };
+        let moved = temp.path().join("original-retained");
+        let mut junction = create_junction(&temp.path().join("prepared-junction"), target)
+            .expect("create junction");
+        let mut attempted = false;
+        let mut replaced = false;
+        let mut entries = Vec::new();
+        let mut omissions = Vec::new();
+        WindowsFileSystem::new()
+            .visit_directory(&selected, &mut |item| {
+                match item {
+                    DirectoryItem::Entry(entry) => {
+                        entries.push(entry);
+                        if !attempted {
+                            // This interleaving occurs after the directory was opened
+                            // but before the next child's metadata is requested. Every
+                            // renamed path and both targets belong to this fixture.
+                            attempted = true;
+                            match fs::rename(replace, &moved) {
+                                Ok(()) => {
+                                    fs::rename(&junction.0, replace)
+                                        .expect("install prepared fixture junction");
+                                    junction.0 = replace.clone();
+                                    replaced = true;
+                                }
+                                Err(error)
+                                    if replace_ancestor
+                                        && matches!(error.raw_os_error(), Some(5 | 32)) =>
+                                {
+                                    // Some Windows filesystems refuse renaming
+                                    // an ancestor while a descendant directory
+                                    // handle is open. This also prevents escape;
+                                    // continue asserting all original metadata.
+                                }
+                                Err(error) => panic!("rename own fixture directory: {error}"),
+                            }
+                        }
+                    }
+                    DirectoryItem::Omission(omission) => omissions.push(omission),
+                }
+                VisitControl::Continue
+            })
+            .expect("retained enumeration continues on the original directory");
+        assert!(attempted);
+        assert!(replaced || replace_ancestor, "the direct-directory swap must run");
+        assert_eq!(entries.len(), 3);
+        assert!(omissions.is_empty(), "relative metadata remains available: {omissions:?}");
+        for entry in entries {
+            assert_eq!(entry.own_metrics.logical().known_bytes(), Some(3));
+            assert!(entry.own_metrics.allocated().known_bytes().is_some());
+            assert!(
+                entry.file_identity.is_some(),
+                "metadata must come from the retained directory"
+            );
+        }
+        assert_eq!(fs::metadata(outside.join("b.bin")).expect("outside sentinel").len(), 8_192);
+        let original = if !replaced {
+            selected
+        } else if replace_ancestor {
+            moved.join("selected")
+        } else {
+            moved
+        };
+        assert_eq!(fs::metadata(original.join("b.bin")).expect("retained original").len(), 3);
+        // Junction drops first and removes only its owned reparse point; the fixture
+        // then removes the two directories it created, never following the junction.
+    }
+
+    #[test]
+    fn replacing_open_directory_with_junction_does_not_redirect_later_metadata() {
+        assert_renamed_directory_cannot_redirect_metadata(false);
+    }
+
+    #[test]
+    fn replacing_ancestor_with_junction_does_not_redirect_later_metadata() {
+        assert_renamed_directory_cannot_redirect_metadata(true);
+    }
+
+    #[test]
+    fn directory_below_a_junction_is_rejected_before_any_entry_is_emitted() {
+        let temp = TestDirectory::new("ancestor-junction");
+        let outside = temp.path().join("outside-own-fixture");
+        fs::create_dir_all(outside.join("selected")).expect("create outside fixture");
+        fs::write(outside.join("selected/sentinel.bin"), b"must not be scanned")
+            .expect("write outside sentinel");
+        let junction =
+            create_junction(&temp.path().join("link"), &outside).expect("create junction");
+        let mut visited = false;
+        let failure = WindowsFileSystem::new()
+            .visit_directory(&junction.0.join("selected"), &mut |_| {
+                visited = true;
+                VisitControl::Continue
+            })
+            .expect_err("an ancestor junction cannot become a scan root implicitly");
+        assert!(!visited);
+        assert_eq!(failure.operation, FsOperation::EnumerateDirectory);
+        assert_eq!(failure.kind, FsErrorKind::NotSupported);
+        assert!(outside.join("selected/sentinel.bin").is_file());
     }
 }

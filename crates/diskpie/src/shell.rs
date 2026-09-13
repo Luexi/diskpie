@@ -22,10 +22,13 @@ use eframe::egui::{
 };
 
 use diskpie_app::{
+    branch_rescan::BranchRescanIntent,
     diagnostics::{DiagnosticCode, DiagnosticEvent, DiagnosticField, ErrorClass, Outcome},
     format::{format_iec_bytes, format_path_for_display},
     i18n::{I18n, I18nError, Locale, MessageId},
-    navigation::{CommandAvailability, NavigationAction, UnavailableReason},
+    item_list_service::{ItemListKey, ItemListRequest, ItemListService},
+    navigation::{CommandAvailability, NavigationAction, NavigationCommand, UnavailableReason},
+    presentation::{ItemSort, SortDirection},
     runtime::{RuntimeConfig, RuntimeController, RuntimeError, RuntimeState},
     session::SessionProgress,
     settings::{
@@ -38,6 +41,17 @@ use diskpie_core::{
     sunburst::{LayoutOptions, SizeBasis},
 };
 use diskpie_scan::{CancelToken, ScanFs, ScanRoot};
+
+#[cfg(windows)]
+mod actions_ui;
+#[cfg(windows)]
+mod support_ui;
+#[cfg(windows)]
+pub(crate) use actions_ui::PendingAction;
+#[cfg(windows)]
+use actions_ui::{ActionUi, FileAction};
+#[cfg(windows)]
+use support_ui::SupportUi;
 
 use crate::{
     diagnostic_sink::DiagnosticSink,
@@ -62,8 +76,6 @@ use diskpie_platform::{
     DialogError, DialogErrorStage, DialogEvent, OwnerWindow, ShellEvent, ShellService, SubmitError,
 };
 
-/// Largest-children rows offered by the synchronized list.
-const LARGEST_CHILDREN_LIMIT: usize = 200;
 /// Shell events drained per frame.
 const SHELL_EVENT_BUDGET: usize = 4;
 /// Resolver results drained per frame.
@@ -128,6 +140,11 @@ pub struct UiServices {
     pub resolver: ResolverClient,
     pub diagnostics: DiagnosticSink,
     pub fonts: SystemFonts,
+    pub item_list: Option<ItemListService>,
+    #[cfg(windows)]
+    pub support: Option<crate::support_service::SupportClient>,
+    #[cfg(windows)]
+    pub diagnostic_counters: Option<crate::local_diagnostics::DiagnosticsCounterReader>,
 }
 
 /// Ownership handed back to the composition root after eframe drops the app.
@@ -139,6 +156,10 @@ pub struct ShellExit {
     /// the root can keep ticking the runtime during its bounded shutdown
     /// wait without the clock going backwards.
     pub clock_origin: Instant,
+    pub item_list: Option<ItemListService>,
+    pub retired_resources: VecDeque<Box<dyn Send>>,
+    #[cfg(windows)]
+    pub(crate) pending_action: Option<PendingAction>,
 }
 
 /// Single handoff from the dropped eframe application to the composition root.
@@ -160,10 +181,12 @@ impl ExitHandoff {
 struct DeferredLaunch {
     fs: Arc<dyn ScanFs>,
     roots: Vec<ScanRoot>,
+    requested_paths: Vec<PathBuf>,
     cancel: CancelToken,
     displays: Vec<String>,
     issues: Vec<String>,
     frames: u32,
+    initial_omissions: u64,
 }
 
 /// User-facing status line. Free text is display-only and never logged.
@@ -212,7 +235,7 @@ struct VolumeRow {
 /// revision or the subject changes rather than every frame.
 #[derive(Default)]
 struct DetailsCache {
-    key: Option<(u64, NodeId)>,
+    key: Option<(GenerationId, u64, NodeId)>,
     path: String,
 }
 
@@ -234,13 +257,23 @@ pub enum ShellCommand {
     Cancel,
     SetMetric(SizeBasis),
     Focus(Option<NodeId>),
+    ShowDetails(NodeId),
+    #[cfg(windows)]
+    FileAction(NodeId, FileAction),
+}
+
+/// A delayed UI intent retains the exact frame that supplied its node IDs.
+struct DeferredNavigation {
+    command: NavigationCommand,
+    revision: Option<u64>,
+    frames: u32,
 }
 
 /// Cached largest-children ranking for the committed frame.
 #[derive(Default)]
 struct ListCache {
-    key: Option<(u64, NodeId, SizeBasis)>,
-    rows: Vec<NodeId>,
+    key: Option<ItemListKey>,
+    rows: Arc<[NodeId]>,
 }
 
 pub struct DiskPieShell {
@@ -257,19 +290,46 @@ pub struct DiskPieShell {
     mesh_options: SunburstMeshOptions,
     picker: Option<NativeFolderPicker>,
     resolver: ResolverClient,
+    scan_job: Option<ResolveJobId>,
+    branch_job: Option<(ResolveJobId, BranchRescanIntent)>,
+    branch_running: bool,
+    retired_resources: VecDeque<Box<dyn Send>>,
+    item_list: Option<ItemListService>,
+    list_requested: Option<ItemListKey>,
+    item_query: String,
+    show_item_list: bool,
+    item_list_width_points: u16,
+    item_sort: ItemSort,
+    sort_direction: SortDirection,
+    details_open: bool,
+    hovered_item: Option<NodeId>,
+    #[cfg(windows)]
+    support: Option<crate::support_service::SupportClient>,
+    #[cfg(windows)]
+    diagnostic_counters: Option<crate::local_diagnostics::DiagnosticsCounterReader>,
+    #[cfg(windows)]
+    support_ui: SupportUi,
+    #[cfg(windows)]
+    actions: ActionUi,
     diagnostics: DiagnosticSink,
     flow: ScanFlow,
     volumes: Option<VolumeList>,
     volume_rows: Vec<VolumeRow>,
     volumes_job: Option<ResolveJobId>,
     deferred_launch: Option<DeferredLaunch>,
-    deferred_actions: VecDeque<(NavigationAction, u32)>,
+    deferred_actions: VecDeque<DeferredNavigation>,
     roots_display: Vec<String>,
+    /// Full selection of the displayed results, including unobserved roots.
+    /// Branch rescans inherit this scope; an unshown launch cannot replace it.
+    full_scan_paths: Vec<PathBuf>,
+    pending_full_scan_paths: Option<(GenerationId, Vec<PathBuf>)>,
     /// `roots_display` joined for the rails; rebuilt only when the roots change.
     location: Option<String>,
     resolve_issues: Vec<String>,
     focused: Option<NodeId>,
-    context_node: Option<NodeId>,
+    focused_list_row: Option<(egui::Id, NodeId)>,
+    context_node: Option<(GenerationId, u64, NodeId)>,
+    interaction_generation: Option<GenerationId>,
     notice: Notice,
     previous_session_panicked: bool,
     optional_services_unavailable: bool,
@@ -277,6 +337,7 @@ pub struct DiskPieShell {
     shutdown_requested: bool,
     list_cache: ListCache,
     details_cache: DetailsCache,
+    hover_cache: DetailsCache,
     item_count_cache: ItemCountCache,
     path_scratch: PathBuf,
     last_selected: Option<NodeId>,
@@ -318,7 +379,18 @@ impl DiskPieShell {
         exit: ExitHandoff,
     ) -> Result<Self, I18nError> {
         theme::install(ctx);
-        let UiServices { runtime, picker, resolver, diagnostics, fonts } = services;
+        let UiServices {
+            runtime,
+            picker,
+            resolver,
+            diagnostics,
+            fonts,
+            item_list,
+            #[cfg(windows)]
+            support,
+            #[cfg(windows)]
+            diagnostic_counters,
+        } = services;
         if !fonts.is_empty() {
             // The font bytes move into egui; nothing keeps a second copy.
             ctx.set_fonts(fonts.apply_to(egui::FontDefinitions::default()));
@@ -344,6 +416,8 @@ impl DiskPieShell {
             theme_preference,
             metric,
             show_both_sizes: settings.settings().show_both_sizes,
+            show_item_list: settings.settings().show_item_list,
+            item_list_width_points: settings.settings().item_list_width_points,
             settings,
             exit,
             runtime: Some(runtime),
@@ -351,6 +425,25 @@ impl DiskPieShell {
             mesh_options: SunburstMeshOptions::default(),
             picker,
             resolver,
+            scan_job: None,
+            branch_job: None,
+            branch_running: false,
+            retired_resources: VecDeque::new(),
+            item_list,
+            list_requested: None,
+            item_query: String::new(),
+            item_sort: ItemSort::Size,
+            sort_direction: SortDirection::Descending,
+            details_open: false,
+            hovered_item: None,
+            #[cfg(windows)]
+            support,
+            #[cfg(windows)]
+            diagnostic_counters,
+            #[cfg(windows)]
+            support_ui: SupportUi::default(),
+            #[cfg(windows)]
+            actions: ActionUi::default(),
             diagnostics,
             flow: ScanFlow::new(),
             volumes: None,
@@ -359,10 +452,14 @@ impl DiskPieShell {
             deferred_launch: None,
             deferred_actions: VecDeque::new(),
             roots_display: Vec::new(),
+            full_scan_paths: Vec::new(),
+            pending_full_scan_paths: None,
             location: None,
             resolve_issues: Vec::new(),
             focused: None,
+            focused_list_row: None,
             context_node: None,
+            interaction_generation: None,
             notice,
             previous_session_panicked,
             optional_services_unavailable,
@@ -370,6 +467,7 @@ impl DiskPieShell {
             shutdown_requested: false,
             list_cache: ListCache::default(),
             details_cache: DetailsCache::default(),
+            hover_cache: DetailsCache::default(),
             item_count_cache: ItemCountCache::default(),
             path_scratch: PathBuf::new(),
             last_selected: None,
@@ -394,12 +492,32 @@ impl DiskPieShell {
     /// Per-frame bounded logic: poll services and the runtime, never wait.
     pub fn logic(&mut self, ctx: &egui::Context) {
         self.drain_shell_events();
+        #[cfg(windows)]
+        self.drain_support_results();
         self.drain_resolver_results();
+        while let Some(resource) = self.retired_resources.pop_front() {
+            if let Err(resource) = self.resolver.retire(resource) {
+                self.retired_resources.push_front(resource);
+                break;
+            }
+        }
         self.retry_deferred_launch();
         self.tick_runtime();
+        self.promote_visible_scan_scope();
         self.retry_deferred_action();
         self.sync_size_basis();
         self.observe_runtime();
+        #[cfg(windows)]
+        {
+            self.drive_reconciliation();
+            if self.support.as_ref().is_some_and(|support| support.outstanding() != 0)
+                || self.destructive_busy()
+                || self.support_ui.needs_repaint()
+                || self.actions.needs_repaint()
+            {
+                ctx.request_repaint_after(BACKGROUND_POLL_INTERVAL);
+            }
+        }
 
         let runtime_needs_repaint =
             self.runtime.as_ref().is_some_and(RuntimeController::needs_repaint);
@@ -431,6 +549,13 @@ impl DiskPieShell {
             picker.request_shutdown();
         }
         self.resolver.request_stop();
+        if let Some(list) = self.item_list.as_ref() {
+            list.request_shutdown();
+        }
+        #[cfg(windows)]
+        if let Some(support) = self.support.as_ref() {
+            support.request_stop();
+        }
     }
 
     fn drain_shell_events(&mut self) {
@@ -440,13 +565,17 @@ impl DiskPieShell {
                 break;
             };
             match picker.try_recv() {
-                Ok(Some(ShellEvent::Dialog(event))) => {
-                    self.handle_picker_event(picker_event(event));
+                Ok(Some(event)) => {
+                    if let Some(event) = self.handle_action_shell(event) {
+                        match event {
+                            ShellEvent::Dialog(event) => {
+                                self.handle_picker_event(picker_event(event))
+                            }
+                            ShellEvent::SaveExport(event) => self.handle_export_dialog(event),
+                            _ => {}
+                        }
+                    }
                 }
-                // The shell submits only folder-dialog requests today; the
-                // action outcomes exist for the destructive-action binding
-                // that is not connected to this shell yet.
-                Ok(Some(_action_outcome)) => {}
                 Ok(None) => break,
                 Err(_stopped) => {
                     self.handle_picker_stopped();
@@ -460,6 +589,11 @@ impl DiskPieShell {
     /// the session and an open dialog can never report back.
     fn handle_picker_stopped(&mut self) {
         self.picker = None;
+        #[cfg(windows)]
+        {
+            self.action_service_stopped();
+            self.export_service_stopped();
+        }
         if let Some(request_id) = self.flow.dialog_outstanding() {
             self.handle_picker_event(PickerEvent::Failed {
                 request_id,
@@ -530,6 +664,41 @@ impl DiskPieShell {
             }
             return;
         }
+        if self.branch_job.as_ref().is_some_and(|(job, _)| *job == id) {
+            let (_, intent) = self.branch_job.take().expect("matching branch request");
+            self.flow.resolve_finished(Ok(()));
+            match outcome {
+                ResolveOutcome::Launch(mut launch) if launch.roots.len() == 1 => {
+                    if let Some(runtime) = self.runtime.as_mut() {
+                        let root = launch.roots.remove(0);
+                        match runtime.request_branch_scan(intent, launch.fs, root, launch.cancel) {
+                            Ok(_) => {
+                                self.branch_running = true;
+                                self.flow.launch_attempted(LaunchOutcome::Accepted);
+                                self.notice = Notice::Message(MessageId::Scanning);
+                            }
+                            Err(rejected) => {
+                                self.retired_resources.push_back(Box::new(rejected));
+                                self.notice = Notice::Message(MessageId::ResultsRetained);
+                            }
+                        }
+                    }
+                }
+                ResolveOutcome::Failed(failure) => {
+                    self.retired_resources.push_back(Box::new(intent));
+                    self.notice = Notice::Text(failure.detail);
+                }
+                _ => {
+                    self.retired_resources.push_back(Box::new(intent));
+                    self.notice = Notice::Message(MessageId::ResultsRetained);
+                }
+            }
+            return;
+        }
+        if self.scan_job != Some(id) {
+            return;
+        }
+        self.scan_job = None;
         match outcome {
             ResolveOutcome::Launch(launch) => {
                 self.flow.resolve_finished(Ok(()));
@@ -591,25 +760,49 @@ impl DiskPieShell {
     }
 
     fn launch(&mut self, launch: ResolvedLaunch) {
-        let ResolvedLaunch { fs, roots, cancel, displays, issues } = launch;
-        self.try_launch(DeferredLaunch { fs, roots, cancel, displays, issues, frames: 0 });
+        let ResolvedLaunch { fs, roots, requested_paths, cancel, displays, mut issues, failures } =
+            launch;
+        let initial_omissions = failures.len() as u64;
+        issues.extend(failures.into_iter().map(|failure| failure.detail));
+        self.try_launch(DeferredLaunch {
+            fs,
+            roots,
+            requested_paths,
+            cancel,
+            displays,
+            issues,
+            frames: 0,
+            initial_omissions,
+        });
     }
 
     /// Hands a resolved launch to the runtime. A rejection returns the exact
     /// provider, roots, and cancel token, which are retained for a retry on a
     /// later frame while retirement backpressure lasts.
     fn try_launch(&mut self, launch: DeferredLaunch) {
-        let DeferredLaunch { fs, roots, cancel, displays, issues, frames } = launch;
+        let DeferredLaunch {
+            fs,
+            roots,
+            requested_paths,
+            cancel,
+            displays,
+            issues,
+            frames,
+            initial_omissions,
+        } = launch;
         let Some(runtime) = self.runtime.as_mut() else {
             self.flow.launch_attempted(LaunchOutcome::Rejected(FailureClass::Other));
             return;
         };
         let root_count = u64::try_from(roots.len()).unwrap_or(u64::MAX);
-        match runtime.request_scan(fs, roots, cancel) {
+        match runtime.request_scan_with_omissions(fs, roots, cancel, initial_omissions) {
             Ok(receipt) => {
+                #[cfg(windows)]
+                self.action_full_scan_accepted(receipt.generation);
                 self.flow.launch_attempted(LaunchOutcome::Accepted);
                 self.location = (!displays.is_empty()).then(|| displays.join(LOCATION_SEPARATOR));
                 self.roots_display = displays;
+                self.pending_full_scan_paths = Some((receipt.generation.into(), requested_paths));
                 self.resolve_issues = issues;
                 self.focused = None;
                 self.notice = Notice::Message(MessageId::Scanning);
@@ -628,10 +821,12 @@ impl DiskPieShell {
                         self.deferred_launch = Some(DeferredLaunch {
                             fs,
                             roots,
+                            requested_paths,
                             cancel,
                             displays,
                             issues,
                             frames: frames.saturating_add(1),
+                            initial_omissions,
                         });
                     }
                     LaunchOutcome::Rejected(class) => {
@@ -653,6 +848,19 @@ impl DiskPieShell {
         }
     }
 
+    fn promote_visible_scan_scope(&mut self) {
+        if self.pending_full_scan_paths.as_ref().is_some_and(|(generation, _)| {
+            self.runtime
+                .as_ref()
+                .and_then(RuntimeController::snapshot)
+                .is_some_and(|snapshot| snapshot.generation() == *generation)
+        }) {
+            let (_, paths) =
+                self.pending_full_scan_paths.take().expect("matching displayed generation");
+            self.full_scan_paths = paths;
+        }
+    }
+
     fn tick_runtime(&mut self) {
         let elapsed = self.started.elapsed();
         let Some(runtime) = self.runtime.as_mut() else {
@@ -667,6 +875,7 @@ impl DiskPieShell {
                     self.diagnostics.emit(event);
                 }
                 if let Some(generation) = report.scan_finished {
+                    let was_branch = std::mem::take(&mut self.branch_running);
                     let summary = runtime
                         .settled_summary()
                         .filter(|summary| summary.generation == generation);
@@ -689,7 +898,19 @@ impl DiskPieShell {
                             }
                             _ => (DiagnosticCode::ScanCompleted, None, MessageId::Complete),
                         };
-                        self.notice = Notice::Message(notice);
+                        self.notice = Notice::Message(
+                            if was_branch
+                                && matches!(
+                                    summary.phase,
+                                    diskpie_app::session::SessionPhase::Cancelled
+                                        | diskpie_app::session::SessionPhase::Failed(_)
+                                )
+                            {
+                                MessageId::ResultsRetained
+                            } else {
+                                notice
+                            },
+                        );
                         let mut event = DiagnosticEvent::new(code);
                         let _generation =
                             event.push_field(DiagnosticField::GenerationId(generation.get()));
@@ -750,9 +971,11 @@ impl DiskPieShell {
             | RuntimeState::ShuttingDown { .. }
             | RuntimeState::ShutdownComplete => None,
         };
-        let has_results = runtime
-            .snapshot()
-            .is_some_and(|snapshot| Some(snapshot.generation()) == current_generation);
+        let has_results = runtime.snapshot().is_some_and(|snapshot| {
+            Some(snapshot.generation()) == current_generation
+                || self.branch_running
+                || matches!(state, RuntimeState::Settled { .. })
+        });
         self.flow.observe_runtime(RuntimeObservation::from_state(&state), has_results);
 
         let selected = runtime.navigation().and_then(|navigation| navigation.selected());
@@ -774,7 +997,8 @@ impl DiskPieShell {
 
     fn request_scan_paths(&mut self, paths: Vec<PathBuf>) {
         match self.resolver.submit(ResolveJob::Paths(paths)) {
-            Ok(_id) => {
+            Ok(id) => {
+                self.scan_job = Some(id);
                 self.flow.resolve_started();
                 self.notice = Notice::Message(MessageId::Resolving);
             }
@@ -844,9 +1068,10 @@ impl DiskPieShell {
             self.notice = Notice::Message(reason_message(reason));
             return;
         }
+        let revision = runtime.displayed_revision();
         match runtime.execute_navigation(command) {
             Ok(report) => self.consume_navigation_report(&report),
-            Err(RuntimeError::FrameTransitionPending) => self.defer_action(action),
+            Err(RuntimeError::FrameTransitionPending) => self.defer_action(command, revision),
             Err(RuntimeError::Navigation(error)) => {
                 if let diskpie_app::navigation::NavigationError::CommandUnavailable {
                     reason, ..
@@ -866,11 +1091,17 @@ impl DiskPieShell {
     /// Launches the full-root rescan a report asks for, if any.
     fn consume_navigation_report(&mut self, report: &diskpie_app::runtime::NavigationReport) {
         if let Some(request) = report.rescan_request() {
-            let paths = request
-                .full_roots()
-                .iter()
-                .map(|target| target.path().to_path_buf())
-                .collect::<Vec<_>>();
+            if let diskpie_app::navigation::RescanRequest::Branch(target) = request {
+                self.request_branch(target.node());
+                return;
+            }
+            // A snapshot contains only resolved roots. Preserve the full native
+            // selection when retrying; failure details are never action paths.
+            let paths = if self.full_scan_paths.is_empty() {
+                request.full_roots().iter().map(|target| target.path().to_path_buf()).collect()
+            } else {
+                self.full_scan_paths.clone()
+            };
             if paths.is_empty() {
                 // Branch rescans have no engine path yet; availability
                 // already reports it, this is defensive.
@@ -881,36 +1112,65 @@ impl DiskPieShell {
         }
     }
 
+    fn request_branch(&mut self, node: NodeId) {
+        if self.branch_job.is_some() {
+            self.notice = Notice::Message(MessageId::CommandBusy);
+            return;
+        }
+        let Some(runtime) = self.runtime.as_ref() else {
+            return;
+        };
+        let Ok(intent) = runtime.branch_rescan_intent(node) else {
+            self.notice = Notice::Message(MessageId::ActionWaitForScan);
+            return;
+        };
+        let Ok(path) = intent.native_path() else {
+            self.notice = Notice::Message(MessageId::ResultsRetained);
+            return;
+        };
+        match self.resolver.submit(ResolveJob::Paths(vec![path])) {
+            Ok(id) => {
+                self.branch_job = Some((id, intent));
+                self.flow.resolve_started();
+                self.notice = Notice::Message(MessageId::Resolving);
+            }
+            Err(_) => self.notice = Notice::Message(MessageId::ResolverBusy),
+        }
+    }
+
     /// Queues an action refused with `FrameTransitionPending`. The queue keeps
     /// order and is bounded; an action beyond the bound is refused visibly
     /// instead of silently replacing an earlier one.
-    fn defer_action(&mut self, action: NavigationAction) {
+    fn defer_action(&mut self, command: NavigationCommand, revision: Option<u64>) {
         if self.deferred_actions.len() >= MAX_DEFERRED_ACTIONS {
             self.notice = Notice::Message(MessageId::CommandBusy);
             return;
         }
-        self.deferred_actions.push_back((action, 0));
+        self.deferred_actions.push_back(DeferredNavigation { command, revision, frames: 0 });
     }
 
     /// Retries the oldest deferred action once per frame; later ones wait so
     /// the user's order is preserved.
     fn retry_deferred_action(&mut self) {
-        let Some((action, frames)) = self.deferred_actions.pop_front() else {
+        let Some(mut pending) = self.deferred_actions.pop_front() else {
             return;
         };
-        if frames >= MAX_DEFERRED_ACTION_FRAMES {
+        if pending.frames >= MAX_DEFERRED_ACTION_FRAMES {
             return;
         }
         let Some(runtime) = self.runtime.as_mut() else {
             return;
         };
-        let Ok(command) = runtime.navigation_command(action) else {
+        if runtime.snapshot().map(TreeSnapshot::generation) != Some(pending.command.generation())
+            || runtime.displayed_revision() != pending.revision
+        {
             return;
-        };
-        match runtime.execute_navigation(command) {
+        }
+        match runtime.execute_navigation(pending.command) {
             Ok(report) => self.consume_navigation_report(&report),
             Err(RuntimeError::FrameTransitionPending) => {
-                self.deferred_actions.push_front((action, frames.saturating_add(1)));
+                pending.frames = pending.frames.saturating_add(1);
+                self.deferred_actions.push_front(pending);
             }
             Err(_error) => runtime.clear_error(),
         }
@@ -918,6 +1178,24 @@ impl DiskPieShell {
 
     /// Executes commands emitted by the widgets this frame.
     pub fn dispatch(&mut self, command: ShellCommand) {
+        let starts_scan = matches!(
+            &command,
+            ShellCommand::ChooseFolder
+                | ShellCommand::ScanPaths(_)
+                | ShellCommand::ScanAllVolumes
+                | ShellCommand::Navigate(
+                    NavigationAction::RescanAll | NavigationAction::RescanBranch(_)
+                )
+        );
+        #[cfg(windows)]
+        if starts_scan && self.destructive_busy() {
+            self.notice = Notice::Message(MessageId::ActionWorking);
+            return;
+        }
+        if starts_scan && !self.retired_resources.is_empty() {
+            self.notice = Notice::Message(MessageId::CommandBusy);
+            return;
+        }
         match command {
             ShellCommand::Navigate(action) => self.navigate(action),
             ShellCommand::ChooseFolder => self.choose_folder(),
@@ -945,6 +1223,13 @@ impl DiskPieShell {
                 self.navigate(NavigationAction::SetSizeBasis(basis));
             }
             ShellCommand::Focus(node) => self.focused = node,
+            ShellCommand::ShowDetails(node) => {
+                self.navigate(NavigationAction::Select(node));
+                self.show_item_list = true;
+                self.details_open = true;
+            }
+            #[cfg(windows)]
+            ShellCommand::FileAction(node, action) => self.start_file_action(node, action),
         }
     }
 
@@ -972,6 +1257,22 @@ impl DiskPieShell {
     /// Refreshes the per-frame formatted values that depend only on the
     /// committed frame, so rendering allocates nothing when nothing changed.
     fn refresh_frame_caches(&mut self) {
+        let generation = self
+            .runtime
+            .as_ref()
+            .and_then(RuntimeController::snapshot)
+            .map(TreeSnapshot::generation);
+        if generation != self.interaction_generation {
+            self.interaction_generation = generation;
+            self.focused = self
+                .runtime
+                .as_ref()
+                .and_then(RuntimeController::navigation)
+                .and_then(|navigation| navigation.selected());
+            self.hovered_item = None;
+            self.focused_list_row = None;
+            self.context_node = None;
+        }
         let entries = self
             .runtime
             .as_ref()
@@ -999,7 +1300,7 @@ impl DiskPieShell {
             return;
         };
         let subject = navigation.selected().unwrap_or_else(|| navigation.view_root());
-        let key = (revision, subject);
+        let key = (snapshot.generation(), revision, subject);
         if self.details_cache.key == Some(key) {
             return;
         }
@@ -1018,6 +1319,9 @@ impl DiskPieShell {
         updated.locale = setting_from_locale(self.locale);
         updated.theme = setting_from_theme(self.theme_preference);
         updated.size_preference = setting_from_basis(self.metric);
+        updated.show_item_list = self.show_item_list;
+        updated.item_list_width_points = self.item_list_width_points;
+        updated.show_both_sizes = self.show_both_sizes;
         if updated != *self.settings.settings() {
             self.settings.replace(updated);
         }
@@ -1028,7 +1332,10 @@ impl DiskPieShell {
     }
 
     fn phase_message(&self) -> MessageId {
-        phase_message(self.flow.state())
+        committed_phase_message(
+            self.flow.state(),
+            self.view_root_record().map(|record| record.aggregate().state()),
+        )
     }
 
     fn notice_text(&self) -> &str {
@@ -1074,256 +1381,241 @@ impl DiskPieShell {
     fn command_rail(&mut self, ui: &mut egui::Ui) {
         let mut commands = Vec::new();
         let state = self.flow.state();
-        let back = self.availability(NavigationAction::Back);
-        let parent = self.availability(NavigationAction::Parent);
-        let rescan = self.availability(NavigationAction::RescanAll);
-        let summary = self.availability(NavigationAction::ShowSummary);
-        let is_summary_view = self
-            .runtime
-            .as_ref()
-            .and_then(RuntimeController::navigation)
-            .is_some_and(diskpie_app::navigation::NavigationState::is_summary_view);
-        let picker_available = self.picker.is_some();
-        let location = self.location.as_deref();
-        let strings = &self.strings;
-        let mut selected_locale = self.locale;
-        let theme_preference = &mut self.theme_preference;
-
-        egui::Panel::top("command-rail").exact_size(52.0).show_separator_line(true).show(
-            ui,
-            |ui| {
-                ui.horizontal(|ui| {
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(strings.get(MessageId::AppName))
-                            .strong()
-                            .size(18.0)
-                            .color(theme::SCAN_CURRENT),
-                    );
-                    ui.separator();
-                    if command_button(ui, strings, MessageId::Back, back, "Backspace · Alt+←") {
-                        commands.push(ShellCommand::Navigate(NavigationAction::Back));
+        egui::Panel::top("command-rail").exact_size(40.0).show(ui, |ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+            ui.horizontal_centered(|ui| {
+                ui.label(RichText::new(self.strings.get(MessageId::AppName)).strong());
+                ui.separator();
+                for (action, label, icon, shortcut) in [
+                    (NavigationAction::Back, MessageId::Back, "←", "Alt+←"),
+                    (NavigationAction::Parent, MessageId::Parent, "↑", "Alt+↑"),
+                ] {
+                    if navigation_icon(
+                        ui,
+                        &self.strings,
+                        label,
+                        icon,
+                        self.availability(action),
+                        shortcut,
+                    ) {
+                        commands.push(ShellCommand::Navigate(action));
                     }
-                    if command_button(ui, strings, MessageId::Parent, parent, "Alt+↑") {
-                        commands.push(ShellCommand::Navigate(NavigationAction::Parent));
-                    }
-                    let choose = ui
+                }
+                ui.menu_button(self.strings.get(MessageId::NewScan), |ui| {
+                    if ui
                         .add_enabled(
-                            picker_available && state != ScanUi::Choosing,
-                            egui::Button::new(strings.get(MessageId::ChooseFolder)),
+                            self.picker.is_some(),
+                            egui::Button::new(self.strings.get(MessageId::ChooseFolder)),
                         )
-                        .on_hover_text("Ctrl+O")
-                        .on_disabled_hover_text(if picker_available {
-                            strings.get(MessageId::Choosing)
-                        } else {
-                            strings.get(MessageId::FolderPickerUnavailable)
-                        });
-                    if choose.clicked() {
+                        .clicked()
+                    {
                         commands.push(ShellCommand::ChooseFolder);
+                        ui.close();
                     }
-                    if command_button(ui, strings, MessageId::Rescan, rescan, "F5") {
-                        commands.push(ShellCommand::Navigate(NavigationAction::RescanAll));
+                    ui.separator();
+                    self.volume_list(ui, &mut commands, state);
+                });
+                let metric_label = self
+                    .strings
+                    .get(match self.metric {
+                        SizeBasis::Logical => MessageId::LogicalSize,
+                        SizeBasis::Allocated => MessageId::AllocatedData,
+                    })
+                    .to_owned();
+                let narrow = ui.ctx().content_rect().width() < 800.0;
+                let list_label = match (narrow, self.show_item_list) {
+                    (true, true) => MessageId::ShowMap,
+                    (false, true) => MessageId::HideItemList,
+                    (_, false) => MessageId::ShowItemList,
+                };
+                let scan_width = if state.can_cancel() {
+                    toolbar_label_width(ui, self.strings.get(MessageId::Cancel), false)
+                } else {
+                    toolbar_label_width(ui, "⟳", false).max(28.0)
+                };
+                let trailing = scan_width
+                    + toolbar_label_width(ui, &metric_label, true)
+                    + toolbar_label_width(ui, self.strings.get(list_label), false)
+                    + if cfg!(windows) {
+                        toolbar_label_width(ui, self.strings.get(MessageId::Tools), true)
+                    } else {
+                        0.0
                     }
-                    let cancel = ui
-                        .add_enabled(
-                            state.can_cancel(),
-                            egui::Button::new(strings.get(MessageId::Cancel)),
-                        )
-                        .on_hover_text("Esc");
-                    if cancel.clicked() {
+                    + 16.0;
+                let width = (ui.available_width() - trailing).max(24.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(width, 30.0),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        self.breadcrumbs(ui, &mut commands);
+                    },
+                );
+                if state.can_cancel() {
+                    if ui.button(self.strings.get(MessageId::Cancel)).on_hover_text("Esc").clicked()
+                    {
                         commands.push(ShellCommand::Cancel);
                     }
-                    if (summary.is_available() || is_summary_view)
-                        && command_button(ui, strings, MessageId::ShowSummary, summary, "")
-                    {
-                        commands.push(ShellCommand::Navigate(NavigationAction::ShowSummary));
-                    }
-                    // The trailing preference cluster is laid out left to right
-                    // inside a right-aligned region so keyboard focus travels in
-                    // reading order instead of mirroring the visual order.
-                    let show_labels = ui.available_width() > 820.0;
-                    let theme_label = strings.get(MessageId::Theme);
-                    let language_label = strings.get(MessageId::Language);
-                    let spacing = ui.spacing().item_spacing.x;
-                    let label_width = |ui: &egui::Ui, text: &str| {
-                        if show_labels {
-                            ui.painter()
-                                .layout_no_wrap(
-                                    text.to_owned(),
-                                    egui::TextStyle::Body.resolve(ui.style()),
-                                    ui.visuals().text_color(),
-                                )
-                                .size()
-                                .x
-                                + spacing
-                        } else {
-                            0.0
+                } else if navigation_icon(
+                    ui,
+                    &self.strings,
+                    MessageId::Rescan,
+                    "⟳",
+                    self.availability(NavigationAction::RescanAll),
+                    "F5",
+                ) {
+                    commands.push(ShellCommand::Navigate(NavigationAction::RescanAll));
+                }
+                ui.menu_button(metric_label, |ui| {
+                    for (basis, label) in [
+                        (SizeBasis::Logical, MessageId::LogicalSize),
+                        (SizeBasis::Allocated, MessageId::AllocatedData),
+                    ] {
+                        if ui
+                            .selectable_label(self.metric == basis, self.strings.get(label))
+                            .clicked()
+                        {
+                            commands.push(ShellCommand::SetMetric(basis));
+                            ui.close();
                         }
-                    };
-                    let cluster_width = 2.0 * (PREFERENCE_COMBO_WIDTH + spacing)
-                        + label_width(ui, theme_label)
-                        + label_width(ui, language_label);
-
-                    // The scan-root display is truncated so a long path can
-                    // never push the preference cluster out of the rail.
-                    let location_width = ui.available_width() - cluster_width - 16.0;
-                    if location_width > 120.0 {
-                        ui.scope(|ui| {
-                            ui.set_max_width(location_width);
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(
-                                        location
-                                            .unwrap_or_else(|| strings.get(MessageId::NoLocation)),
-                                    )
-                                    .weak()
-                                    .monospace(),
-                                )
-                                .truncate(),
-                            );
-                        });
                     }
-                    ui.add_space((ui.available_width() - cluster_width - 8.0).max(0.0));
-
-                    let theme_combo = egui::ComboBox::from_id_salt("theme-preference")
-                        .width(PREFERENCE_COMBO_WIDTH)
-                        .selected_text(theme_name(*theme_preference, strings))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                theme_preference,
-                                ThemePreference::System,
-                                strings.get(MessageId::ThemeSystem),
-                            );
-                            ui.selectable_value(
-                                theme_preference,
-                                ThemePreference::Dark,
-                                strings.get(MessageId::ThemeDark),
-                            );
-                            ui.selectable_value(
-                                theme_preference,
-                                ThemePreference::Light,
-                                strings.get(MessageId::ThemeLight),
-                            );
-                        });
-                    label_combo(ui, theme_combo.response, theme_label, show_labels);
-
-                    let language_combo = egui::ComboBox::from_id_salt("language")
-                        .width(PREFERENCE_COMBO_WIDTH)
-                        .selected_text(selected_locale.native_name())
-                        .show_ui(ui, |ui| {
-                            for locale in Locale::ALL {
-                                ui.selectable_value(
-                                    &mut selected_locale,
-                                    locale,
-                                    locale.native_name(),
-                                );
-                            }
-                        });
-                    label_combo(ui, language_combo.response, language_label, show_labels);
+                    ui.checkbox(
+                        &mut self.show_both_sizes,
+                        self.strings.get(MessageId::ShowBothSizes),
+                    );
+                    ui.separator();
+                    #[cfg(not(windows))]
+                    self.appearance_controls(ui);
+                    ui.separator();
+                    self.telemetry_details(ui);
+                    let summary = self.availability(NavigationAction::ShowSummary);
+                    if command_button(ui, &self.strings, MessageId::ShowSummary, summary, "") {
+                        commands.push(ShellCommand::Navigate(NavigationAction::ShowSummary));
+                        ui.close();
+                    }
                 });
-            },
-        );
-
-        ui.ctx().set_theme(*theme_preference);
-        self.select_locale(selected_locale);
+                if ui
+                    .add(
+                        egui::Button::new(self.strings.get(list_label))
+                            .selected(self.show_item_list),
+                    )
+                    .clicked()
+                {
+                    self.show_item_list = !self.show_item_list;
+                }
+                #[cfg(windows)]
+                self.tools_menu(ui);
+            });
+        });
         for command in commands {
             self.dispatch(command);
         }
     }
 
-    fn telemetry_rail(&mut self, ui: &mut egui::Ui) {
-        let mut commands = Vec::new();
-        let state = self.flow.state();
-        let phase = self.strings.get(self.phase_message());
-        let phase_color = phase_color(state, ui.visuals().dark_mode);
-        let progress = self.runtime.as_ref().and_then(RuntimeController::progress);
-        let counters = progress.map(SessionProgress::effective).unwrap_or_default();
-        let selected_bytes = self
-            .selected_node_record()
-            .map(|record| format_iec_bytes(node_known_bytes(record, self.metric), self.locale));
-        let unknown = self.view_root_record().map_or(0, |record| match self.metric {
-            SizeBasis::Logical => record.aggregate().logical().unknown_entries(),
-            SizeBasis::Allocated => record.aggregate().allocated().unknown_entries(),
+    fn appearance_controls(&mut self, ui: &mut egui::Ui) {
+        let mut locale = self.locale;
+        ui.label(self.strings.get(MessageId::Theme));
+        ui.horizontal(|ui| {
+            for (theme, label) in [
+                (ThemePreference::System, MessageId::ThemeSystem),
+                (ThemePreference::Light, MessageId::ThemeLight),
+                (ThemePreference::Dark, MessageId::ThemeDark),
+            ] {
+                ui.selectable_value(&mut self.theme_preference, theme, self.strings.get(label));
+            }
         });
+        ui.label(self.strings.get(MessageId::Language));
+        ui.horizontal(|ui| {
+            for candidate in Locale::ALL {
+                ui.selectable_value(&mut locale, candidate, candidate.native_name());
+            }
+        });
+        ui.ctx().set_theme(self.theme_preference);
+        self.select_locale(locale);
+    }
+
+    fn breadcrumbs(&self, ui: &mut egui::Ui, commands: &mut Vec<ShellCommand>) {
+        let Some(runtime) = &self.runtime else {
+            return;
+        };
+        let (Some(snapshot), Some(navigation)) = (runtime.snapshot(), runtime.navigation()) else {
+            ui.add(egui::Label::new(self.strings.get(MessageId::NoLocation)).truncate());
+            return;
+        };
+        let root = navigation.view_root();
+        // Keep frame work bounded even for a path with millions of ancestors.
+        let mut nodes = Vec::with_capacity(8);
+        let mut cursor = Some(root);
+        while let Some(node) = cursor.filter(|_| nodes.len() < 8) {
+            let Some(record) = snapshot.node(node) else {
+                break;
+            };
+            nodes.push((node, compact_node_name(record, &self.strings)));
+            cursor = record.parent();
+        }
+        nodes.reverse();
+        let visible = if ui.available_width() >= 360.0 { 3 } else { 1 };
+        let hidden = nodes.len().saturating_sub(visible);
+        if hidden > 0 || cursor.is_some() {
+            ui.menu_button("…", |ui| {
+                ui.label(self.strings.get(MessageId::AncestorFolders));
+                for (node, name) in nodes.iter().take(hidden) {
+                    if ui.button(name).clicked() {
+                        commands.push(ShellCommand::Navigate(NavigationAction::Activate(*node)));
+                        ui.close();
+                    }
+                }
+            });
+        }
+        for (index, (node, name)) in nodes.iter().skip(hidden).enumerate() {
+            if index > 0 || hidden > 0 {
+                ui.label(RichText::new("›").weak());
+            }
+            let remaining = (nodes.len() - hidden - index) as f32;
+            let width = (ui.available_width() / remaining).max(12.0);
+            let response =
+                ui.add_sized([width, 28.0], egui::Button::new(name).truncate().frame(false));
+            let full_name = snapshot.node(*node).map(display_name).unwrap_or_default();
+            if response.on_hover_text(full_name).clicked() && *node != root {
+                commands.push(ShellCommand::Navigate(NavigationAction::Activate(*node)));
+            }
+        }
+    }
+
+    /// Compatibility seam for the shared before/after headless frame harness.
+    /// Telemetry is now in the metric menu, so this consumes no canvas space.
+    fn telemetry_rail(&mut self, _ui: &mut egui::Ui) {}
+
+    fn telemetry_details(&mut self, ui: &mut egui::Ui) {
+        let counters = self
+            .runtime
+            .as_ref()
+            .and_then(RuntimeController::progress)
+            .map(SessionProgress::effective)
+            .unwrap_or_default();
+        ui.label(self.strings.get(self.phase_message()));
+        ui.label(RichText::new(&self.item_count_cache.text).weak());
+        let aggregate = self.view_root_record().map(NodeRecord::aggregate);
+        let omissions =
+            aggregate.map_or(counters.omissions, |aggregate| aggregate.omission_count());
+        for (label, value) in [
+            (MessageId::Files, counters.files),
+            (MessageId::Folders, counters.directories),
+            (MessageId::OmittedItems, omissions),
+        ] {
+            metric_value(ui, self.strings.get(label), &value.to_string());
+        }
         let hidden = self
             .runtime
             .as_ref()
             .and_then(RuntimeController::navigation)
             .map_or(0, diskpie_app::navigation::NavigationState::hidden_branch_count);
-        let restore_all = self.availability(NavigationAction::RestoreAllBranches);
-        let items = self.item_count_cache.text.as_str();
-        let hidden_label = if hidden > 0 {
-            self.i18n
-                .hidden_group(u64::try_from(hidden).unwrap_or(u64::MAX))
-                .unwrap_or_else(|_| hidden.to_string())
-        } else {
-            String::new()
-        };
-        let files = counters.files.to_string();
-        let folders = counters.directories.to_string();
-        let omissions = counters.omissions.to_string();
-        let unknown = unknown.to_string();
-        let metric = self.metric;
-        let strings = &self.strings;
-
-        egui::Panel::top("telemetry-rail").exact_size(44.0).show_separator_line(true).show(
-            ui,
-            |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.add_space(8.0);
-                    status_pill(ui, phase, phase_color);
-                    ui.separator();
-                    metric_value(
-                        ui,
-                        strings.get(MessageId::Selected),
-                        selected_bytes.as_deref().unwrap_or("—"),
-                    );
-                    metric_value(ui, strings.get(MessageId::Files), &files);
-                    metric_value(ui, strings.get(MessageId::Folders), &folders);
-                    metric_value(ui, strings.get(MessageId::OmittedItems), &omissions);
-                    metric_value(ui, strings.get(MessageId::UnknownSize), &unknown);
-                    ui.label(RichText::new(items).weak().monospace());
-                    ui.separator();
-                    let logical = ui.add(
-                        egui::Button::new(strings.get(MessageId::LogicalSize))
-                            .selected(metric == SizeBasis::Logical),
-                    );
-                    if logical.clicked() {
-                        commands.push(ShellCommand::SetMetric(SizeBasis::Logical));
-                    }
-                    let allocated = ui.add(
-                        egui::Button::new(strings.get(MessageId::AllocatedData))
-                            .selected(metric == SizeBasis::Allocated),
-                    );
-                    if allocated.clicked() {
-                        commands.push(ShellCommand::SetMetric(SizeBasis::Allocated));
-                    }
-                    if hidden > 0 {
-                        ui.separator();
-                        ui.label(RichText::new(&hidden_label).weak().monospace());
-                        if command_button(
-                            ui,
-                            strings,
-                            MessageId::RestoreAllBranches,
-                            restore_all,
-                            "",
-                        ) {
-                            commands
-                                .push(ShellCommand::Navigate(NavigationAction::RestoreAllBranches));
-                        }
-                    }
-                });
-            },
-        );
-        for command in commands {
-            self.dispatch(command);
+        if hidden > 0 {
+            let restore = self.availability(NavigationAction::RestoreAllBranches);
+            if command_button(ui, &self.strings, MessageId::RestoreAllBranches, restore, "") {
+                self.dispatch(ShellCommand::Navigate(NavigationAction::RestoreAllBranches));
+                ui.close();
+            }
         }
-    }
-
-    fn selected_node_record(&self) -> Option<&NodeRecord> {
-        let runtime = self.runtime.as_ref()?;
-        let selected = runtime.navigation()?.selected()?;
-        runtime.snapshot()?.node(selected)
     }
 
     fn view_root_record(&self) -> Option<&NodeRecord> {
@@ -1332,25 +1624,41 @@ impl DiskPieShell {
         runtime.snapshot()?.node(root)
     }
 
+    fn displayed_size_basis(&self) -> SizeBasis {
+        display_size_basis(
+            self.runtime.as_ref().and_then(RuntimeController::navigation),
+            self.metric,
+        )
+    }
+
     fn workspace(&mut self, ui: &mut egui::Ui) {
-        let wide = ui.available_width() >= 900.0;
-        if wide {
-            egui::Panel::right("inspection-rail")
+        let previous_interaction =
+            (self.hovered_item, self.focused, self.show_item_list, self.details_open);
+        self.hovered_item = None;
+        let wide = ui.available_width() >= 800.0;
+        if self.show_item_list && wide {
+            let panel = egui::Panel::right("inspection-rail")
                 .resizable(true)
-                .default_size(360.0)
-                .min_size(300.0)
-                .max_size(480.0)
+                .default_size(f32::from(self.item_list_width_points))
+                .min_size(260.0)
+                .max_size(400.0)
                 .show_separator_line(true)
                 .show(ui, |ui| self.inspector(ui));
-            egui::CentralPanel::default().show(ui, |ui| self.lens(ui));
-        } else {
-            egui::CentralPanel::default().show(ui, |ui| {
-                egui::ScrollArea::vertical().id_salt("narrow-workspace").show(ui, |ui| {
-                    self.lens(ui);
-                    ui.separator();
-                    self.inspector(ui);
-                });
-            });
+            self.item_list_width_points =
+                panel.response.rect.width().round().clamp(260.0, 400.0) as u16;
+        }
+        let frame = egui::Frame::central_panel(ui.style()).inner_margin(16);
+        egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+            if self.show_item_list && !wide {
+                self.inspector(ui);
+            } else {
+                self.lens(ui);
+            }
+        });
+        if (self.hovered_item, self.focused, self.show_item_list, self.details_open)
+            != previous_interaction
+        {
+            ui.ctx().request_repaint();
         }
     }
 
@@ -1526,6 +1834,10 @@ impl DiskPieShell {
 
     fn chart_lens(&mut self, ui: &mut egui::Ui, state: ScanUi) {
         let mut commands = Vec::new();
+        #[cfg(windows)]
+        let action_busy = self.actions.busy();
+        #[cfg(not(windows))]
+        let action_busy = false;
         {
             let Self {
                 runtime,
@@ -1537,7 +1849,7 @@ impl DiskPieShell {
                 focused,
                 context_node,
                 path_scratch,
-                metric,
+                hovered_item,
                 ..
             } = self;
             let Some(runtime) = runtime.as_ref() else {
@@ -1552,18 +1864,23 @@ impl DiskPieShell {
                 return;
             };
             let selected = navigation.selected();
-            let color_key = |node: NodeId| presentation.path_color_key(node).unwrap_or(0);
+            let basis = navigation.size_basis();
+            let revision = runtime.displayed_revision().unwrap_or(0);
+            if context_node.is_some_and(|(generation, bound_revision, _)| {
+                generation != snapshot.generation() || bound_revision != revision
+            }) {
+                *context_node = None;
+            }
+            let color_identity =
+                |node: NodeId| presentation.color_identity(node).unwrap_or_default();
             let available = ui.available_size();
             let side = available.x.min(available.y).max(120.0);
-            let phase_text = strings.get(phase_message(state));
-            let tooltip_context = TooltipContext {
-                snapshot,
-                i18n,
-                strings,
-                locale: *locale,
-                basis: *metric,
-                phase_text,
-            };
+            let phase_text = strings.get(committed_phase_message(
+                state,
+                snapshot.node(navigation.view_root()).map(|record| record.aggregate().state()),
+            ));
+            let tooltip_context =
+                TooltipContext { snapshot, i18n, strings, locale: *locale, basis, phase_text };
             let response = ui
                 .vertical_centered(|ui| {
                     SunburstView::new(layout, mesh_cache)
@@ -1571,7 +1888,7 @@ impl DiskPieShell {
                         .focused(*focused)
                         .desired_size(Vec2::splat(side))
                         .mesh_options(*mesh_options)
-                        .color_key(&color_key)
+                        .color_identity(&color_identity)
                         .accessibility_label(strings.get(MessageId::ChartAccessibilityLabel))
                         .show_with_tooltip(ui, |ui, tooltip| {
                             chart_tooltip(ui, tooltip, &tooltip_context, path_scratch);
@@ -1579,7 +1896,17 @@ impl DiskPieShell {
                 })
                 .inner;
 
+            *hovered_item = response.hovered.and_then(|hit| hit.action_target());
+            if let Some(record) = snapshot.node(navigation.view_root()) {
+                chart_center_labels(ui, &response, record, basis, *locale, strings);
+            }
             let requests = response.requests;
+            if let Some(node) = requests.primary_click {
+                commands.push(ShellCommand::Navigate(primary_navigation(snapshot, node)));
+            }
+            if requests.parent {
+                commands.push(ShellCommand::Navigate(NavigationAction::Parent));
+            }
             match requests.selection {
                 Some(NodeChange::Set(node)) => {
                     commands.push(ShellCommand::Navigate(NavigationAction::Select(node)));
@@ -1600,7 +1927,7 @@ impl DiskPieShell {
             // A secondary click opens egui's context menu by itself; the
             // keyboard request (Shift+F10) opens the same popup explicitly.
             if let Some(node) = requests.context_menu {
-                *context_node = Some(node);
+                *context_node = Some((snapshot.generation(), revision, node));
                 if !response.widget.secondary_clicked() {
                     egui::Popup::open_id(
                         ui.ctx(),
@@ -1608,10 +1935,13 @@ impl DiskPieShell {
                     );
                 }
             }
-            let menu_node = *context_node;
+            let menu_node = context_node.map(|(_, _, node)| node);
+            let menu_reason = menu_node.and_then(|node| {
+                file_action_reason(action_busy, Some(snapshot), Some(navigation), node)
+            });
             let menu_response = response.widget.context_menu(|ui| {
                 if let Some(node) = menu_node {
-                    branch_menu(ui, strings, navigation, node, &mut commands);
+                    branch_menu(ui, strings, navigation, node, menu_reason, &mut commands);
                 } else {
                     ui.close();
                 }
@@ -1631,34 +1961,79 @@ impl DiskPieShell {
     }
 
     fn inspector(&mut self, ui: &mut egui::Ui) {
+        #[cfg(windows)]
+        let action_busy = self.actions.busy();
+        #[cfg(not(windows))]
+        let action_busy = false;
         let mut commands = Vec::new();
-        let state = self.flow.state();
-        ui.add_space(8.0);
+        ui.spacing_mut().item_spacing.y = 2.0;
         ui.horizontal(|ui| {
-            ui.heading(self.strings.get(MessageId::LargestItems));
+            ui.label(RichText::new(self.strings.get(MessageId::ItemList)).strong());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new(self.item_count_cache.text.as_str()).weak().monospace());
+                let ready = self.runtime.as_ref().is_some_and(|runtime| {
+                    let (Some(snapshot), Some(navigation), Some(key)) =
+                        (runtime.snapshot(), runtime.navigation(), self.list_cache.key.as_ref())
+                    else {
+                        return false;
+                    };
+                    list_key_matches(
+                        key,
+                        snapshot.generation(),
+                        runtime.displayed_revision(),
+                        navigation.view_root(),
+                        navigation.size_basis(),
+                        &self.item_query,
+                    ) && key.sort == self.item_sort
+                        && key.direction == self.sort_direction
+                });
+                let count = if ready {
+                    self.item_count(self.list_cache.rows.len() as u64)
+                } else {
+                    "—".to_owned()
+                };
+                ui.label(RichText::new(count).weak().size(13.0));
             });
         });
         self.largest_list(ui, &mut commands);
-        ui.add_space(12.0);
         ui.separator();
-        self.details(ui, state, &mut commands);
-        ui.add_space(16.0);
-        ui.separator();
-        ui.label(RichText::new(self.strings.get(MessageId::Safety)).strong());
-        ui.label(RichText::new(self.strings.get(MessageId::ActionsUnavailable)).weak());
-        ui.horizontal_wrapped(|ui| {
-            for id in [
-                MessageId::Open,
-                MessageId::Reveal,
-                MessageId::Recycle,
-                MessageId::DeletePermanently,
-            ] {
-                ui.add_enabled(false, egui::Button::new(self.strings.get(id)))
-                    .on_disabled_hover_text(self.strings.get(MessageId::ActionsUnavailable));
-            }
-        });
+        let response = ui.add_sized(
+            [ui.available_width(), 30.0],
+            egui::Button::new(self.strings.get(MessageId::Details)).frame(false),
+        );
+        if response.clicked() {
+            self.details_open = !self.details_open;
+        }
+        let mut icon = response.clone();
+        icon.rect = egui::Rect::from_center_size(
+            egui::pos2(response.rect.left() + 14.0, response.rect.center().y),
+            Vec2::splat(12.0),
+        );
+        egui::collapsing_header::paint_default_icon(
+            ui,
+            if self.details_open { 1.0 } else { 0.0 },
+            &icon,
+        );
+        if self.details_open {
+            egui::ScrollArea::vertical().id_salt("item-details").max_height(210.0).show(ui, |ui| {
+                self.details(ui, self.flow.state(), &mut commands);
+                if let Some(node) = self
+                    .runtime
+                    .as_ref()
+                    .and_then(RuntimeController::navigation)
+                    .map(|navigation| navigation.selected().unwrap_or(navigation.view_root()))
+                {
+                    ui.separator();
+                    let runtime = self.runtime.as_ref();
+                    let unavailable = file_action_reason(
+                        action_busy,
+                        runtime.and_then(RuntimeController::snapshot),
+                        runtime.and_then(RuntimeController::navigation),
+                        node,
+                    );
+                    file_action_buttons(ui, &self.strings, node, unavailable, &mut commands);
+                }
+            });
+        }
         for command in commands {
             self.dispatch(command);
         }
@@ -1675,32 +2050,149 @@ impl DiskPieShell {
             self.list_cache = ListCache::default();
             return;
         };
-        let key = (revision, navigation.view_root(), navigation.size_basis());
-        if self.list_cache.key == Some(key) {
+        let key = ItemListKey {
+            generation: snapshot.generation(),
+            revision,
+            root: navigation.view_root(),
+            size_basis: navigation.size_basis(),
+            sort: self.item_sort,
+            direction: self.sort_direction,
+            query: self.item_query.clone(),
+        };
+        let Some(service) = self.item_list.as_mut() else {
+            return;
+        };
+        if let Some(completion) = service.try_take() {
+            if self.list_requested.as_ref() == Some(&completion.key) {
+                self.list_requested = None;
+            }
+            if completion.key == key {
+                match completion.result {
+                    Ok(rows) => self.list_cache = ListCache { key: Some(key.clone()), rows },
+                    Err(_) => self.notice = Notice::Message(MessageId::SupportUnavailable),
+                }
+            }
+        }
+        if self.list_cache.key.as_ref() == Some(&key) || self.list_requested.as_ref() == Some(&key)
+        {
             return;
         }
-        let rows = diskpie_app::presentation::largest_children(
-            snapshot,
-            navigation.view_root(),
-            navigation.size_basis(),
-            LARGEST_CHILDREN_LIMIT,
-        )
-        .unwrap_or_default();
-        self.list_cache = ListCache { key: Some(key), rows };
+        if service
+            .submit(ItemListRequest { key: key.clone(), snapshot: navigation.snapshot_handle() })
+            .is_ok()
+        {
+            self.list_requested = Some(key);
+        }
     }
 
-    /// Keyboard-operable, virtualized companion list synchronized with the chart.
+    /// Keyboard-operable companion table; sorting and filtering run in the worker.
     fn largest_list(&mut self, ui: &mut egui::Ui, commands: &mut Vec<ShellCommand>) {
+        #[cfg(windows)]
+        let action_busy = self.actions.busy();
+        #[cfg(not(windows))]
+        let action_busy = false;
+        let search = self.strings.get(MessageId::SearchItems);
+        ui.add_sized(
+            [ui.available_width(), 28.0],
+            egui::TextEdit::singleline(&mut self.item_query).hint_text(search),
+        )
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, search));
+        let widths = item_column_widths(ui.available_width());
+        let basis = self.displayed_size_basis();
+        let partial_share =
+            self.view_root_record().is_some_and(|record| share_is_partial(record, basis));
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            for (id, sort, width) in [
+                (MessageId::ItemName, ItemSort::Name, widths[0]),
+                (MessageId::ItemSize, ItemSort::Size, widths[1]),
+                (MessageId::ItemShare, ItemSort::Size, widths[2]),
+            ] {
+                let arrow = if self.item_sort == sort {
+                    match self.sort_direction {
+                        SortDirection::Ascending => " ↑",
+                        SortDirection::Descending => " ↓",
+                    }
+                } else {
+                    ""
+                };
+                let name = if id == MessageId::ItemShare {
+                    if partial_share { "%*" } else { "%" }
+                } else {
+                    self.strings.get(id)
+                };
+                let label = format!("{name}{arrow}");
+                let mut response =
+                    ui.add_sized([width, 28.0], egui::Button::new(label).frame(false).truncate());
+                if id == MessageId::ItemShare {
+                    let description = if partial_share {
+                        format!(
+                            "% {} · {}",
+                            self.strings.get(MessageId::ShareOfView),
+                            self.strings.get(MessageId::PartialResults)
+                        )
+                    } else {
+                        format!("% {}", self.strings.get(MessageId::ShareOfView))
+                    };
+                    response.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &description)
+                    });
+                    response = response.on_hover_text(description);
+                }
+                if response.clicked() {
+                    if self.item_sort == sort {
+                        self.sort_direction = match self.sort_direction {
+                            SortDirection::Ascending => SortDirection::Descending,
+                            SortDirection::Descending => SortDirection::Ascending,
+                        };
+                    } else {
+                        self.item_sort = sort;
+                        self.sort_direction = if sort == ItemSort::Name {
+                            SortDirection::Ascending
+                        } else {
+                            SortDirection::Descending
+                        };
+                    }
+                }
+            }
+        })
+        .response
+        .on_hover_text(self.strings.get(MessageId::ListKeyboardHint));
+        let list_height =
+            (ui.available_height() - if self.details_open { 248.0 } else { 36.0 }).max(60.0);
         let Some(runtime) = self.runtime.as_ref() else {
             ui.label(RichText::new(self.strings.get(MessageId::EmptyItemsHint)).weak());
             return;
         };
-        let (Some(snapshot), Some(navigation)) = (runtime.snapshot(), runtime.navigation()) else {
-            ui.label(RichText::new(self.strings.get(MessageId::EmptyItemsHint)).weak());
+        let (Some(snapshot), Some(navigation), Some(presentation)) =
+            (runtime.snapshot(), runtime.navigation(), runtime.presentation())
+        else {
             return;
         };
+        let ready = self.list_cache.key.as_ref().is_some_and(|key| {
+            list_key_matches(
+                key,
+                snapshot.generation(),
+                runtime.displayed_revision(),
+                navigation.view_root(),
+                navigation.size_basis(),
+                &self.item_query,
+            ) && key.sort == self.item_sort
+                && key.direction == self.sort_direction
+        });
+        if !ready {
+            ui.label(self.strings.get(if self.item_list.is_some() {
+                MessageId::UpdatingItems
+            } else {
+                MessageId::SupportUnavailable
+            }));
+            if self.item_list.is_some() {
+                ui.ctx().request_repaint_after(BACKGROUND_POLL_INTERVAL);
+            }
+            return;
+        }
         if self.list_cache.rows.is_empty() {
-            ui.label(RichText::new(self.strings.get(MessageId::EmptyItemsHint)).weak());
+            ui.label(RichText::new(self.strings.get(MessageId::NoMatchingItems)).weak());
             return;
         }
         let basis = navigation.size_basis();
@@ -1712,60 +2204,190 @@ impl DiskPieShell {
         let strings = &self.strings;
         let locale = self.locale;
         let scroll_to_selection = std::mem::take(&mut self.scroll_to_selection);
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(strings.get(MessageId::Shortcuts)).small());
-            ui.label(RichText::new(strings.get(MessageId::ListKeyboardHint)).weak().small());
-        });
-        let row_height = ui.spacing().interact_size.y;
-        let list_height = (ui.available_height() * 0.45).clamp(120.0, 420.0);
+        let row_height = 30.0;
         let enter = ui.input(|input| input.key_pressed(Key::Enter));
-        egui::ScrollArea::vertical()
+        let focused_row = self
+            .focused_list_row
+            .filter(|(id, _)| ui.memory(|memory| memory.focused() == Some(*id)));
+        self.focused_list_row = None;
+        let selected_index = focused_row.map(|(_, node)| node).or(selected).and_then(|node| {
+            diskpie_app::presentation::ranked_position(
+                snapshot,
+                rows,
+                basis,
+                self.item_sort,
+                self.sort_direction,
+                node,
+            )
+        });
+        let movement = if !text_field_has_focus(ui.ctx())
+            && (!ui.ctx().egui_wants_keyboard_input() || focused_row.is_some())
+        {
+            ui.input_mut(|input| {
+                if input.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                    1
+                } else if input.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                    -1
+                } else {
+                    0
+                }
+            })
+        } else {
+            0
+        };
+        let scroll_index = if movement != 0 {
+            let index = selected_index
+                .map_or(0, |index| index.saturating_add_signed(movement).min(rows.len() - 1));
+            commands.push(ShellCommand::Navigate(NavigationAction::Select(rows[index])));
+            Some(index)
+        } else if scroll_to_selection {
+            selected_index
+        } else {
+            None
+        };
+        let mut scroll = egui::ScrollArea::vertical()
             .id_salt("largest-children")
             .max_height(list_height)
-            .auto_shrink([false, true])
-            .show_rows(ui, row_height, rows.len(), |ui, range| {
-                // Justified rows fill the width and keep the text left-aligned
-                // so names, sizes, and shares line up as columns.
-                ui.with_layout(Layout::top_down_justified(Align::Min), |ui| {
-                    for index in range {
-                        let node = rows[index];
-                        let Some(record) = snapshot.node(node) else {
-                            continue;
-                        };
-                        let bytes = node_known_bytes(record, basis);
-                        let size = format_iec_bytes(bytes, locale);
-                        let percent = format_percent(fraction(bytes, root_bytes));
-                        let name = display_name(record);
-                        let is_selected = selected == Some(node);
-                        let label = format!("{name}  {size}  {percent}");
-                        let response = ui.add(
-                            egui::Button::selectable(
-                                is_selected,
-                                RichText::new(&label).monospace(),
-                            )
-                            .min_size(Vec2::new(0.0, row_height)),
+            .min_scrolled_height(list_height)
+            .auto_shrink([false, false]);
+        if let Some(index) = scroll_index {
+            scroll = scroll.vertical_scroll_offset(
+                (index as f32 * (row_height + ui.spacing().item_spacing.y) - list_height * 0.5)
+                    .max(0.0),
+            );
+        }
+        scroll.show_rows(ui, row_height, rows.len(), |ui, range| {
+            for index in range {
+                let node = rows[index];
+                let Some(record) = snapshot.node(node) else {
+                    continue;
+                };
+                let bytes = node_known_bytes(record, basis);
+                let size = node_size_text(record, basis, locale, strings);
+                let compact_size = node_compact_size_text(record, basis, locale, strings);
+                let percent = format_percent(fraction(bytes, root_bytes));
+                let name = display_name(record);
+                let is_selected = selected == Some(node);
+                let label = format!("{name}  {size}  {percent}");
+                let (_, rect) = ui.allocate_space(Vec2::new(ui.available_width(), row_height));
+                let response = ui.interact(
+                    rect,
+                    item_row_id(snapshot.generation(), runtime.displayed_revision(), node),
+                    Sense::click(),
+                );
+                let visuals = ui.style().interact_selectable(&response, is_selected);
+                if is_selected || response.hovered() || response.has_focus() {
+                    ui.painter().rect_filled(rect, 2.0, visuals.bg_fill);
+                    if response.has_focus() {
+                        ui.painter().rect_stroke(
+                            rect,
+                            2.0,
+                            visuals.bg_stroke,
+                            egui::StrokeKind::Inside,
                         );
-                        response.widget_info(|| {
-                            egui::WidgetInfo::selected(
-                                egui::WidgetType::SelectableLabel,
-                                true,
-                                is_selected,
-                                &label,
-                            )
-                        });
-                        if is_selected && scroll_to_selection {
-                            response.scroll_to_me(Some(Align::Center));
-                        }
-                        let zoom = response.has_focus() && enter;
-                        if zoom || response.double_clicked() {
-                            commands.push(ShellCommand::Navigate(NavigationAction::Activate(node)));
-                        } else if response.clicked() {
-                            commands.push(ShellCommand::Navigate(NavigationAction::Select(node)));
-                            commands.push(ShellCommand::Focus(Some(node)));
-                        }
                     }
+                }
+                let swatch = crate::sunburst_view::stable_sector_color(
+                    presentation.color_identity(node).unwrap_or_default(),
+                    ui.visuals().dark_mode,
+                );
+                ui.painter().rect_filled(
+                    egui::Rect::from_center_size(
+                        egui::pos2(rect.left() + 8.0, rect.center().y),
+                        Vec2::splat(8.0),
+                    ),
+                    1.0,
+                    swatch,
+                );
+                let columns = item_column_widths(rect.width());
+                let name_rect = egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + 19.0, rect.top()),
+                    egui::pos2(rect.left() + columns[0] - 5.0, rect.bottom()),
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(name_rect)
+                        .layout(Layout::left_to_right(Align::Center)),
+                    |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&name).size(13.0).color(visuals.text_color()),
+                            )
+                            .truncate(),
+                        );
+                    },
+                );
+                let size_rect = egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + columns[0], rect.top()),
+                    egui::pos2(rect.right() - columns[2] - 5.0, rect.bottom()),
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(size_rect)
+                        .layout(Layout::right_to_left(Align::Center)),
+                    |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&compact_size)
+                                    .monospace()
+                                    .size(13.0)
+                                    .color(visuals.text_color()),
+                            )
+                            .truncate(),
+                        );
+                    },
+                );
+                ui.painter().text(
+                    egui::pos2(rect.right() - 5.0, rect.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    &percent,
+                    FontId::monospace(13.0),
+                    visuals.text_color(),
+                );
+                response.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::WidgetType::SelectableLabel,
+                        true,
+                        is_selected,
+                        &label,
+                    )
                 });
-            });
+                if response.hovered() {
+                    self.hovered_item = Some(node);
+                }
+                let response = response.on_hover_text(&label);
+                if is_selected && scroll_to_selection {
+                    response.scroll_to_me(Some(Align::Center));
+                }
+                if response.has_focus() || (movement != 0 && scroll_index == Some(index)) {
+                    self.focused_list_row = Some((response.id, node));
+                    commands.push(ShellCommand::Focus(Some(node)));
+                    if movement != 0 {
+                        response.request_focus();
+                    }
+                }
+                let select_only = response.has_focus()
+                    && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Space));
+                if select_only {
+                    commands.push(ShellCommand::Navigate(NavigationAction::Select(node)));
+                } else if (response.has_focus() && enter)
+                    || (response.clicked() && !response.double_clicked())
+                {
+                    commands.push(ShellCommand::Navigate(primary_navigation(snapshot, node)));
+                    commands.push(ShellCommand::Focus(Some(node)));
+                }
+                if response.has_focus()
+                    && ui.input_mut(|input| input.consume_key(Modifiers::SHIFT, Key::F10))
+                {
+                    egui::Popup::open_id(ui.ctx(), egui::Popup::default_response_id(&response));
+                }
+                let action_reason =
+                    file_action_reason(action_busy, Some(snapshot), Some(navigation), node);
+                response.context_menu(|ui| {
+                    branch_menu(ui, strings, navigation, node, action_reason, commands);
+                });
+            }
+        });
     }
 
     fn details(&self, ui: &mut egui::Ui, state: ScanUi, commands: &mut Vec<ShellCommand>) {
@@ -1784,27 +2406,30 @@ impl DiskPieShell {
             strings.get(MessageId::NoSelection)
         };
         let aggregate = record.map(NodeRecord::aggregate);
-        let logical = aggregate.map_or_else(
+        let logical = record.map_or_else(
             || "—".to_owned(),
-            |aggregate| format_iec_bytes(aggregate.logical().known_bytes(), self.locale),
+            |record| node_size_text(record, SizeBasis::Logical, self.locale, strings),
         );
-        let allocated = aggregate.map_or_else(
+        let allocated = record.map_or_else(
             || "—".to_owned(),
-            |aggregate| format_iec_bytes(aggregate.allocated().known_bytes(), self.locale),
+            |record| node_size_text(record, SizeBasis::Allocated, self.locale, strings),
         );
         let files = aggregate.map_or_else(|| "0".to_owned(), |a| a.file_count().to_string());
         let folders = aggregate.map_or_else(|| "0".to_owned(), |a| a.directory_count().to_string());
         let scan_state = if runtime.and_then(RuntimeController::snapshot).is_none() {
             strings.get(MessageId::NotStarted)
         } else {
-            strings.get(phase_message(state))
+            strings.get(committed_phase_message(
+                state,
+                self.view_root_record().map(|record| record.aggregate().state()),
+            ))
         };
 
         let mut rows: Vec<(&str, &str)> = vec![(strings.get(MessageId::CurrentPath), path)];
         if let Some(location) = self.location.as_deref() {
             rows.push((strings.get(MessageId::ScanRoots), location));
         }
-        match (self.show_both_sizes, self.metric) {
+        match (self.show_both_sizes, self.displayed_size_basis()) {
             (true, _) => {
                 rows.push((strings.get(MessageId::LogicalSize), &logical));
                 rows.push((strings.get(MessageId::AllocatedData), &allocated));
@@ -1830,6 +2455,18 @@ impl DiskPieShell {
         if aggregate.is_some_and(|aggregate| !aggregate.has_unique_allocation_precision()) {
             ui.label(RichText::new(strings.get(MessageId::AllocationEstimate)).weak());
         }
+        if let Some(aggregate) = aggregate {
+            if aggregate.omission_count() != 0 {
+                ui.label(format!(
+                    "{}: {}",
+                    strings.get(MessageId::OmittedItems),
+                    aggregate.omission_count()
+                ));
+            }
+            if aggregate.state() != diskpie_core::ScanState::Complete {
+                ui.label(strings.get(MessageId::PendingItem));
+            }
+        }
         if !self.resolve_issues.is_empty() {
             ui.add_space(4.0);
             ui.label(RichText::new(strings.get(MessageId::DiscoveryIssues)).weak());
@@ -1851,54 +2488,192 @@ impl DiskPieShell {
                 if command_button(ui, strings, MessageId::RestoreBranch, restore, "") {
                     commands.push(ShellCommand::Navigate(NavigationAction::RestoreBranch(node)));
                 }
-                ui.add_enabled(false, egui::Button::new(strings.get(MessageId::RescanBranch)))
-                    .on_disabled_hover_text(strings.get(MessageId::RescanBranchUnavailable));
+                let rescan = navigation
+                    .availability(navigation.command(NavigationAction::RescanBranch(node)));
+                if command_button(ui, strings, MessageId::RescanBranch, rescan, "") {
+                    commands.push(ShellCommand::Navigate(NavigationAction::RescanBranch(node)));
+                }
             });
         }
     }
 
-    fn status_rail(&self, ui: &mut egui::Ui) {
-        // Both facts are shown when both hold; each adds one line.
-        let extra_lines = usize::from(self.previous_session_panicked)
-            + usize::from(self.optional_services_unavailable);
-        let height = 34.0 + 22.0 * extra_lines as f32;
-        egui::Panel::bottom("status-rail").exact_size(height).show_separator_line(true).show(
+    fn status_rail(&mut self, ui: &mut egui::Ui) {
+        let basis = self.displayed_size_basis();
+        let mut size = String::new();
+        let mut omissions = 0;
+        let mut unknown = [0, 0];
+        if let Some(runtime) = self.runtime.as_ref()
+            && let (Some(snapshot), Some(navigation), Some(revision)) =
+                (runtime.snapshot(), runtime.navigation(), runtime.displayed_revision())
+        {
+            let subject = self
+                .hovered_item
+                .or(self.focused)
+                .or(navigation.selected())
+                .filter(|node| snapshot.node(*node).is_some())
+                .unwrap_or(navigation.view_root());
+            let key = (snapshot.generation(), revision, subject);
+            if self.hover_cache.key != Some(key) {
+                let path = if snapshot.path_into(subject, &mut self.path_scratch).is_ok() {
+                    format_path_for_display(&self.path_scratch)
+                } else {
+                    snapshot.node(subject).map(display_name).unwrap_or_default()
+                };
+                self.hover_cache = DetailsCache { key: Some(key), path };
+            }
+            if let Some(record) = snapshot.node(subject) {
+                size = node_size_text(record, basis, self.locale, &self.strings);
+            }
+            if let Some(record) = snapshot.node(navigation.view_root()) {
+                let aggregate = record.aggregate();
+                omissions = aggregate.omission_count();
+                unknown = [
+                    aggregate.logical().unknown_entries(),
+                    aggregate.allocated().unknown_entries(),
+                ];
+            }
+        } else {
+            self.hover_cache = DetailsCache::default();
+        }
+        egui::Panel::bottom("status-rail").exact_size(28.0).show_separator_line(true).show(
             ui,
             |ui| {
-                ui.horizontal(|ui| {
-                    ui.add_space(8.0);
-                    ui.vertical(|ui| {
-                        ui.add(
-                            egui::Label::new(RichText::new(self.notice_text()).weak()).truncate(),
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.horizontal_centered(|ui| {
+                    let phase = self.strings.get(self.phase_message());
+                    let warning = self.previous_session_panicked
+                        || self.optional_services_unavailable
+                        || omissions != 0
+                        || unknown != [0, 0]
+                        || self.phase_message() != phase_message(self.flow.state());
+                    let phase_color = if warning {
+                        ui.visuals().warn_fg_color
+                    } else {
+                        phase_color(self.flow.state(), ui.visuals().dark_mode)
+                    };
+                    let active_unknown = unknown[usize::from(basis == SizeBasis::Allocated)];
+                    let working = match self.flow.state() {
+                        ScanUi::Scanning | ScanUi::Partial { settled: false } => {
+                            Some(MessageId::Scanning)
+                        }
+                        ScanUi::Cancelling => Some(MessageId::Cancelling),
+                        _ => None,
+                    };
+                    let base = if let Some(working) = working {
+                        let mut text = format!(
+                            "{} · {}",
+                            self.strings.get(working),
+                            self.item_count_cache.text
                         );
-                        if self.previous_session_panicked {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(
-                                        self.strings
-                                            .get(MessageId::PreviousSessionEndedUnexpectedly),
-                                    )
-                                    .color(ui.visuals().warn_fg_color),
-                                )
+                        if self.view_root_record().is_some_and(|record| {
+                            record.aggregate().state() != diskpie_core::ScanState::Complete
+                        }) {
+                            text.push_str(" · ");
+                            text.push_str(self.strings.get(MessageId::PartialResults));
+                        }
+                        text
+                    } else {
+                        phase.to_owned()
+                    };
+                    let text = if active_unknown != 0 {
+                        format!(
+                            "{base} · {}: {active_unknown}",
+                            self.strings.get(MessageId::UnknownSize)
+                        )
+                    } else if omissions != 0 {
+                        format!(
+                            "{base} · {}: {omissions}",
+                            self.strings.get(MessageId::OmittedItems)
+                        )
+                    } else if warning {
+                        format!("⚠ {base}")
+                    } else {
+                        base
+                    };
+                    let measured = ui
+                        .painter()
+                        .layout_no_wrap(text.clone(), FontId::proportional(13.0), phase_color)
+                        .size()
+                        .x
+                        + 16.0;
+                    let width = measured.min((ui.available_width() * 0.60).min(560.0)).max(40.0);
+                    let mut response = ui
+                        .add_sized(
+                            [width, 24.0],
+                            egui::Button::new(RichText::new(&text).size(13.0).color(phase_color))
                                 .truncate(),
-                            );
+                        )
+                        .on_hover_text(&text);
+                    egui::Popup::menu(&response).show(|ui| {
+                        ui.set_max_width(400.0);
+                        ui.label(RichText::new(phase).strong());
+                        ui.label(&self.item_count_cache.text);
+                        ui.label(self.notice_text());
+                        metric_value(
+                            ui,
+                            self.strings.get(MessageId::OmittedItems),
+                            &omissions.to_string(),
+                        );
+                        for (label, count) in [
+                            (MessageId::LogicalSize, unknown[0]),
+                            (MessageId::AllocatedData, unknown[1]),
+                        ] {
+                            ui.label(format!(
+                                "{} · {}: {count}",
+                                self.strings.get(label),
+                                self.strings.get(MessageId::UnknownSize)
+                            ));
+                        }
+                        for issue in self.resolve_issues.iter().take(4) {
+                            ui.label(issue);
+                        }
+                        if self.previous_session_panicked {
+                            ui.label(self.strings.get(MessageId::PreviousSessionEndedUnexpectedly));
                         }
                         if self.optional_services_unavailable {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(
-                                        self.strings.get(MessageId::OptionalServicesUnavailable),
-                                    )
-                                    .weak(),
-                                )
-                                .truncate(),
-                            );
+                            ui.label(self.strings.get(MessageId::OptionalServicesUnavailable));
                         }
+                        ui.separator();
+                        ui.label(self.strings.get(MessageId::StandardUser));
+                        ui.label(self.strings.get(MessageId::NoElevation));
                     });
+                    response = response.on_hover_text(self.notice_text());
+                    if self.previous_session_panicked {
+                        response = response.on_hover_text(
+                            self.strings.get(MessageId::PreviousSessionEndedUnexpectedly),
+                        );
+                    }
+                    if self.optional_services_unavailable {
+                        response = response.on_hover_text(
+                            self.strings.get(MessageId::OptionalServicesUnavailable),
+                        );
+                    }
+                    if omissions != 0 {
+                        response = response.on_hover_text(format!(
+                            "{}: {omissions}",
+                            self.strings.get(MessageId::OmittedItems)
+                        ));
+                    }
+                    let _ = response;
+                    ui.separator();
+                    let path = if self.hover_cache.path.is_empty() {
+                        self.notice_text()
+                    } else {
+                        &self.hover_cache.path
+                    };
+                    let width = (ui.available_width() - 112.0).max(24.0);
+                    ui.add_sized(
+                        [width, 20.0],
+                        egui::Label::new(RichText::new(path).size(13.0)).truncate(),
+                    )
+                    .on_hover_text(path);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new(self.strings.get(MessageId::NoElevation)).weak());
-                        ui.label(RichText::new("·").weak());
-                        ui.label(RichText::new(self.strings.get(MessageId::StandardUser)).weak());
+                        ui.label(RichText::new(&size).monospace().size(13.0)).on_hover_text(
+                            self.strings.get(match basis {
+                                SizeBasis::Logical => MessageId::LogicalSize,
+                                SizeBasis::Allocated => MessageId::AllocatedData,
+                            }),
+                        );
                     });
                 });
             },
@@ -1939,9 +2714,14 @@ impl eframe::App for DiskPieShell {
         self.handle_shortcuts(&ctx);
         self.command_rail(ui);
         self.telemetry_rail(ui);
-        self.synchronize_settings();
         self.status_rail(ui);
         self.workspace(ui);
+        #[cfg(windows)]
+        {
+            self.render_support(ui);
+            self.render_actions(ui);
+        }
+        self.synchronize_settings();
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
@@ -1956,11 +2736,18 @@ impl eframe::App for DiskPieShell {
 impl Drop for DiskPieShell {
     fn drop(&mut self) {
         self.begin_shutdown();
+        if let Some((_, intent)) = self.branch_job.take() {
+            self.retired_resources.push_back(Box::new(intent));
+        }
         self.exit.publish(ShellExit {
             settings: self.settings.clone(),
             runtime: self.runtime.take(),
             picker: self.picker.take(),
             clock_origin: self.started,
+            item_list: self.item_list.take(),
+            retired_resources: std::mem::take(&mut self.retired_resources),
+            #[cfg(windows)]
+            pending_action: self.actions.take_pending(),
         });
     }
 }
@@ -1968,6 +2755,194 @@ impl Drop for DiskPieShell {
 // --------------------------------------------------------------------------
 // Pure helpers
 // --------------------------------------------------------------------------
+
+/// A metric request becomes visible only with its committed geometry and rows.
+fn display_size_basis(
+    navigation: Option<&diskpie_app::navigation::NavigationState>,
+    requested: SizeBasis,
+) -> SizeBasis {
+    navigation.map_or(requested, diskpie_app::navigation::NavigationState::size_basis)
+}
+
+fn share_is_partial(record: &NodeRecord, basis: SizeBasis) -> bool {
+    let aggregate = record.aggregate();
+    let metric = match basis {
+        SizeBasis::Logical => aggregate.logical(),
+        SizeBasis::Allocated => aggregate.allocated(),
+    };
+    aggregate.state() != diskpie_core::ScanState::Complete || metric.unknown_entries() != 0
+}
+
+fn size_summary_text(
+    known: u128,
+    unknown: u64,
+    incomplete: bool,
+    locale: Locale,
+    strings: &UiStrings,
+) -> String {
+    if unknown != 0 || incomplete {
+        if known == 0 {
+            return strings.get(MessageId::UnknownSize).to_owned();
+        }
+        return format!("{} {}", strings.get(MessageId::AtLeast), format_iec_bytes(known, locale));
+    }
+    format_iec_bytes(known, locale)
+}
+
+fn node_compact_size_text(
+    record: &NodeRecord,
+    basis: SizeBasis,
+    locale: Locale,
+    strings: &UiStrings,
+) -> String {
+    let aggregate = record.aggregate();
+    let size = match basis {
+        SizeBasis::Logical => aggregate.logical(),
+        SizeBasis::Allocated => aggregate.allocated(),
+    };
+    if size.known_bytes() > 0
+        && (size.unknown_entries() != 0 || aggregate.state() != diskpie_core::ScanState::Complete)
+    {
+        format!("≥ {}", format_iec_bytes(size.known_bytes(), locale))
+    } else {
+        node_size_text(record, basis, locale, strings)
+    }
+}
+
+fn item_row_id(generation: GenerationId, revision: Option<u64>, node: NodeId) -> egui::Id {
+    egui::Id::new(("diskpie-item-row", generation, revision, node))
+}
+
+fn toolbar_label_width(ui: &egui::Ui, label: &str, menu: bool) -> f32 {
+    ui.painter()
+        .layout_no_wrap(label.to_owned(), FontId::proportional(14.0), ui.visuals().text_color())
+        .size()
+        .x
+        + ui.spacing().button_padding.x * 2.0
+        + if menu { 20.0 } else { 0.0 }
+}
+
+/// Fixed numerical columns keep labels compact without making data jump.
+fn item_column_widths(width: f32) -> [f32; 3] {
+    let share = 62.0;
+    let size = 90.0;
+    [(width - share - size).max(20.0), size, share]
+}
+
+fn primary_navigation(snapshot: &TreeSnapshot, node: NodeId) -> NavigationAction {
+    if snapshot.node(node).is_some_and(|record| record.kind().can_have_children()) {
+        NavigationAction::Activate(node)
+    } else {
+        NavigationAction::Select(node)
+    }
+}
+
+fn chart_center_labels(
+    ui: &egui::Ui,
+    response: &crate::sunburst_view::SunburstResponse,
+    record: &NodeRecord,
+    basis: SizeBasis,
+    locale: Locale,
+    strings: &UiStrings,
+) {
+    let radius = response.chart_radius * response.center_radius_normalized as f32;
+    let width = (radius * 1.55).max(36.0);
+    let font_scale = (radius / 88.0).clamp(0.72, 1.2);
+    let name = compact_node_name(record, strings);
+    let value = node_compact_size_text(record, basis, locale, strings);
+    let metric = strings.get(match basis {
+        SizeBasis::Logical => MessageId::LogicalSize,
+        SizeBasis::Allocated => MessageId::AllocatedData,
+    });
+    let lines = [
+        (name.as_str(), 16.0 * font_scale, ui.visuals().text_color()),
+        (value.as_str(), 27.0 * font_scale, ui.visuals().strong_text_color()),
+        (metric, 12.0 * font_scale, ui.visuals().weak_text_color()),
+    ];
+    let mut y = response.chart_center.y - 36.0 * font_scale;
+    for (text, size, color) in lines {
+        let measured = ui
+            .painter()
+            .layout_no_wrap(text.to_owned(), FontId::proportional(size), color)
+            .size()
+            .x;
+        let size = if measured > width { (size * width / measured).max(12.0) } else { size };
+        let mut job = egui::text::LayoutJob::simple(
+            text.to_owned(),
+            FontId::proportional(size),
+            color,
+            width,
+        );
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+        let pos = egui::pos2(response.chart_center.x - galley.size().x * 0.5, y);
+        y += galley.size().y + 5.0 * font_scale;
+        ui.painter().galley(pos, galley, color);
+    }
+}
+
+fn navigation_icon(
+    ui: &mut egui::Ui,
+    strings: &UiStrings,
+    label: MessageId,
+    icon: &str,
+    availability: CommandAvailability,
+    shortcut: &str,
+) -> bool {
+    let mut response = ui
+        .add_enabled(
+            availability.is_available(),
+            egui::Button::new(icon).min_size(Vec2::splat(28.0)),
+        )
+        .on_hover_text(format!("{} ({shortcut})", strings.get(label)));
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            availability.is_available(),
+            strings.get(label),
+        )
+    });
+    if let Some(reason) = availability.reason() {
+        response = response.on_disabled_hover_text(strings.get(reason_message(reason)));
+    }
+    response.clicked()
+}
+
+fn list_key_matches(
+    key: &ItemListKey,
+    generation: GenerationId,
+    revision: Option<u64>,
+    root: NodeId,
+    basis: SizeBasis,
+    query: &str,
+) -> bool {
+    key.generation == generation
+        && Some(key.revision) == revision
+        && key.root == root
+        && key.size_basis == basis
+        && key.query == query
+}
+
+fn node_size_text(
+    record: &NodeRecord,
+    basis: SizeBasis,
+    locale: Locale,
+    strings: &UiStrings,
+) -> String {
+    let aggregate = record.aggregate();
+    let size = match basis {
+        SizeBasis::Logical => aggregate.logical(),
+        SizeBasis::Allocated => aggregate.allocated(),
+    };
+    size_summary_text(
+        size.known_bytes(),
+        size.unknown_entries(),
+        aggregate.state() != diskpie_core::ScanState::Complete || aggregate.omission_count() != 0,
+        locale,
+        strings,
+    )
+}
 
 /// Builds the runtime policy from validated settings.
 #[must_use]
@@ -2008,6 +2983,18 @@ pub fn shortcut_command(modifiers: Modifiers, key: Key, can_cancel: bool) -> Opt
         (Modifiers::NONE, Key::Escape) => can_cancel.then_some(ShellCommand::Cancel),
         (Modifiers::COMMAND, Key::O) => Some(ShellCommand::ChooseFolder),
         _ => None,
+    }
+}
+
+/// The lightweight worker summary can arrive before its final layout commits.
+/// Until then, label the immutable results actually visible in this frame.
+fn committed_phase_message(state: ScanUi, committed: Option<diskpie_core::ScanState>) -> MessageId {
+    match (state, committed) {
+        (ScanUi::Complete, Some(diskpie_core::ScanState::Partial)) => MessageId::PartialResults,
+        (ScanUi::Complete, Some(diskpie_core::ScanState::Cancelled)) => {
+            phase_message(ScanUi::CancelledWithResults)
+        }
+        _ => phase_message(state),
     }
 }
 
@@ -2155,10 +3142,18 @@ pub const fn reason_message(reason: UnavailableReason) -> MessageId {
 fn phase_color(state: ScanUi, dark_mode: bool) -> Color32 {
     match state {
         ScanUi::Empty | ScanUi::Choosing | ScanUi::Resolving | ScanUi::Scanning => {
-            theme::SCAN_CURRENT
+            if dark_mode {
+                theme::SCAN_CURRENT
+            } else {
+                Color32::from_rgb(8, 105, 179)
+            }
         }
         ScanUi::Partial { .. } | ScanUi::Cancelling | ScanUi::CancelledWithResults => {
-            theme::SECTOR_EMBER
+            if dark_mode {
+                theme::SECTOR_EMBER
+            } else {
+                Color32::from_rgb(158, 88, 0)
+            }
         }
         ScanUi::Complete => {
             if dark_mode {
@@ -2167,7 +3162,13 @@ fn phase_color(state: ScanUi, dark_mode: bool) -> Color32 {
                 theme::PLATTER_MIDNIGHT
             }
         }
-        ScanUi::Failed { .. } => theme::DANGER_STOP,
+        ScanUi::Failed { .. } => {
+            if dark_mode {
+                theme::DANGER_STOP
+            } else {
+                Color32::from_rgb(164, 45, 58)
+            }
+        }
     }
 }
 
@@ -2205,6 +3206,17 @@ fn display_name(record: &NodeRecord) -> String {
     }
 }
 
+/// The center identifies the current location; the native path stays in its tooltip/footer.
+fn compact_node_name(record: &NodeRecord, strings: &UiStrings) -> String {
+    match record.kind() {
+        EntryKind::Root => std::path::Path::new(record.name())
+            .file_name()
+            .map_or_else(|| display_name(record), |name| name.to_string_lossy().into_owned()),
+        EntryKind::SyntheticGroup => strings.get(MessageId::LocationSummary).to_owned(),
+        _ => display_name(record),
+    }
+}
+
 struct TooltipContext<'a> {
     snapshot: &'a TreeSnapshot,
     i18n: &'a I18n,
@@ -2239,12 +3251,12 @@ fn chart_tooltip(
             ui.label(format!(
                 "{}: {}",
                 strings.get(MessageId::LogicalSize),
-                format_iec_bytes(aggregate.logical().known_bytes(), context.locale)
+                node_size_text(record, SizeBasis::Logical, context.locale, strings)
             ));
             ui.label(format!(
                 "{}: {}",
                 strings.get(MessageId::AllocatedData),
-                format_iec_bytes(aggregate.allocated().known_bytes(), context.locale)
+                node_size_text(record, SizeBasis::Allocated, context.locale, strings)
             ));
             ui.label(format!("{}: {}", strings.get(MessageId::FileCount), aggregate.file_count()));
             ui.label(format!(
@@ -2295,9 +3307,15 @@ fn branch_menu(
     strings: &UiStrings,
     navigation: &diskpie_app::navigation::NavigationState,
     node: NodeId,
+    action_unavailable: Option<MessageId>,
     commands: &mut Vec<ShellCommand>,
 ) {
     ui.set_min_width(200.0);
+    if ui.button(strings.get(MessageId::Details)).clicked() {
+        commands.push(ShellCommand::ShowDetails(node));
+        ui.close();
+    }
+    ui.separator();
     let hide = navigation.availability(navigation.command(NavigationAction::HideBranch(node)));
     if command_button(ui, strings, MessageId::HideBranch, hide, "") {
         commands.push(ShellCommand::Navigate(NavigationAction::HideBranch(node)));
@@ -2309,13 +3327,84 @@ fn branch_menu(
         commands.push(ShellCommand::Navigate(NavigationAction::RestoreBranch(node)));
         ui.close();
     }
-    ui.add_enabled(false, egui::Button::new(strings.get(MessageId::RescanBranch)))
-        .on_disabled_hover_text(strings.get(MessageId::RescanBranchUnavailable));
+    let rescan = navigation.availability(navigation.command(NavigationAction::RescanBranch(node)));
+    if command_button(ui, strings, MessageId::RescanBranch, rescan, "") {
+        commands.push(ShellCommand::Navigate(NavigationAction::RescanBranch(node)));
+        ui.close();
+    }
     ui.separator();
-    for id in [MessageId::Open, MessageId::Reveal, MessageId::Recycle, MessageId::DeletePermanently]
+    file_action_buttons(ui, strings, node, action_unavailable, commands);
+}
+
+/// Synchronous reason an item action cannot start for `node`, mirroring the
+/// off-thread target validation so an unavailable subject never looks
+/// clickable. Anything this check misses is still rejected by the support
+/// worker and reported through the same notices.
+#[cfg(windows)]
+fn file_action_reason(
+    busy: bool,
+    snapshot: Option<&TreeSnapshot>,
+    navigation: Option<&diskpie_app::navigation::NavigationState>,
+    node: NodeId,
+) -> Option<MessageId> {
+    if busy {
+        return Some(MessageId::ActionWaitForScan);
+    }
+    let (Some(snapshot), Some(navigation)) = (snapshot, navigation) else {
+        return Some(MessageId::ActionsUnavailable);
+    };
+    let Some(record) = snapshot.node(node) else {
+        return Some(MessageId::ReasonUnknownNode);
+    };
+    if record.kind() == EntryKind::SyntheticGroup {
+        return Some(MessageId::ReasonSyntheticTarget);
+    }
+    if navigation.is_hidden(node) {
+        return Some(MessageId::ReasonHiddenTarget);
+    }
+    None
+}
+
+/// Item actions are a Windows Shell feature; other targets get the reason.
+#[cfg(not(windows))]
+fn file_action_reason(
+    _busy: bool,
+    _snapshot: Option<&TreeSnapshot>,
+    _navigation: Option<&diskpie_app::navigation::NavigationState>,
+    _node: NodeId,
+) -> Option<MessageId> {
+    None
+}
+
+fn file_action_buttons(
+    ui: &mut egui::Ui,
+    strings: &UiStrings,
+    node: NodeId,
+    unavailable: Option<MessageId>,
+    commands: &mut Vec<ShellCommand>,
+) {
+    #[cfg(windows)]
+    ui.horizontal_wrapped(|ui| {
+        for (label, action) in [
+            (MessageId::Open, FileAction::Open),
+            (MessageId::Reveal, FileAction::Reveal),
+            (MessageId::Recycle, FileAction::Recycle),
+            (MessageId::DeletePermanently, FileAction::Delete),
+        ] {
+            let mut response =
+                ui.add_enabled(unavailable.is_none(), egui::Button::new(strings.get(label)));
+            if let Some(reason) = unavailable {
+                response = response.on_disabled_hover_text(strings.get(reason));
+            }
+            if response.clicked() {
+                commands.push(ShellCommand::FileAction(node, action));
+            }
+        }
+    });
+    #[cfg(not(windows))]
     {
-        ui.add_enabled(false, egui::Button::new(strings.get(id)))
-            .on_disabled_hover_text(strings.get(MessageId::ActionsUnavailable));
+        let _ = (node, unavailable, commands);
+        ui.label(strings.get(MessageId::ActionsUnavailable));
     }
 }
 
@@ -2399,39 +3488,11 @@ const fn setting_from_basis(basis: SizeBasis) -> SizePreference {
     }
 }
 
-/// Fixed width keeps the preference cluster measurable for right alignment.
-const PREFERENCE_COMBO_WIDTH: f32 = 132.0;
-
-/// Gives a combo box an accessible name and, when there is room, a visible
-/// label after it in egui's usual control-then-label order.
-fn label_combo(ui: &mut egui::Ui, combo: egui::Response, label: &str, show_label: bool) {
-    combo.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, ui.is_enabled(), label)
-    });
-    if show_label {
-        let label_response = ui.label(RichText::new(label).weak());
-        let _labelled = combo.labelled_by(label_response.id);
-    }
-}
-
-fn status_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
-    let text = RichText::new(text).strong().monospace().color(color);
-    ui.label(text);
-}
-
 fn metric_value(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(label).weak());
         ui.label(RichText::new(value).monospace().strong());
     });
-}
-
-fn theme_name(preference: ThemePreference, strings: &UiStrings) -> &str {
-    match preference {
-        ThemePreference::System => strings.get(MessageId::ThemeSystem),
-        ThemePreference::Dark => strings.get(MessageId::ThemeDark),
-        ThemePreference::Light => strings.get(MessageId::ThemeLight),
-    }
 }
 
 fn arc_points(center: Pos2, radius: f32, start: f32, end: f32, segments: usize) -> Vec<Pos2> {
@@ -2449,6 +3510,7 @@ fn arc_points(center: Pos2, radius: f32, start: f32, end: f32, segments: usize) 
 mod tests {
     use super::*;
     use crate::resolver::{ResolveBackend, ResolveFailure, ResolvedRoot};
+    use diskpie_app::session::SessionPhase;
     use std::path::Path;
 
     struct RejectingBackend;
@@ -2568,7 +3630,7 @@ mod tests {
         PathBuf::from(r"C:\fixture\tree")
     }
 
-    fn headless_shell(startup_path: Option<PathBuf>) -> (DiskPieShell, egui::Context) {
+    pub(super) fn headless_shell(startup_path: Option<PathBuf>) -> (DiskPieShell, egui::Context) {
         headless_shell_with(RejectingBackend, DiagnosticSink::disconnected(), startup_path)
     }
 
@@ -2589,8 +3651,13 @@ mod tests {
             resolver,
             diagnostics,
             fonts: SystemFonts::default(),
+            item_list: ItemListService::new().ok(),
+            #[cfg(windows)]
+            support: None,
+            #[cfg(windows)]
+            diagnostic_counters: None,
         };
-        let shell = DiskPieShell::with_context(
+        let mut shell = DiskPieShell::with_context(
             &ctx,
             startup_path,
             false,
@@ -2600,7 +3667,17 @@ mod tests {
             ExitHandoff::default(),
         )
         .expect("shell builds headlessly");
+        shell.show_item_list =
+            std::env::var("DISKPIE_UI_BENCH_LIST_VISIBLE").is_ok_and(|value| value == "1");
         (shell, ctx)
+    }
+
+    fn completed_fixture_frame(shell: &DiskPieShell) -> bool {
+        shell.scan_state() == ScanUi::Complete
+            && shell.view_root_record().is_some_and(|record| {
+                record.aggregate().file_count() == 49
+                    && record.aggregate().state() == diskpie_core::ScanState::Complete
+            })
     }
 
     fn settle(shell: &mut DiskPieShell, ctx: &egui::Context) {
@@ -2706,6 +3783,10 @@ mod tests {
             runtime: None,
             picker: None,
             clock_origin: Instant::now(),
+            item_list: None,
+            retired_resources: VecDeque::new(),
+            #[cfg(windows)]
+            pending_action: None,
         });
         let taken = exit.take().expect("handoff present");
         assert_eq!(taken.settings, session);
@@ -2878,6 +3959,164 @@ mod tests {
     }
 
     #[test]
+    fn full_rescan_retries_unresolved_roots_until_the_original_selection_is_complete() {
+        struct EmptyFs;
+        impl ScanFs for EmptyFs {
+            fn visit_directory(
+                &self,
+                _path: &Path,
+                _visitor: &mut dyn FnMut(diskpie_scan::DirectoryItem) -> diskpie_scan::VisitControl,
+            ) -> Result<(), diskpie_scan::FsError> {
+                Ok(())
+            }
+        }
+        struct RecoveringBackend {
+            unavailable: Arc<std::sync::atomic::AtomicBool>,
+            calls: Arc<Mutex<Vec<PathBuf>>>,
+            missing: PathBuf,
+        }
+        impl ResolveBackend for RecoveringBackend {
+            fn resolve_root(&self, path: &Path) -> Result<ResolvedRoot, ResolveFailure> {
+                self.calls.lock().unwrap().push(path.to_path_buf());
+                if path == self.missing
+                    && self.unavailable.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return Err(ResolveFailure {
+                        class: FailureClass::PathUnavailable,
+                        detail: "fixture temporarily unavailable".into(),
+                    });
+                }
+                Ok(ResolvedRoot {
+                    root: ScanRoot::new(
+                        path,
+                        diskpie_core::VolumeKey::new(1),
+                        diskpie_scan::StorageClass::Unknown,
+                    ),
+                    issues: Vec::new(),
+                })
+            }
+            fn discover_volumes(&self) -> VolumeList {
+                VolumeList::default()
+            }
+            fn filesystem(&self, _cancel: CancelToken) -> Arc<dyn ScanFs> {
+                Arc::new(EmptyFs)
+            }
+        }
+        // Entirely in memory: these native spellings are never opened on disk.
+        let first = crate::resolver::normalize_for_resolution(&fixture_root().join("available"));
+        let missing = crate::resolver::normalize_for_resolution(&fixture_root().join("missing"));
+        let expected = vec![first, missing.clone()];
+        let unavailable = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (mut shell, ctx) = headless_shell_with(
+            RecoveringBackend {
+                unavailable: Arc::clone(&unavailable),
+                calls: Arc::clone(&calls),
+                missing,
+            },
+            DiagnosticSink::disconnected(),
+            None,
+        );
+        settle(&mut shell, &ctx);
+        shell.request_scan_paths(expected.clone());
+        for generation in 1..=3 {
+            pump_until(&mut shell, &ctx, "full selection retry", |shell| {
+                shell.scan_job.is_none()
+                    && shell.runtime.as_ref().is_some_and(|runtime| {
+                        runtime.snapshot().is_some_and(|snapshot| {
+                            snapshot.generation() == GenerationId::new(generation)
+                        }) && !runtime.needs_repaint()
+                    })
+            });
+            assert_eq!(*calls.lock().unwrap(), expected);
+            assert_eq!(shell.full_scan_paths, expected);
+            assert_eq!(
+                shell.runtime.as_ref().unwrap().phase(),
+                Some(if generation < 3 { SessionPhase::Partial } else { SessionPhase::Complete })
+            );
+            if generation < 3 {
+                calls.lock().unwrap().clear();
+                if generation == 2 {
+                    unavailable.store(false, std::sync::atomic::Ordering::Release);
+                }
+                shell.dispatch(ShellCommand::Navigate(NavigationAction::RescanAll));
+            }
+        }
+        shell.begin_shutdown();
+    }
+
+    #[test]
+    fn full_rescan_scope_follows_the_visible_generation_when_a_new_scan_is_cancelled() {
+        struct CapturingBackend {
+            calls: Arc<Mutex<Vec<PathBuf>>>,
+        }
+        impl ResolveBackend for CapturingBackend {
+            fn resolve_root(&self, path: &Path) -> Result<ResolvedRoot, ResolveFailure> {
+                self.calls.lock().unwrap().push(path.to_path_buf());
+                FixtureBackend { root: fixture_root(), delay: Duration::ZERO }.resolve_root(path)
+            }
+            fn discover_volumes(&self) -> VolumeList {
+                VolumeList::default()
+            }
+            fn filesystem(&self, _cancel: CancelToken) -> Arc<dyn ScanFs> {
+                Arc::new(FixtureFs { root: fixture_root(), delay: Duration::ZERO })
+            }
+        }
+        for publish_before_cancel in [false, true] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let (mut shell, ctx) = headless_shell_with(
+                CapturingBackend { calls: Arc::clone(&calls) },
+                DiagnosticSink::disconnected(),
+                Some(fixture_root()),
+            );
+            pump_until(&mut shell, &ctx, "first committed selection", completed_fixture_frame);
+            let first_generation = shell.runtime.as_ref().unwrap().snapshot().unwrap().generation();
+            let original_scope = shell.full_scan_paths.clone();
+            calls.lock().unwrap().clear();
+            let second = fixture_root().with_file_name("second-selection");
+            shell.launch(ResolvedLaunch {
+                fs: Arc::new(FixtureFs { root: second.clone(), delay: Duration::from_millis(10) }),
+                roots: vec![ScanRoot::new(
+                    second.clone(),
+                    diskpie_core::VolumeKey::new(1),
+                    diskpie_scan::StorageClass::Unknown,
+                )],
+                requested_paths: vec![second.clone()],
+                cancel: CancelToken::new(),
+                displays: Vec::new(),
+                issues: Vec::new(),
+                failures: Vec::new(),
+            });
+            assert_eq!(
+                shell.full_scan_paths, original_scope,
+                "acceptance alone cannot replace the displayed scope"
+            );
+            assert!(shell.pending_full_scan_paths.is_some());
+            if publish_before_cancel {
+                pump_until(
+                    &mut shell,
+                    &ctx,
+                    "second generation's first visible publication",
+                    |shell| {
+                        shell.runtime.as_ref().unwrap().snapshot().unwrap().generation()
+                            != first_generation
+                    },
+                );
+                assert_eq!(shell.full_scan_paths, vec![second.clone()]);
+                assert!(shell.pending_full_scan_paths.is_none());
+            }
+            shell.dispatch(ShellCommand::Cancel);
+            shell.dispatch(ShellCommand::Navigate(NavigationAction::RescanAll));
+            pump_until(&mut shell, &ctx, "rescan submitted from the displayed frame", |_| {
+                !calls.lock().unwrap().is_empty()
+            });
+            let expected = if publish_before_cancel { vec![second] } else { original_scope };
+            assert_eq!(*calls.lock().unwrap(), expected);
+            shell.begin_shutdown();
+        }
+    }
+
+    #[test]
     fn a_deferred_launch_keeps_the_recovered_parts_and_is_retried_next_frame() {
         let (mut shell, ctx) = headless_shell(None);
         settle(&mut shell, &ctx);
@@ -2896,10 +4135,12 @@ mod tests {
         shell.deferred_launch = Some(DeferredLaunch {
             fs: Arc::clone(&fs),
             roots,
+            requested_paths: vec![fixture_root()],
             cancel: CancelToken::new(),
             displays: vec!["C:\\fixture\\tree".to_owned()],
             issues: Vec::new(),
             frames: 3,
+            initial_omissions: 0,
         });
         assert_eq!(shell.scan_state(), ScanUi::Resolving);
         assert!(shell.flow.background_work_outstanding());
@@ -2910,6 +4151,7 @@ mod tests {
         pump_until(&mut shell, &ctx, "the retried launch to complete", |shell| {
             shell.scan_state() == ScanUi::Complete
         });
+        assert_eq!(shell.full_scan_paths, vec![fixture_root()]);
         shell.begin_shutdown();
     }
 
@@ -2918,11 +4160,17 @@ mod tests {
         let (mut shell, ctx) = headless_shell(None);
         settle(&mut shell, &ctx);
         for _ in 0..MAX_DEFERRED_ACTIONS {
-            shell.defer_action(NavigationAction::Back);
+            shell.defer_action(
+                NavigationCommand::new(GenerationId::new(1), NavigationAction::Back),
+                Some(1),
+            );
         }
         assert_eq!(shell.deferred_actions.len(), MAX_DEFERRED_ACTIONS);
         shell.notice = Notice::Message(MessageId::StatusReady);
-        shell.defer_action(NavigationAction::Parent);
+        shell.defer_action(
+            NavigationCommand::new(GenerationId::new(1), NavigationAction::Parent),
+            Some(1),
+        );
         assert_eq!(shell.deferred_actions.len(), MAX_DEFERRED_ACTIONS);
         assert_eq!(shell.notice, Notice::Message(MessageId::CommandBusy));
         // Without a frame the retries drain one per frame and are dropped.
@@ -2938,8 +4186,12 @@ mod tests {
         let backend = FixtureBackend { root: fixture_root(), delay: Duration::ZERO };
         let (mut shell, ctx) = headless_shell_with(backend, bridge.sink(), Some(fixture_root()));
         assert_eq!(shell.scan_state(), ScanUi::Resolving);
-        pump_until(&mut shell, &ctx, "the fixture scan to complete", |shell| {
-            shell.scan_state() == ScanUi::Complete
+        pump_until(&mut shell, &ctx, "the fixture scan and list to complete", |shell| {
+            completed_fixture_frame(shell)
+                && !shell.list_cache.rows.is_empty()
+                && shell.list_cache.key.as_ref().is_some_and(|key| {
+                    Some(key.revision) == shell.runtime.as_ref().unwrap().displayed_revision()
+                })
         });
         let completed = wait_for_code(&seen, DiagnosticCode::ScanCompleted);
         assert!(completed.fields().any(|field| matches!(field, DiagnosticField::FileCount(49))));
@@ -3140,6 +4392,460 @@ mod tests {
     }
 
     #[test]
+    fn unknown_and_partial_sizes_are_never_exact_zero_in_either_locale() {
+        for locale in Locale::ALL {
+            let strings = UiStrings::new(&I18n::new(locale).unwrap());
+            assert_eq!(
+                size_summary_text(0, 1, false, locale, &strings),
+                strings.get(MessageId::UnknownSize)
+            );
+            assert_eq!(
+                size_summary_text(0, 0, true, locale, &strings),
+                strings.get(MessageId::UnknownSize)
+            );
+            assert!(
+                size_summary_text(100, 1, false, locale, &strings)
+                    .starts_with(strings.get(MessageId::AtLeast))
+            );
+            assert!(
+                size_summary_text(100, 0, true, locale, &strings)
+                    .starts_with(strings.get(MessageId::AtLeast))
+            );
+            assert_eq!(
+                size_summary_text(0, 0, false, locale, &strings),
+                format_iec_bytes(0, locale)
+            );
+        }
+    }
+
+    #[test]
+    fn same_revision_and_root_cannot_reuse_another_generations_list() {
+        let key = ItemListKey {
+            generation: GenerationId::new(7),
+            revision: 3,
+            root: NodeId::from_raw(0),
+            size_basis: SizeBasis::Allocated,
+            sort: ItemSort::Size,
+            direction: SortDirection::Descending,
+            query: String::new(),
+        };
+        assert!(list_key_matches(
+            &key,
+            GenerationId::new(7),
+            Some(3),
+            key.root,
+            key.size_basis,
+            ""
+        ));
+        assert!(!list_key_matches(
+            &key,
+            GenerationId::new(8),
+            Some(3),
+            key.root,
+            key.size_basis,
+            ""
+        ));
+        assert!(!list_key_matches(&key, key.generation, Some(3), key.root, SizeBasis::Logical, ""));
+        assert!(!list_key_matches(&key, key.generation, Some(3), key.root, key.size_basis, "new"));
+    }
+
+    #[test]
+    fn list_search_and_keyboard_reach_children_beyond_two_hundred() {
+        struct ManyFiles;
+        impl ScanFs for ManyFiles {
+            fn visit_directory(
+                &self,
+                _: &Path,
+                visitor: &mut dyn FnMut(diskpie_scan::DirectoryItem) -> diskpie_scan::VisitControl,
+            ) -> Result<(), diskpie_scan::FsError> {
+                for index in 0..600 {
+                    if visitor(FixtureFs::entry(
+                        &format!("file-{index:05}"),
+                        EntryKind::File,
+                        600 - index,
+                    )) == diskpie_scan::VisitControl::Stop
+                    {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+        }
+        let (mut shell, ctx) = headless_shell(None);
+        settle(&mut shell, &ctx);
+        shell.launch(ResolvedLaunch {
+            fs: Arc::new(ManyFiles),
+            requested_paths: vec![fixture_root()],
+            roots: vec![ScanRoot::new(
+                fixture_root(),
+                diskpie_core::VolumeKey::new(1),
+                diskpie_scan::StorageClass::Unknown,
+            )],
+            cancel: CancelToken::new(),
+            displays: Vec::new(),
+            issues: Vec::new(),
+            failures: Vec::new(),
+        });
+        pump_until(&mut shell, &ctx, "all list rows", |shell| {
+            shell.list_cache.rows.len() == 600
+                && matches!(shell.runtime.as_ref().unwrap().state(), RuntimeState::Settled { .. })
+                && shell.list_cache.key.as_ref().is_some_and(|key| {
+                    Some(key.revision) == shell.runtime.as_ref().unwrap().displayed_revision()
+                })
+        });
+        let target = shell.list_cache.rows[400];
+        let next = shell.list_cache.rows[401];
+        shell.navigate(NavigationAction::Select(target));
+        shell.logic(&ctx);
+        shell.refresh_frame_caches();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            shell.inspector(ui);
+        });
+        let runtime = shell.runtime.as_ref().unwrap();
+        let row_id = item_row_id(
+            runtime.snapshot().unwrap().generation(),
+            runtime.displayed_revision(),
+            target,
+        );
+        ctx.memory_mut(|memory| memory.request_focus(row_id));
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            shell.inspector(ui);
+        });
+        assert_eq!(
+            shell.focused_list_row,
+            Some((row_id, target)),
+            "the virtual row really holds egui focus"
+        );
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: Key::ArrowDown,
+            physical_key: Some(Key::ArrowDown),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        });
+        let _ = ctx.run_ui(input, |ui| {
+            shell.inspector(ui);
+        });
+        assert_eq!(shell.runtime.as_ref().unwrap().navigation().unwrap().selected(), Some(next));
+        shell.item_query = "FiLe-00599".to_owned();
+        pump_until(&mut shell, &ctx, "case insensitive last item", |shell| {
+            shell.list_cache.key.as_ref().is_some_and(|key| key.query == "FiLe-00599")
+                && shell.list_cache.rows.len() == 1
+        });
+        let snapshot = shell.runtime.as_ref().unwrap().snapshot().unwrap();
+        assert_eq!(display_name(snapshot.node(shell.list_cache.rows[0]).unwrap()), "file-00599");
+        shell.item_query.clear();
+        shell.refresh_list_cache();
+        shell.item_query = "FiLe-00599".to_owned();
+        pump_until(&mut shell, &ctx, "obsolete list completion", |shell| {
+            shell.list_requested.is_none()
+        });
+        shell.item_query.clear();
+        pump_until(&mut shell, &ctx, "return to discarded query", |shell| {
+            shell.list_cache.key.as_ref().is_some_and(|key| key.query.is_empty())
+                && shell.list_cache.rows.len() == 600
+        });
+        shell.begin_shutdown();
+    }
+
+    #[test]
+    fn deferred_navigation_never_rebinds_a_reused_node_to_a_new_snapshot() {
+        let backend = FixtureBackend { root: fixture_root(), delay: Duration::ZERO };
+        let (mut shell, ctx) =
+            headless_shell_with(backend, DiagnosticSink::disconnected(), Some(fixture_root()));
+        pump_until(&mut shell, &ctx, "first tree", |shell| {
+            completed_fixture_frame(shell)
+                && !shell.list_cache.rows.is_empty()
+                && shell.list_cache.key.as_ref().is_some_and(|key| {
+                    Some(key.revision) == shell.runtime.as_ref().unwrap().displayed_revision()
+                })
+        });
+        let runtime = shell.runtime.as_ref().unwrap();
+        let old_revision = runtime.displayed_revision();
+        let old_node = shell.list_cache.rows[0];
+        let old_command = runtime.navigation_command(NavigationAction::Activate(old_node)).unwrap();
+        let replacement = PathBuf::from(r"C:\fixture\replacement");
+        shell.launch(ResolvedLaunch {
+            fs: Arc::new(FixtureFs { root: replacement.clone(), delay: Duration::ZERO }),
+            requested_paths: vec![replacement.clone()],
+            roots: vec![ScanRoot::new(
+                replacement.clone(),
+                diskpie_core::VolumeKey::new(1),
+                diskpie_scan::StorageClass::Unknown,
+            )],
+            cancel: CancelToken::new(),
+            displays: vec![format_path_for_display(&replacement)],
+            issues: Vec::new(),
+            failures: Vec::new(),
+        });
+        pump_until(&mut shell, &ctx, "replacement tree", |shell| {
+            completed_fixture_frame(shell)
+                && shell.runtime.as_ref().unwrap().snapshot().unwrap().generation()
+                    != old_command.generation()
+        });
+        let runtime = shell.runtime.as_ref().unwrap();
+        let root = runtime.navigation().unwrap().view_root();
+        assert!(runtime.snapshot().unwrap().node(old_node).is_some(), "node ID was reused");
+        shell.defer_action(old_command, old_revision);
+        shell.retry_deferred_action();
+        assert!(shell.deferred_actions.is_empty());
+        assert_eq!(shell.runtime.as_ref().unwrap().navigation().unwrap().view_root(), root);
+        let runtime = shell.runtime.as_ref().unwrap();
+        let command = runtime.navigation_command(NavigationAction::Activate(old_node)).unwrap();
+        let stale_revision = runtime.displayed_revision().map(|revision| revision + 1);
+        shell.defer_action(command, stale_revision);
+        shell.retry_deferred_action();
+        assert!(shell.deferred_actions.is_empty());
+        assert_eq!(shell.runtime.as_ref().unwrap().navigation().unwrap().view_root(), root);
+    }
+
+    #[test]
+    fn focused_folder_row_space_selects_and_enter_navigates() {
+        let backend = FixtureBackend { root: fixture_root(), delay: Duration::ZERO };
+        let (mut shell, ctx) =
+            headless_shell_with(backend, DiagnosticSink::disconnected(), Some(fixture_root()));
+        pump_until(&mut shell, &ctx, "fixture list", |shell| {
+            completed_fixture_frame(shell)
+                && !shell.list_cache.rows.is_empty()
+                && shell.list_cache.key.as_ref().is_some_and(|key| {
+                    Some(key.revision) == shell.runtime.as_ref().unwrap().displayed_revision()
+                })
+        });
+        let runtime = shell.runtime.as_ref().unwrap();
+        let snapshot = runtime.snapshot().unwrap();
+        let root = runtime.navigation().unwrap().view_root();
+        let folder = shell
+            .list_cache
+            .rows
+            .iter()
+            .copied()
+            .find(|node| snapshot.node(*node).unwrap().kind() == EntryKind::Directory)
+            .unwrap();
+        let row_id = item_row_id(snapshot.generation(), runtime.displayed_revision(), folder);
+        shell.navigate(NavigationAction::Select(folder));
+        shell.scroll_to_selection = true;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| shell.inspector(ui));
+        ctx.memory_mut(|memory| memory.request_focus(row_id));
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| shell.inspector(ui));
+        assert_eq!(shell.focused_list_row, Some((row_id, folder)));
+        shell.navigate(NavigationAction::ClearSelection);
+        let key_input = |key| {
+            let mut input = egui::RawInput::default();
+            input.events.push(egui::Event::Key {
+                key,
+                physical_key: Some(key),
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            });
+            input
+        };
+        let _ = ctx.run_ui(key_input(Key::Space), |ui| shell.inspector(ui));
+        let navigation = shell.runtime.as_ref().unwrap().navigation().unwrap();
+        assert_eq!(navigation.selected(), Some(folder));
+        assert_eq!(navigation.view_root(), root, "Space must not zoom or open a folder");
+        let _ = ctx.run_ui(key_input(Key::Enter), |ui| shell.inspector(ui));
+        pump_until(&mut shell, &ctx, "folder keyboard zoom", |shell| {
+            shell.runtime.as_ref().unwrap().navigation().unwrap().view_root() == folder
+        });
+    }
+
+    #[test]
+    fn pending_metric_requests_keep_values_and_partial_share_on_committed_basis() {
+        use diskpie_app::navigation::NavigationState;
+        use diskpie_core::{
+            MetricSource, NodeSpec, OwnMetrics, SizeMetric, TreeBuilder, UnknownReason,
+        };
+
+        let mut builder = TreeBuilder::new(GenerationId::new(1));
+        let root = builder.add_root(NodeSpec::root("fixture")).unwrap();
+        builder
+            .add_child(
+                root,
+                NodeSpec::file(
+                    "known",
+                    OwnMetrics::new(
+                        SizeMetric::known(1024, MetricSource::NativeFileInformation),
+                        SizeMetric::known(4096, MetricSource::FilesystemAllocation),
+                    ),
+                ),
+            )
+            .unwrap();
+        builder
+            .add_child(
+                root,
+                NodeSpec::file(
+                    "unknown-logical",
+                    OwnMetrics::new(
+                        SizeMetric::unknown(
+                            UnknownReason::AccessDenied,
+                            MetricSource::NativeFileInformation,
+                        ),
+                        SizeMetric::known(4096, MetricSource::FilesystemAllocation),
+                    ),
+                ),
+            )
+            .unwrap();
+        let snapshot = Arc::new(builder.freeze().unwrap());
+        let record = snapshot.node(root).unwrap();
+        let mut navigation = NavigationState::new(Arc::clone(&snapshot)).unwrap();
+        let locale = Locale::EnglishUnitedStates;
+        let strings = UiStrings::new(&I18n::new(locale).unwrap());
+
+        // A new preference can arrive while the published layout is still logical.
+        let basis = display_size_basis(Some(&navigation), SizeBasis::Allocated);
+        assert_eq!(basis, SizeBasis::Logical);
+        assert!(share_is_partial(record, basis));
+        assert_eq!(node_compact_size_text(record, basis, locale, &strings), "≥ 1 KiB");
+
+        navigation
+            .execute(navigation.command(NavigationAction::SetSizeBasis(SizeBasis::Allocated)))
+            .unwrap();
+        // A rapid second request must likewise keep the newly committed allocated view.
+        let basis = display_size_basis(Some(&navigation), SizeBasis::Logical);
+        assert_eq!(basis, SizeBasis::Allocated);
+        assert!(!share_is_partial(record, basis));
+        assert_eq!(node_compact_size_text(record, basis, locale, &strings), "8 KiB");
+    }
+
+    #[test]
+    fn complete_worker_summary_does_not_claim_partial_displayed_results_are_complete() {
+        use diskpie_core::ScanState;
+        assert_eq!(
+            committed_phase_message(ScanUi::Complete, Some(ScanState::Partial)),
+            MessageId::PartialResults
+        );
+        assert_eq!(
+            committed_phase_message(ScanUi::Complete, Some(ScanState::Cancelled)),
+            phase_message(ScanUi::CancelledWithResults)
+        );
+        assert_eq!(
+            committed_phase_message(ScanUi::Complete, Some(ScanState::Complete)),
+            MessageId::Complete
+        );
+        assert_eq!(
+            committed_phase_message(ScanUi::Resolving, Some(ScanState::Partial)),
+            MessageId::Resolving
+        );
+    }
+
+    #[test]
+    fn optional_table_and_appearance_preferences_are_persisted_together() {
+        let (mut shell, ctx) = headless_shell(None);
+        settle(&mut shell, &ctx);
+        shell.show_item_list = true;
+        shell.item_list_width_points = 360;
+        shell.show_both_sizes = false;
+        shell.theme_preference = ThemePreference::Light;
+        shell.select_locale(Locale::SpanishMexico);
+        shell.synchronize_settings();
+        let settings = shell.settings.settings();
+        assert!(settings.show_item_list);
+        assert_eq!(settings.item_list_width_points, 360);
+        assert!(!settings.show_both_sizes);
+        assert_eq!(settings.theme, SettingsTheme::Light);
+        assert_eq!(settings.locale, SettingsLocale::SpanishMexico);
+    }
+
+    #[test]
+    fn renewed_shell_fits_minimum_viewport_and_keeps_toolbar_and_status_fixed() {
+        let backend = FixtureBackend { root: fixture_root(), delay: Duration::ZERO };
+        let (mut shell, ctx) =
+            headless_shell_with(backend, DiagnosticSink::disconnected(), Some(fixture_root()));
+        pump_until(&mut shell, &ctx, "fixture", completed_fixture_frame);
+        for (size, list) in [
+            (Vec2::new(1280.0, 850.0), false),
+            (Vec2::new(1280.0, 850.0), true),
+            (Vec2::new(800.0, 600.0), true),
+            (Vec2::new(799.0, 600.0), true),
+            (Vec2::new(800.0, 600.0), false),
+        ] {
+            shell.show_item_list = list;
+            for _ in 0..3 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, size)),
+                    ..Default::default()
+                };
+                let _ = ctx.run_ui(input, |ui| {
+                    shell.command_rail(ui);
+                    shell.telemetry_rail(ui);
+                    shell.status_rail(ui);
+                    shell.workspace(ui);
+                    assert!(
+                        ui.min_rect().right() <= size.x + 1.0,
+                        "horizontal overflow at {size:?}: {:?}",
+                        ui.min_rect()
+                    );
+                    assert!(
+                        ui.min_rect().bottom() <= size.y + 1.0,
+                        "vertical overflow at {size:?}: {:?}",
+                        ui.min_rect()
+                    );
+                });
+            }
+            let top =
+                egui::containers::panel::PanelState::load(&ctx, egui::Id::new("command-rail"))
+                    .unwrap();
+            let bottom =
+                egui::containers::panel::PanelState::load(&ctx, egui::Id::new("status-rail"))
+                    .unwrap();
+            assert_eq!(top.outer_rect.height(), 40.0);
+            assert_eq!(bottom.outer_rect.height(), 28.0);
+            assert!(top.outer_rect.right() <= size.x);
+            assert!(bottom.outer_rect.right() <= size.x);
+        }
+    }
+
+    #[test]
+    fn context_targets_expire_with_snapshot_revision_and_generation() {
+        let backend = FixtureBackend { root: fixture_root(), delay: Duration::ZERO };
+        let (mut shell, ctx) =
+            headless_shell_with(backend, DiagnosticSink::disconnected(), Some(fixture_root()));
+        pump_until(&mut shell, &ctx, "fixture", completed_fixture_frame);
+        let runtime = shell.runtime.as_ref().unwrap();
+        let generation = runtime.snapshot().unwrap().generation();
+        let revision = runtime.displayed_revision().unwrap();
+        let node = runtime.navigation().unwrap().view_root();
+        let selected = runtime.navigation().unwrap().selected();
+        for seal in [
+            (generation, revision + 1, node),
+            (GenerationId::new(generation.get() + 1), revision, node),
+        ] {
+            shell.context_node = Some(seal);
+            let _ =
+                ctx.run_ui(egui::RawInput::default(), |ui| shell.chart_lens(ui, ScanUi::Complete));
+            assert!(
+                shell.context_node.is_none(),
+                "stale menu cannot emit an action for a reused node"
+            );
+            assert_eq!(shell.runtime.as_ref().unwrap().navigation().unwrap().selected(), selected);
+        }
+        assert_ne!(
+            item_row_id(generation, Some(revision), node),
+            item_row_id(generation, Some(revision + 1), node)
+        );
+        shell.interaction_generation = Some(GenerationId::new(generation.get() + 1));
+        shell.focused = Some(node);
+        shell.hovered_item = Some(node);
+        shell.refresh_frame_caches();
+        assert_eq!(shell.focused, selected);
+        assert_eq!(shell.hovered_item, None);
+        let snapshot = shell.runtime.as_ref().unwrap().snapshot().unwrap();
+        let root = snapshot.node(node).unwrap();
+        assert_eq!(compact_node_name(root, &shell.strings), "tree");
+        assert_eq!(primary_navigation(snapshot, node), NavigationAction::Activate(node));
+        let file = snapshot
+            .nodes()
+            .iter()
+            .enumerate()
+            .find(|(_, record)| record.kind() == EntryKind::File)
+            .map(|(index, _)| NodeId::from_raw(index as u32))
+            .unwrap();
+        assert_eq!(primary_navigation(snapshot, file), NavigationAction::Select(file));
+    }
+
+    #[test]
     fn startup_path_goes_through_the_resolver_and_reports_typed_failure() {
         let (mut shell, ctx) = headless_shell(Some(PathBuf::from(r"C:\fixture\missing")));
         assert_eq!(shell.scan_state(), ScanUi::Resolving);
@@ -3167,4 +4873,9 @@ mod tests {
         shell.begin_shutdown();
         assert!(shell.shutdown_requested);
     }
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/diskpie-bench/ui_frames.inc.rs"));
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tools/diskpie-bench/visual_matrix.inc.rs"
+    ));
 }
