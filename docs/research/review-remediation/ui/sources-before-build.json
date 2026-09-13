@@ -1,0 +1,298 @@
+{
+  "DateUTC": "2026-09-07T23:21:47.1910884Z",
+  "Toolchain": "rustc 1.97.1 (8bab26f4f 2026-07-14)\r\nbinary: rustc\r\ncommit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\r\ncommit-date: 2026-07-14\r\nhost: x86_64-pc-windows-msvc\r\nrelease: 1.97.1\r\nLLVM version: 22.1.6\r\n",
+  "Sources": [
+    {
+      "Path": ".cargo\\config.toml",
+      "SHA256": "5E32A57DFBD159E0E7E5857673B1CF3B00CA1423A0722D3E853DCDFED4DA92BA"
+    },
+    {
+      "Path": "assets\\brand\\diskpie-icon.ico",
+      "SHA256": "01646F61E652B031EED73BA963445496176FB24D87B445509881DF90C83FCC2D"
+    },
+    {
+      "Path": "assets\\brand\\diskpie-icon.png",
+      "SHA256": "A0638005C85BE8C68AA763D3BA8707E865D243FFED60FA5043C2FC50E8028A5F"
+    },
+    {
+      "Path": "assets\\brand\\README.md",
+      "SHA256": "618263987093F5502397DB91C2267C8D68DE5AA972377FC695A110E881C49839"
+    },
+    {
+      "Path": "Cargo.lock",
+      "SHA256": "C82749C5173077D35FF455FA2BCB6907647F4B5E32C5EBA75870D0DE4FF0F76F"
+    },
+    {
+      "Path": "Cargo.toml",
+      "SHA256": "835D170C2BAB42CC52CC5C0A4C5148DA376721D5BF50CFEDDF6B8DFE6966622C"
+    },
+    {
+      "Path": "crates\\diskpie-app\\Cargo.toml",
+      "SHA256": "503351E657D77711563537C56BDAB38D3FA97A5D705059EDE83D7355793F01B8"
+    },
+    {
+      "Path": "crates\\diskpie-app\\i18n\\en-US.ftl",
+      "SHA256": "7B99C922D1F0B3BB66F757AC7736CA17C5FEBFCE653EEB3D963B5D7A0CA994C8"
+    },
+    {
+      "Path": "crates\\diskpie-app\\i18n\\es-MX.ftl",
+      "SHA256": "874D5C2A741A61A84A6644018EA7A5602E6BC9551AFB2CDEC76799BD1173E7E8"
+    },
+    {
+      "Path": "crates\\diskpie-app\\src\\actions.rs",
+      "SHA256": "32A16EADE068069B9ADAEC74FB51434CCDF1ACCEDA0FFB0F8F08804DF7F1BACF"
+    },
+    {
+      "Path": "crates\\diskpie-app\\src\\branch_rescan.rs",
+      "SHA256": "106B8D4A0EE48C20422454A5DCDF580498D4D01B8D9E2EB0043FCD1357827CC9"
+    },
+    {
+      "Path": "crates\\diskpie-app\\src\\diagnostics\\events.rs",
+      "SHA256": "7FC799B417BEA27265A7F9F6D7FBA90EF892E0B548BDFE0D94028F8024DA6E59"
+    },
+    {
+      "Path": "crates\\diskpie-app\\src\\diagnostics\\export.rs",
+      "SHA256": "898F70892EF19C61D684E93378830EBC121ECB08F0EC668605CF7A5AA888FF33"
+    },
+    {
+      "Path": "crates\\diskpie-app\\src\\diagnostics\\mod.rs",
+      "SHA256": "E887588580012B6F21462FF6B205BB2D7195B3B050A7B6AB4691038097119871"
+    },
+    {
+      "Path": "crates\\diskpie-app\\src\\diagnostics\\redaction.rs",
+      "SHA256": "3D9C40345F40D874BE6FF3A0E30476602EEAA316FFAA2AB33D90A81AC9850CAF"
+    },
+    {
+      "Path": "crates\\diskpie-app\\src\\explorer_integration.rs",
+      "SHA256": "CB622200140D4EB505C3C2C0BC96AA006C5D0F802A185C8FCDD12B8064654324"
+    },
+    {
+      "Path": "crates\\diskpie-app\\src\\format.rs",
+      "SHA256": "23EC4222819E5E9E3FA56DA5BD5736E0AFA70E7095B7F8C40C7FE6D2CB95F951"
+    },
+    {
+      "Path": "crates\\diskpie-app\\src\\i18n.rs",
+      "SHA256": "010D836588D72FE61DC037AA535C4BA2783CB2D316CBE94FD76B66CCF93789C2"
+    },
+    {
+      "Path": "crates\\diskpie-app\\src\\item_list_service.rs",
+      "SHA256": "45C1501BBA9A0BA6AFF3F9892A7F2B688557CA538193B29A3CC55DE0015B0E18"
+    },
+    {
+      "Path": "crates\\diskpie-app\\src\\layout_service.rs",
+      "SHA256": "3C194728B4E4EAC3EFF49C6504D412085D4AF0CCD16D628AF409B4BBD4ACF17F"
+    },
+    {
+      "Path": "crates\\diskpie-app\\src\\lib.rs",
+      "SHA256": "A4A152249891A1E1E96D90D27A15DDE084BA5C52A28D0ACD41A6928A0A561886"
+    },
+    {
+      "Path": "crates\\diskpie-app\\src\\navigation.rs",
+      "SHA256": "022A7863140BB1C7DB825705DA6CDF1E9F61ABA2EA0A440E51DD170FFECE92F2"
+    },
+    {
+      "Path": "crates\\diskpie-app\\src\\presentation.rs",
+      "SHA256": "1DDFB8599B3FA14B8D3FEA5DE4095F7F0691BC869B779BBABBB1F159BB156C2D"
+    },
+    {
+      "Path": "crates\\diskpie-app\\src\\runtime.rs",
+      "SHA256": "32C704F94BDAFCF1F66F6EB9AFE240861037EEADCB5852AB8B1D80EEB8D073CD"
+    },
+    {
+      "Path": "crates\\diskpie-app\\src\\session.rs",
+      "SHA256": "DA6A752FE9A3D410955BC4D3DFBCB3880EA83D38850F05BB571131CFBD48AE4C"
+    },
+    {
+      "Path": "crates\\diskpie-app\\src\\settings.rs",
+      "SHA256": "B558E610547102BA245A4B9C0AFA58DAD15DCED02289EF793CA6B4BC94AE2391"
+    },
+    {
+      "Path": "crates\\diskpie-core\\Cargo.toml",
+      "SHA256": "C1CF5940A0F5A0B00D8F9BBB1824983804F33C467187C339FB521721D8DAF3F3"
+    },
+    {
+      "Path": "crates\\diskpie-core\\src\\lib.rs",
+      "SHA256": "03205A5C65AB16A0B80ADF15D20902AB1F7BF699CA52E1D7148E8FC40DCCA18F"
+    },
+    {
+      "Path": "crates\\diskpie-core\\src\\model.rs",
+      "SHA256": "FE0D732C9BF865C4537D304F866C85F3B8C852D79496B04320459201BA94CBC6"
+    },
+    {
+      "Path": "crates\\diskpie-core\\src\\sunburst.rs",
+      "SHA256": "0494ACDFCB2C97EC9E4D290B112AE438CED7D428A332BFB72F9B69EA5E3F3FCB"
+    },
+    {
+      "Path": "crates\\diskpie-platform\\Cargo.toml",
+      "SHA256": "0E90430A2B9BB78CAC57170442572F94C335F3B3399E73A3B9C73E538FAD5794"
+    },
+    {
+      "Path": "crates\\diskpie-platform\\src\\lib.rs",
+      "SHA256": "6F9079DA38104623DF4AC112CC4BC0ADC3FD0BF4ACECF2177CA92D64DAC55662"
+    },
+    {
+      "Path": "crates\\diskpie-platform\\src\\windows\\batch_prototype.rs",
+      "SHA256": "061C818D8810C224BC3495C21AF3F1B52CDAF9AA325369AF625BBC2CF550306D"
+    },
+    {
+      "Path": "crates\\diskpie-platform\\src\\windows\\diagnostic_files.rs",
+      "SHA256": "C1A21571BE9214323F1241AD69E404E87184256D7F55B48868E7093595BC0671"
+    },
+    {
+      "Path": "crates\\diskpie-platform\\src\\windows\\explorer_integration.rs",
+      "SHA256": "B8FFEB230AB88C09904C9790C23BFC435D82E7F30CCDE91EE79BB0E2BCB023C7"
+    },
+    {
+      "Path": "crates\\diskpie-platform\\src\\windows\\filesystem.rs",
+      "SHA256": "D105F316A10B89B9AEB9BEA642A8D0064583C0641C0D41DC6F7D321BEF32DB6F"
+    },
+    {
+      "Path": "crates\\diskpie-platform\\src\\windows\\project_paths.rs",
+      "SHA256": "8F6C0DDB871A53B387C3A62704A6FFFB1625E8B04C14B4D23CB67CF09BAF590E"
+    },
+    {
+      "Path": "crates\\diskpie-platform\\src\\windows\\settings_file.rs",
+      "SHA256": "8511A7DB1B3DD1B8455362A41153458C02E0088A1527CA3E4E3200B48A8550E7"
+    },
+    {
+      "Path": "crates\\diskpie-platform\\src\\windows\\shell_actions.rs",
+      "SHA256": "3287B036CF54C8AF802E75C91ADB182B3EA024275E2D11B0B1F3A427C4A4BB86"
+    },
+    {
+      "Path": "crates\\diskpie-platform\\src\\windows\\shell_service.rs",
+      "SHA256": "426E14BC8961986F63ADED52CC323ECB4341F7DFCF2CD14AB104AB26D3A5A85D"
+    },
+    {
+      "Path": "crates\\diskpie-platform\\src\\windows\\startup_feedback.rs",
+      "SHA256": "8611088CEBF88E4F982BBCA7D3657B1C44271A0D1C5C690090E354AFF36DBF72"
+    },
+    {
+      "Path": "crates\\diskpie-platform\\src\\windows\\volumes.rs",
+      "SHA256": "88989D090373A04D833E3146D10207BD14C0BA570AE600BCFDA2A404AD091CFA"
+    },
+    {
+      "Path": "crates\\diskpie-platform\\tests\\scan_integration.rs",
+      "SHA256": "DDCB59147707668AF7D349FA5A6D9633F6657503B1E29DC2EE367E7879C2B3A9"
+    },
+    {
+      "Path": "crates\\diskpie-scan\\Cargo.toml",
+      "SHA256": "2EB54FD906229D31F443900E2A1B7B3763E8071079F9264643D7764F527AC814"
+    },
+    {
+      "Path": "crates\\diskpie-scan\\src\\coordinator.rs",
+      "SHA256": "8D367C7D9F16780D73FE16AF81D1455F911CC2021951161497AFD85B61317205"
+    },
+    {
+      "Path": "crates\\diskpie-scan\\src\\fs.rs",
+      "SHA256": "3A4418F42F7F1D09CAA8EA0B3C5771AF7366F9962A3654DB7B475CC5F80FC020"
+    },
+    {
+      "Path": "crates\\diskpie-scan\\src\\lib.rs",
+      "SHA256": "562E216C4D4D68DA7AC7E3261267DDC0F269D0186DA86EB82A67ACA97F51FB79"
+    },
+    {
+      "Path": "crates\\diskpie-scan\\src\\protocol.rs",
+      "SHA256": "97CD434839A001A873ACD26E4FEDFBA5764D6FDFD8172667FF4DE238CACB817A"
+    },
+    {
+      "Path": "crates\\diskpie-scan\\src\\tests.rs",
+      "SHA256": "9770DB4E3CAAD0CB0A8D02B1AA47B10FC5FED68F38B1961E89502372E9F90743"
+    },
+    {
+      "Path": "crates\\diskpie\\build.rs",
+      "SHA256": "9D16CC4625583D10C39A15E4FB10926017A43DFA75EF0888CE396B7881BE82D6"
+    },
+    {
+      "Path": "crates\\diskpie\\Cargo.toml",
+      "SHA256": "D13FBB5B47CC7CEBDFBDA914370496345B1213CBC92E88E4933BC4ACFF9A1F50"
+    },
+    {
+      "Path": "crates\\diskpie\\diskpie.manifest",
+      "SHA256": "F957913C0BDAA1C5E2D07837E20DAE8C56809A4E30DE85574191D41CC0DAE2F2"
+    },
+    {
+      "Path": "crates\\diskpie\\src\\cli.rs",
+      "SHA256": "AF580551EE2A4C0C009B560B139CF84D918AFE9E21289AE4FB6C49A4F96C8922"
+    },
+    {
+      "Path": "crates\\diskpie\\src\\diagnostic_sink.rs",
+      "SHA256": "438CD5129C0827835CB0980B811E2E97AAAFC368EC6FCDFFDC98893CD3E76FAA"
+    },
+    {
+      "Path": "crates\\diskpie\\src\\fonts.rs",
+      "SHA256": "A5FAC8DACC0C6839854B90DB82481B4750BDAC7210CBD9B1A07221F128072FDA"
+    },
+    {
+      "Path": "crates\\diskpie\\src\\local_diagnostics.rs",
+      "SHA256": "C56E96F0D734F64D41F56E400F9F2128D0A033D02F3878F2B337A79A9F81A66A"
+    },
+    {
+      "Path": "crates\\diskpie\\src\\main.rs",
+      "SHA256": "3DBB875CF187DBD4F05A2EEC1499FB34D71D35550D6A07FEA74E087824BE7996"
+    },
+    {
+      "Path": "crates\\diskpie\\src\\panic_marker.rs",
+      "SHA256": "FEEC822DF94DF166A2B5AD6C0E86E0CC775506779D6781BF3CAC36A06AB7CA00"
+    },
+    {
+      "Path": "crates\\diskpie\\src\\resolver.rs",
+      "SHA256": "8B907C74BB03075B0008963E68B16A69B24C4E82C8BF27EF170F59B9C2FBE822"
+    },
+    {
+      "Path": "crates\\diskpie\\src\\scan_ui.rs",
+      "SHA256": "112020B0E7549FFB1B970D1E0BF65E78137EFCDA5AACBB5BEFBD781178F163E1"
+    },
+    {
+      "Path": "crates\\diskpie\\src\\shell.rs",
+      "SHA256": "7C5AD175D1F92FA1A09AE5A905F717F636070FD291B45B92F25F4640EFE0D73C"
+    },
+    {
+      "Path": "crates\\diskpie\\src\\shell\\actions_ui.rs",
+      "SHA256": "B99301E28E78E0DCCD68BE9F03280D6D8A5930652F17169A0137090E9CD912FB"
+    },
+    {
+      "Path": "crates\\diskpie\\src\\shell\\support_ui.rs",
+      "SHA256": "ACF95AE265367957A712958D1E3EC00EE37A8D047F7C8189D9C7723F1F5128D0"
+    },
+    {
+      "Path": "crates\\diskpie\\src\\storage.rs",
+      "SHA256": "1FD0C456641B8C07F9DDE13458C07C5BABCBD4C170948FDFD5023EBF26A4CE41"
+    },
+    {
+      "Path": "crates\\diskpie\\src\\sunburst_view.rs",
+      "SHA256": "ADADF6C02F560D37F3ACE69EB20DDDAFF8FE1E7A05A3C90D9C37DE117F940B0C"
+    },
+    {
+      "Path": "crates\\diskpie\\src\\support_service.rs",
+      "SHA256": "B501C9C15282F09308B39A54B2D0937A10F89282F2D32D4420CCFC287880DDC9"
+    },
+    {
+      "Path": "crates\\diskpie\\src\\theme.rs",
+      "SHA256": "61C7979624B5BDDC9013A6C78DB2E27602C6C005AFB1C5D062083301C6AE77E6"
+    },
+    {
+      "Path": "rust-toolchain.toml",
+      "SHA256": "DAFAE8F49387948AE1527C41C6B846ACC184B10205EB41719DC5835E38D0F9D1"
+    },
+    {
+      "Path": "tools\\diskpie-bench\\Cargo.lock",
+      "SHA256": "E9E597893ADF98A4CACBEE2D5CD760532C07B6F4C70D7F8E835B7962D55F2E4E"
+    },
+    {
+      "Path": "tools\\diskpie-bench\\Cargo.toml",
+      "SHA256": "204F210733D84405E55A8C8304983FAA545FA79126A972AF1D4BDC1076D3AAA0"
+    },
+    {
+      "Path": "tools\\diskpie-bench\\src\\main.rs",
+      "SHA256": "D2882D1DD2BCA6E3CA476A89E6C732A2685AE52A1714EDA87CA5BEAD417E226C"
+    },
+    {
+      "Path": "tools\\diskpie-bench\\ui_frames.inc.rs",
+      "SHA256": "333605F6328DE3B0B3E55BC640CC0D05C9F8CE104F4D020089096FAFD0A794CE"
+    },
+    {
+      "Path": "tools\\diskpie-bench\\visual_matrix.inc.rs",
+      "SHA256": "E29BEBD7A5C28276BF2B47F7CFFB6B5276C9E8CCB6E9050492E807AC820266A8"
+    }
+  ]
+}

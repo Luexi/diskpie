@@ -1,0 +1,10 @@
+{
+  "DateUTC": "2026-09-06T19:19:34.1042905Z",
+  "Format": "passed",
+  "Clippy": "workspace/all-targets/all-features/locked; -D warnings; passed",
+  "Tests": "555 passed (554 unit/integration + 1 rustdoc), 8 explicit ignored entry points",
+  "Rustdoc": "workspace/no-deps/locked; RUSTDOCFLAGS=-D warnings; passed",
+  "Release": "diskpie/release/locked; passed",
+  "BinarySHA256": "3E2025177C82B52860132A2D034FE1AEC11EF396EF1358274507D75F1E5EE925",
+  "BinaryBytes": 10930688
+}

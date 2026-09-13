@@ -1,0 +1,37 @@
+[
+  {
+    "Algorithm": "SHA256",
+    "Hash": "F454A155EFF6F956428C74F12ECA69F345FC8FD871366AB20F7296853D7C9818",
+    "Path": "C:\\Users\\Luis\\Desktop\\scan\\diskpie\\target\\review-ui-perf-after-20260907-v2\\worker-probe\\main.rs"
+  },
+  {
+    "Algorithm": "SHA256",
+    "Hash": "B6EEAC84C23AF3939F2DB0A26CA4DE49E759523A3758A673AB7F1F4BB379B721",
+    "Path": "C:\\Users\\Luis\\Desktop\\scan\\diskpie\\target\\review-ui-perf-after-20260907-v2\\worker-probe\\before.exe"
+  },
+  {
+    "Algorithm": "SHA256",
+    "Hash": "8F7595115EC94F2BDFB8251CDEC9771A5C224B3536F1F7306658486C5CDD21CE",
+    "Path": "C:\\Users\\Luis\\Desktop\\scan\\diskpie\\target\\review-ui-perf-after-20260907-v2\\worker-probe\\after.exe"
+  },
+  {
+    "Algorithm": "SHA256",
+    "Hash": "6D2B18851F6609993C1BC32D2A8FB7460330FE039736C44C449C97B7AAB38800",
+    "Path": "C:\\Users\\Luis\\Desktop\\scan\\diskpie\\target\\review-ui-perf-20260907-215950-locked\\build\\release\\deps\\libdiskpie_core-6e74b06796cfaaec.rlib"
+  },
+  {
+    "Algorithm": "SHA256",
+    "Hash": "5A16A0E4529F360DB6AA1918B6A33F86F93AFA03C633D7048D84356564C820DB",
+    "Path": "C:\\Users\\Luis\\Desktop\\scan\\diskpie\\target\\review-ui-perf-20260907-215950-locked\\build\\release\\deps\\libdiskpie_app-77025462f16ec115.rlib"
+  },
+  {
+    "Algorithm": "SHA256",
+    "Hash": "CC308A461FE17B020BDF0DA4BDA5A47F826137E4DED198B48E30E1F80A4D352E",
+    "Path": "C:\\Users\\Luis\\Desktop\\scan\\diskpie\\target\\review-ui-perf-after-20260907-v2\\build\\release\\deps\\libdiskpie_core-6e74b06796cfaaec.rlib"
+  },
+  {
+    "Algorithm": "SHA256",
+    "Hash": "AB46B5F22EF7E8E5074A11C96A4DC5FD642BBCAF4A7E36F6F579CD49CF6E7BCD",
+    "Path": "C:\\Users\\Luis\\Desktop\\scan\\diskpie\\target\\review-ui-perf-after-20260907-v2\\build\\release\\deps\\libdiskpie_app-77025462f16ec115.rlib"
+  }
+]

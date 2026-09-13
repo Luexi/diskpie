@@ -1,8 +1,12 @@
 # DiskPie architecture
 
 > Living architecture guide and continuation context. Last reconciled with the
-> paused dirty working tree on 2026-08-02. Statements labeled **planned** are
-> required direction, not implemented behavior.
+> implementation on 2026-09-07. See ROADMAP.md and
+> [redesign validation](research/scanner-renovado-validation.md) for automated
+> and manual evidence; connected behavior is not a claim of release readiness.
+
+The [review remediation record](research/review-remediation-validation.md)
+describes the latest changes and separates them from historical redesign evidence.
 
 ## 1. Architectural goals
 
@@ -29,7 +33,10 @@ flowchart LR
     App --> Layout["Portable sunburst layout"]
     Layout --> UI
     UI --> Shell["Windows Shell STA"]
-    UI --> Settings["Native settings adapter - planned"]
+    UI --> Support["Bounded support worker"]
+    Support --> Registry["Owned Explorer integration"]
+    Support --> Export["Retained diagnostic export"]
+    UI --> Settings["Composition-root native settings lifecycle"]
     UI --> Diagnostics["Local bounded diagnostics"]
     Shell --> Windows["Windows Shell / COM"]
     WinFS --> NTFS["NTFS, ReFS, FAT, shares"]
@@ -101,6 +108,8 @@ UI-independent application policy and orchestration:
 - `RuntimeController` owns active/pending/retiring scans and frame-bounded
   polling;
 - `LayoutService` computes layouts off the frame thread;
+- `ItemListService` ranks and filters all immediate children off-thread;
+- branch replacement merges and re-aggregates an immutable snapshot after join;
 - `NavigationState` owns selection, zoom root, Back history, hidden branches,
   size basis, and rescan intent;
 - presentation indexes provide stable textual/chart-facing state;
@@ -123,14 +132,14 @@ project-authored unsafe code:
 - `filesystem.rs`: Win32 directory enumeration and metadata;
 - `volumes.rs`: volume discovery, device hints, capacity, and root resolution;
 - `shell_service.rs`: one message-pumping COM STA, its bounded request queue,
-  folder dialog, and per-request cancellation;
+  folder/Save As dialogs, and per-request cancellation;
 - `shell_actions.rs`: open/reveal/Installed Apps, `IFileOperation` recycle and
   permanent deletion with a progress sink, late identity validation, and the
   Recycle Bin query/empty calls;
 - `project_paths.rs`: Known Folder-based application directories;
 - `diagnostic_files.rs`: retained-handle local logging, retention, export, and
   atomic marker support; and
-- **planned** `settings_file.rs`: explicit retained-handle `app.ron` transport.
+- `settings_file.rs`: explicit retained-handle `app.ron` transport.
 
 Every unsafe block must be target-gated, minimal, documented with a `SAFETY`
 invariant, and convert raw ownership to RAII immediately.
@@ -145,7 +154,10 @@ Executable and composition root:
 - polling platform/runtime events within frame budgets;
 - local diagnostic subscriber lifecycle;
 - settings/crash capability preparation and post-event-loop finish; and
-- **planned** destructive confirmation surfaces.
+- destructive confirmation, post-action reconciliation, Explorer preferences,
+  and diagnostic preview/destination surfaces;
+- `support_service.rs`: a UI-independent composition worker for target validation,
+  registry operations, bounded diagnostic collection, and export capabilities.
 
 The crate forbids unsafe code. Native filesystem and COM work belongs in the
 platform crate.
@@ -156,20 +168,24 @@ platform crate.
 sequenceDiagram
     participant UI as eframe frame loop
     participant RT as RuntimeController
+    participant SP as Scan supervisor
     participant SC as Scan coordinator
     participant WK as Fixed scan workers
     participant FS as WindowsFileSystem
     participant LS as LayoutService
 
     UI->>RT: request_scan(provider, roots, cancel)
-    RT->>SC: start owned generation
+    RT->>SP: bounded owned generation request
+    SP->>SC: start scan session
     SC->>WK: bounded directory work
     WK->>FS: blocking enumerate/metadata
     FS-->>WK: entries and omissions
     WK-->>SC: bounded batches
-    SC-->>RT: bounded ScanEvents
+    SC-->>SP: bounded ScanEvents
+    SP->>SP: reduce and prepare coherent snapshot off-thread
+    SP-->>RT: prebuilt publication and status
     UI->>RT: tick(elapsed, drain budget)
-    RT->>RT: reduce and stage coherent snapshot
+    RT->>RT: stage prebuilt immutable publication
     RT->>LS: submit immutable layout input
     LS-->>RT: completed layout
     RT->>RT: atomically commit snapshot, presentation, navigation, layout
@@ -215,9 +231,20 @@ runtime teardown so dropping the application remains bounded even under
 ordinary retirement saturation. Capacity remains occupied until disposal has
 actually returned, including through a caught panic.
 
-The latest implementation passed focused/stress checks but its final
-independent revalidation was interrupted by the project pause. Treat it as
-implemented, not yet accepted.
+Focused stress and ownership tests cover retirement. Current integrated gate
+results and remaining manual evidence are recorded in ROADMAP.md.
+
+Branch rescans retain a settled `BranchRescanIntent` containing the exact
+snapshot, generation, revision, node, and native path. The supervisor waits for
+the branch coordinator's actual join before merging. It rebuilds and
+re-aggregates the full tree off-thread and only publishes a successful terminal
+replacement; cancellation or failure retains the prior committed frame. This
+cost is O(total nodes), not a constant-memory splice. Stale intents cannot
+replace another committed revision. ADR 0020 records the composition contract.
+The cancellation token survives join and preparation. Final publication and
+cancellation acceptance share the same short mutex-protected decision; rejected
+publications are disposed off-thread. Merge, freezing and presentation indexing
+check cancellation between batches. Provider failures retain their error phase.
 
 ## 6. Model and filesystem semantics
 
@@ -248,6 +275,10 @@ subsequent links do not double-count allocated storage. Logical naming remains
 visible for each directory entry. When identity is unavailable, precision is
 reported rather than silently claiming exact deduplication.
 
+Nodes retain observed allocation separately from deduplicated ownership. Branch
+replacement can therefore transfer allocation to a surviving alias outside the
+rescanned branch without losing the original observation.
+
 ### Boundaries and omissions
 
 By default, DiskPie does not traverse reparse points, symlinks, junctions,
@@ -255,6 +286,17 @@ mount points, or cloud boundaries that could loop, escape the selected tree,
 cross a volume, or hydrate content. The adapter returns a visible omission or
 boundary record. Access denied and isolated I/O failures also become omissions;
 they do not abort unrelated branches.
+
+Directories remain incomplete until their enumeration terminates. Cancellation
+does not turn queued or unfinished descendants into complete zero-byte folders.
+Root-resolution failures in a multi-root request are surfaced as omissions while
+valid roots continue.
+The resolver also retains the full normalized native selection. Composition
+keeps it independently of observed nodes through deferred launches and branch
+rescans, so F5 retries every requested root even when a prior resolution failed.
+An accepted full launch stages that scope by generation. It becomes the current
+scope only when that generation's first snapshot is displayed; cancelling a
+still-unshown launch cannot replace the roots of the retained visible results.
 
 Sparse and compressed allocation is read from filesystem metadata. Remote,
 removable, and unknown devices use conservative scheduling classes.
@@ -285,6 +327,21 @@ Hidden-branch edits use a persistent plan with a strict maximum delta depth of
 in O(1); if the cache is not ready, mutation returns `HiddenStateBusy` rather
 than materializing an unbounded set on the UI thread.
 
+`SnapshotPresentation` derives its native-path hashes and color-family index in
+one pass. The family index stores `family_anchor: NodeId` and
+`depth_in_family: u32` (8 bytes per node). Each direct child of a scanned
+`EntryKind::Root` starts a family; descendants inherit that anchor and absolute
+family depth. `ColorIdentity { family_key, variant_key, depth }` is retrieved in
+O(1), reusing the existing `path_color_keys`. Stable native paths retain their
+color identity across metric changes, reordering, zoom and branch replacement;
+the renderer chooses the actual palette.
+
+UI context-menu targets and row IDs carry the displayed generation and revision.
+Deferred navigation retains the original `NavigationCommand` and revision and
+is discarded when either becomes stale; a retry never rebinds an old `NodeId`
+to a new generation. Logical keyboard focus may persist across append-only
+progressive revisions, but it resets to remapped selection on a new generation.
+
 ## 8. Sunburst architecture
 
 The portable layout engine produces immutable backend-neutral sectors. Sectors
@@ -298,24 +355,47 @@ may represent:
 Only a real sector exposes an action target. Synthetic sectors cannot be used
 for filesystem mutations.
 
+Snapshot aggregation computes positive descendant depth per metric before any
+hidden-branch, minimum-angle or sector-budget grouping. On x64 its field fits
+existing aggregate padding. Layout reads that depth and applies the configured
+ceiling (default eight) in O(1). A 0.28 center radius and the effective depth
+distribute rings over the remaining radius; zero depth uses a neutral full disk.
+A tiny deep branch can reserve rings even when grouped, so hiding or changing
+the budget alone cannot rescale the chart. Stable index merges, grouping and
+member copying check cancellation; discarded allocations still take worker time.
+Snapshot root indexes make RescanAll availability O(number of roots).
+
 `crates/diskpie/src/sunburst_view.rs` converts a committed layout into cached
 egui meshes, performs pointer/keyboard interaction mapping, and returns typed
-requests to application state. Hovering does not rebuild geometry. The intended
-connected view is paired with a synchronized textual list so every chart action
-has a keyboard-accessible equivalent.
+requests to application state. Mesh identity includes geometry and the full
+color identity; hover, focus and selection remain independent overlays and do
+not rebuild the base mesh. The optional synchronized textual list provides
+keyboard-accessible equivalents without permanently reducing the map area.
+
+The chart's sector limit never limits the list's reachable children.
+`ItemListService` keeps one running request, one coalesced pending request, and
+one completion. `ItemListKey` identifies generation, revision, root, size basis,
+query, `ItemSort::{Name, Size}` and `SortDirection::{Ascending, Descending}`.
+The default is Size descending. Name matching and primary name ordering ignore
+case, with exact native names and `NodeId` as deterministic final tie-breakers.
+Changing only the query reuses ranking; changing sort or direction invalidates
+that ranking. The worker and `ranked_position` share the comparator, allowing
+O(log n) selected-row lookup even in a filtered index. The UI accepts only a
+matching result and virtualizes rows. List and layout loops check cancellation
+during expensive work; their worker lifecycle includes explicit join evidence.
 
 ## 9. UI composition
 
-`DiskPieShell` is the connected product surface. It keeps the “forensic radial
-instrument” direction, the responsive wide/narrow rails, the theme/locale
-controls, and settings synchronization, and it now owns the real handles the
-composition root prepares before the native window exists:
+`DiskPieShell` implements the Scanner renovado direction in ADR 0021: a large
+map with a compact toolbar, a footer and an optional list with collapsible
+details. It preserves theme/locale controls, settings synchronization and the
+real service handles the composition root prepares before the window exists:
 
 ```mermaid
 flowchart TD
-    Start["Composition root prepares runtime, Shell STA, resolver, diagnostic bridge, fonts"] --> Native["eframe creates native window"]
+    Start["Root prepares runtime, Shell STA, resolver, support, list, diagnostics, fonts"] --> Native["eframe creates native window"]
     Native --> Shell["DiskPieShell owns UI-only state plus those handles"]
-    Shell --> Logic["Per-frame bounded logic: drain Shell events, drain resolver results, tick runtime"]
+    Shell --> Logic["Bounded poll: Shell, support, resolver, runtime, reconciliation"]
     Logic --> Flow["ScanFlow derives one ScanUi state"]
     Flow --> View["Render committed immutable frame"]
     View --> Commands["Typed ShellCommand / NavigationAction"]
@@ -351,17 +431,28 @@ Composition-root modules in `crates/diskpie/src`:
 - `diagnostic_sink.rs`: a bounded `SyncSender<DiagnosticEvent>` clone for the
   shell (drop-and-count when full) drained by a root-owned thread into the
   installed tracing subscriber. Events carry only the typed fields; never paths.
-- `fonts.rs`: reads well-known Windows fallback fonts at startup (bounded to
-  64 MiB, missing files skipped) and appends them after the embedded faces.
+- `fonts.rs`: reads well-known Windows fonts at startup (bounded to 64 MiB,
+  missing files skipped). Segoe UI becomes the primary proportional face when
+  present; embedded faces and multilingual fallbacks remain. System fonts are
+  read locally and are not redistributed.
+- `support_service.rs`: one bounded worker for target validation, Explorer
+  registry inspection/mutation, log collection, and prepared diagnostic export.
+  Admission includes queued and undrained jobs (maximum four). A precreated
+  reaper owns its thread handle from startup; timed-out ownership prevents a
+  replacement until actual join. A failed handoff retains one process-lifetime
+  quarantine and cannot supply a clean shutdown receipt.
+- `shell/actions_ui.rs`: confirmation state, accepted request obligations,
+  result receipts, stale-result gating, and post-action branch/full/bin refresh.
+- `shell/support_ui.rs`: asynchronous integration state and exact diagnostic
+  preview pages, per-export path consent, destination tokens, and save results.
 
 The shell obtains the owner HWND through eframe's `HasWindowHandle` on
 `eframe::Frame` and hands the integer to `OwnerWindow::from_raw`; it owns no
-COM object. `ShellService::submit_folder` and `try_recv` are the only Shell
-calls made from a callback. Every navigation action goes through
+COM object. Callbacks submit typed requests, cancel, and poll without waiting.
+Every navigation action goes through
 `RuntimeController::navigation_command` and `execute_navigation`;
 `NavigationReport::rescan_request` is consumed by resolving the full roots
-again through the resolver. Branch rescans have no engine path yet and are
-shown as unavailable with an explicit reason. Shell-wide shortcuts yield to a
+again through the resolver or preparing a settled branch intent. Shell-wide shortcuts yield to a
 focused text field and Escape yields to an open popup; modifiers must match
 exactly. When the window closes while a generation is still active or
 cancelling, the shell writes that generation's `scan.cancelled` record with the
@@ -370,40 +461,47 @@ no later frame will drain the terminal report.
 
 Surfaces:
 
-- command rail: Back, Parent, Choose folder, Rescan, Cancel, Show summary,
-  scan-root display, theme, language; `CommandAvailability` drives enabled
-  state and `UnavailableReason` text is the disabled hover text;
-- telemetry rail: phase pill, selected size in the current basis, files,
-  folders, omissions, unknown-size count, item count, metric toggle, hidden
-  branch count with Restore all;
-- radial lens: calibration rings plus the drive list while empty, choosing, or
-  resolving; the real `SunburstView` otherwise, with a localized tooltip and a
-  context menu (hide/restore/rescan-branch; destructive and open/reveal
-  entries stay disabled);
-- inspection rail: virtualized largest-children list (`ScrollArea::show_rows`)
-  synchronized with the chart, selection details (path, logical, allocated,
-  counts, scan state, hard-link precision note), branch actions, and the
-  disabled safety section;
-- status rail: notice text, optional-services banner, previous-session
-  panic notice.
+- toolbar: 40 points high, with navigation, folder/drive selection, location,
+  rescan/cancel, active metric, Show list and Tools; availability controls the
+  enabled state and localized disabled explanation;
+- radial lens: the default workspace, with folder/drive selection before a
+  result exists and the committed `SunburstView` afterwards. Its center always
+  describes `view_root`, including the active metric and incomplete/unknown
+  size. Earlier results stay visible during resolution and branch rescanning;
+- optional list: resizable 260–400 points, initially 300, with search, Name/Size
+  sorting, aligned size/percentage columns and 30-point virtualized rows
+  (`ScrollArea::show_rows`). Details and current-item actions are collapsible.
+  Below 800 points Show list switches between map and list while preserving the
+  saved preference;
+- Tools: appearance/language and Explorer preferences, diagnostics, Recycle Bin
+  and Installed Apps; chart/list context menus keep item and branch actions;
+- footer: 28 points high, showing hover or keyboard-focus information, counts,
+  progress and notices, including omissions, hidden items and pending updates.
 
 Keyboard: Backspace and Alt+Left go back, Alt+Up goes to the parent, F5
 rescans, Esc cancels while a scan is active, Ctrl+O opens the folder picker;
-the chart keeps its own arrow/Enter/Escape/Shift+F10 handling.
+the chart keeps its own arrow/Enter/Space/Escape/Shift+F10 handling. In chart and
+list, a click enters a real folder or selects a file without opening it; a
+recognized second click does not activate newly zoomed content. The chart center
+goes to the parent. Enter activates and Space selects; list Up/Down reaches all
+filtered rows, including rows outside the virtualized viewport. Shift+F10 opens
+the same context menu from keyboard focus. Text fields retain their own keys.
 
 Shutdown: the shell calls `RuntimeController::request_shutdown`,
 `ShellService::request_shutdown`, and the resolver stop flag when the viewport
 close is requested (and again in `on_exit`/`Drop`); after `run_native`
 returns, `main.rs` awaits the runtime handoff, drops the runtime, calls
 `ShellService::finish(2 s)`, joins the resolver and the diagnostic bridge with
-deadlines, and returns typed `ShutdownReceipts` for the panic-marker
+deadlines, finishes the list and support workers, and returns typed `ShutdownReceipts` for the panic-marker
 quiescence proof, then publishes settings and finishes diagnostics.
 
-Not yet connected: destructive actions and their confirmation flows (Phase 5)
-and the real previous-session-panicked value (the panic-marker workstream).
+The actual previous-session panic state is passed to the shell. New native visual
+and accessibility acceptance is tracked separately from the headless UI tests.
 
 See [UI product direction](research/ui-product-direction.md) for typography,
-palette, accessibility, motion, and frame-performance constraints.
+palette, accessibility, motion and frame-performance constraints, and
+[redesign validation](research/scanner-renovado-validation.md) for the recorded
+automated, native and performance evidence.
 
 ## 10. Windows platform services
 
@@ -414,14 +512,19 @@ optional direct cancellation checkpoints and is passed the same token used by
 the scan coordinator. `resolve_scan_root` turns a selected absolute path into a
 portable `ScanRoot` plus volume/device evidence. This resolution is blocking and
 must not run in an egui callback.
+Enumeration and relative child metadata opens share one retained directory
+handle; native name resolution rejects reparse redirection. A bounded 64 KiB
+directory buffer uses extended records or a full-record provider fallback on
+that same handle. Per-file attributes, allocation and full identity remain
+verified independently. ADR 0022 records the added API feature and provider limits.
 
 ### Shell STA
 
 `ShellService` owns one dedicated, message-pumping single-threaded COM
 apartment. Requests/events crossing the channel are owned plain data; COM
 interfaces and PIDLs never leave the STA. The current implementation supports a
-filesystem-only folder picker with a real owner HWND and one outstanding modal
-request.
+filesystem-only folder and Save As dialogs with a real owner HWND and one
+outstanding modal request, plus the action requests described below.
 
 Shutdown is bounded (ADR 0007, decision note 2026-09-03). `request_shutdown`
 is nonblocking and idempotent; `finish(timeout)` is the composition root's
@@ -434,13 +537,13 @@ so a second STA cannot start until the old one truly exited. If that hand-off
 is impossible the lifecycle fails closed and the claim stays held for the rest
 of the process.
 
-### Destructive actions - implemented below the UI
+### Destructive actions
 
 Open, reveal, Installed Apps, the advisory Recycle Bin query, recycle,
 permanent delete, and empty-bin requests extend the same STA (ADR 0008,
 implementation note 2026-09-04).
 
-What exists:
+The UI composes these contracts without running native work in a callback:
 
 - `diskpie_app::actions::TargetValidator` turns a real, current `NodeId` into a
   `FilesystemTarget` that records the purpose it was validated for; synthetic,
@@ -475,21 +578,20 @@ What exists:
   raw calls sit behind a small internal seam so marshalling is tested without
   launching anything.
 
-What remains:
+The connected confirmation UI focuses Cancel initially, presents exact and
+escaped native paths, requires the stronger typed words, revalidates after
+confirmation, and settles a refresh obligation for every attempt. Recycle is
+enabled only for proven fixed local NTFS; missing identity is disclosed as lower
+assurance. Result uncertainty keeps data stale, and unexpected permanent deletion
+halts later destructive requests. The root retains pending obligations at shutdown.
 
-- the egui binding: confirmation dialogs with default Cancel focus, destructive
-  styling, exact-path plus escaped-UTF-16 presentation, the typed-word field,
-  result presentation, and rescan-on-obligation in the runtime;
-- the disposable-VM provider matrix (NTFS, FAT/removable, SMB, disabled/full
-  bin, oversized items, read-only/open/ACL-denied targets) that gates enabling
-  Recycle per provider class, and ACL-denied descendant fixtures for `Partial`;
-- the directory-recycle callback shape (one `PostDeleteItem` with a Recycle
-  Bin item, or one per descendant); the gated directory fixture settles it and
-  directory recycling stays disabled in the UI until it has run;
-- empty-bin verification in a disposable profile; it is never run against a
-  developer's bin.
+The disposable-VM provider matrix (FAT/removable, SMB, disabled/full bin,
+oversized items, read-only/open/ACL-denied targets) remains necessary before
+broadening Recycle support. Real Empty Recycle Bin is never executed against
+the user's bin during routine validation. Native UI and directory callback
+evidence must be recorded separately from ordinary fake-port tests.
 
-### Explorer integration - policy and adapter implemented, UI pending
+### Explorer integration
 
 Optional integration is per-user, reversible, and idempotent. DiskPie owns only
 its registry keys, does not elevate, and never overwrites foreign/conflicting
@@ -504,8 +606,12 @@ implements the port over `windows-registry` below an injectable
 `HKEY_CURRENT_USER` root (`Software\Classes` in production, a unique
 `Software\DiskPieTest\<run id>\Classes` subtree in tests) and issues
 `SHChangeNotify(SHCNE_ASSOCCHANGED)` after mutations. The composition root
-supplies `std::env::current_exe()`; the settings UI that renders
-`ExplorerIntegrationStatus` and issues requests is not wired yet.
+supplies `std::env::current_exe()`; Tools preferences render the actual
+`ExplorerIntegrationStatus` and submit inspect/install/repair/remove through the
+support worker. Every attempt retains operation and post-inspection results
+separately, including partially failed removal. Known/potential modifications
+notify Explorer. Failed inspection invalidates verified UI/preference state;
+partial owned installations expose safe completion through the domain table.
 
 ## 11. Settings, diagnostics, and panic recovery
 
@@ -516,9 +622,17 @@ native bytes. The schema is versioned and bounded; malformed or future-version
 documents fall back predictably while retaining a warning. Eframe persistence
 is compile-time disabled.
 
-Current gap: `main.rs` constructs an unavailable store with
-`settings.native.not_connected`, and staged bytes are discarded after the event
-loop. The native `app.ron` adapter described in ADR 0019 has not been created.
+The version-1 payload uses additive defaults: `show_item_list = false` and
+`item_list_width_points = 300`, with width validated to 260–400 points. Existing
+documents retain theme, locale, metric and other preferences; default theme is
+System and default size basis is Allocated. Sort, query, hover, selection and
+navigation history remain transient. The optional list and appearance controls
+stage explicit edits through the existing `SettingsSession` lifecycle.
+
+`main.rs` prepares `WindowsSettingsFile` before the window, loads the bounded
+document, and commits staged `app.ron` bytes after the event loop. Retained local
+parent/target handles and native identity evidence implement ADR 0019; unavailable
+storage is visible and never falls back to the executable directory.
 
 ### Diagnostics
 
@@ -536,6 +650,25 @@ Accepted lifecycle rules:
 - reaper failure terminalizes future startup rather than multiplying orphans;
   and
 - startup retention reports a truthful bounded outcome.
+
+Export schema 2 reports the last settled scan, not cumulative counters. Fields
+without measurements are explicitly unknown. The compositor retains a bounded
+suffix and header-margin metadata; collection seeks to each verified source's
+initial bounded tail, reading at most 1 MiB rather than its complete daily log.
+
+Interactive export builds an immutable artifact in the support worker, previews
+exact paginated bytes, and resets path consent for each export. The STA's native
+Save As suggests a UTC-dated `.txt` name. Preflight retains parent/target handles
+and identifies actual local/network transport before user confirmation; the UI
+holds only a single-use token. No temporary file exists before commit.
+
+`PreparedDiagnosticExport::commit` refuses any existing destination and publishes
+the verified temporary by parent-relative no-replace rename. A late alias cannot
+be overwritten. The eager legacy writer keeps replacement compatibility but is
+never called by this UI. ADR 0020 records this refinement of ADR 0016, including
+the explicit residual interval in the legacy writer. Managed source files are
+protected by exact name/identity; collection keeps at most eight bounded newest
+log tails and never modifies source logs. No export uploads data.
 
 ### Panic marker
 
@@ -573,11 +706,12 @@ The wired lifecycle is:
 6. Reconciliation consumes `ShutdownQuiescenceProof::from_receipts`, which
    requires the `DiagnosticsQuiescenceReceipt` that only
    `LocalDiagnostics::finish` mints from the worker's completion message,
-   plus the runtime receipt. The runtime receipt is a documented placeholder
-   because the executable composes no scan, layout, or Shell worker yet; the
-   UI wiring that starts them MUST replace it with joined receipts from those
-   services.
+   plus actual runtime, Shell, resolver, bridge, item-list, and support join
+   evidence from the composition root. A deadline handoff or quarantined worker
+   is not a joined receipt and cannot mint the clean-shutdown proof.
    Without a proof the runtime is dropped and the marker is preserved.
+   A startup failure can occur after composing some workers; missing UI receipts
+   therefore cannot mint a no-runtime or clean-shutdown capability.
 
 Explicit preview and delete reuse the same session type through
 `preview_marker` and `delete_marker`; deletion goes only through freshly
@@ -594,10 +728,14 @@ flowchart LR
     SUP --> WN["Fixed worker N"]
     RT --> LW["Layout worker"]
     UI --> STA["Shell COM STA"]
+    UI --> IL["Item-list worker"]
+    UI --> SW["Support worker"]
     DIAG["Tracing producers"] --> DW["Diagnostic writer"]
     RT -. timed-out ownership .-> RR["Runtime reaper"]
     DW -. timed-out ownership .-> DR["Diagnostic reaper"]
-    STA -. planned timed-out ownership .-> SR["Shell reaper"]
+    STA -. timed-out ownership .-> SR["Shell reaper"]
+    IL -. timed-out ownership .-> IR["Item-list reaper"]
+    SW -. join ownership from startup .-> UR["Support reaper"]
 ```
 
 No component may create an unbounded number of workers or a new helper thread
@@ -611,8 +749,10 @@ fails closed.
 - Diagnostic values use typed fields; arbitrary user paths are not accepted as
   diagnostic strings.
 - `Debug` implementations for path-bearing requests/results redact paths.
-- Settings, log, export, and marker targets must be direct local non-reparse
-  children of retained application-owned directories.
+- Settings, logs, and marker targets must be direct local non-reparse children
+  of retained application-owned directories. Export uses the user's retained
+  destination parent, discloses actual network transport, and forbids replacing
+  any existing destination in the interactive workflow.
 - Atomic replacement is classified through source/target identity after every
   native call, including failure returns.
 - Cleanup deletes only a sibling proven to be owned by its retained handle.
@@ -647,27 +787,21 @@ cargo test --workspace --doc --locked
 git diff --check
 ```
 
-The current dirty tree has not passed this combined gate since the latest
-runtime and diagnostics changes; see the roadmap for narrower evidence.
+See ROADMAP.md for delivery history and
+[Scanner renovado validation](research/scanner-renovado-validation.md) for the
+redesign's exact checks, captures and benchmark evidence.
+Native visual checks, accessibility, clean VMs, and actual empty-bin behavior
+remain separate acceptance items.
 
 ## 15. Current gaps and next architectural decisions
 
-In dependency order:
+1. Complete integrated automated and manual acceptance of the connected flows.
+2. Record repeatable throughput, memory, first-result, cancellation, layout, and
+   list measurements. Whole-tree branch merging remains a memory/cost target.
+3. Keep the isolated batch-enumeration prototype out of production until provider
+   semantics and repeatable measurements justify adoption; no MFT backend is
+   selected by this work.
+4. In a separately authorized phase, verify portable packaging on clean Windows
+   10/11 machines and prepare/publicize the stable release.
 
-1. Finish independent revalidation and commit the paused runtime/diagnostic work.
-2. Implement a shared retained-handle primitive or carefully parallel native
-   adapters for settings and marker commits without weakening file-specific
-   policy.
-3. Harden Shell STA shutdown before giving it to the UI.
-4. Connect real selection, resolution, scanning, runtime, sunburst, and textual
-   inspection state.
-5. Implement the destructive confirmation/action boundary.
-6. Implement reversible Explorer integration.
-7. Measure the conventional backend before deciding whether NTFS/MFT
-   acceleration is justified.
-8. Complete portable packaging, audits, Windows 10/11 verification, and public
-   release.
-
-Use [ROADMAP.md](../ROADMAP.md) for the exact continuation order, frozen Git
-state, interrupted reviews, validation evidence, and release exit criteria.
-
+Use [ROADMAP.md](../ROADMAP.md) for evidence, remaining work, and release scope.

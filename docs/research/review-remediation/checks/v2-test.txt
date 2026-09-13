@@ -1,0 +1,662 @@
+   Compiling diskpie-platform v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-platform)
+   Compiling diskpie-app v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-app)
+   Compiling diskpie-scan v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-scan)
+   Compiling diskpie v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.77s
+     Running unittests src\main.rs (target\debug\deps\diskpie-f21f87409ba30b21.exe)
+
+running 161 tests
+test cli::tests::double_dash_preserves_an_option_like_path ... ok
+test cli::tests::help_and_version_are_fixed_exclusive_actions ... ok
+test cli::tests::preserves_non_scalar_utf16_units ... ok
+test cli::tests::accepts_zero_or_one_native_path ... ok
+test cli::tests::rejects_unknown_options_and_excess_paths ... ok
+test cli::tests::request_debug_output_redacts_the_native_path ... ok
+test cli::tests::scan_path_option_is_equivalent_to_the_positional_path ... ok
+test cli::tests::scan_path_option_keeps_the_single_path_grammar ... ok
+test diagnostic_sink::tests::disconnected_sink_counts_every_event_as_dropped ... ok
+test cli::tests::scan_path_option_preserves_non_scalar_utf16_units ... ok
+test fonts::tests::fonts_directory_falls_back_to_the_default_windows_root ... ok
+test fonts::tests::segoe_ui_leads_proportional_text_without_replacing_monospace_or_fallbacks ... ok
+test fonts::tests::fallbacks_are_appended_after_embedded_fonts_in_both_families ... ok
+test local_diagnostics::tests::bounded_raw_fields_preserve_utf8_and_report_truncation_once ... ok
+test local_diagnostics::tests::disconnected_reaper_terminalizes_before_any_later_worker_can_spawn ... ok
+test local_diagnostics::tests::formatter_never_invokes_an_upstream_debug_implementation ... ok
+test local_diagnostics::tests::application_target_accepts_only_the_closed_event_field ... ok
+test local_diagnostics::tests::event_queue_record_is_utf8_single_line_and_at_most_four_kibibytes ... ok
+test local_diagnostics::tests::formatter_omits_all_upstream_values_before_disk ... ok
+test local_diagnostics::tests::globally_retained_producer_is_weak_and_cannot_prevent_disconnect ... ok
+test diagnostic_sink::tests::a_full_queue_drops_and_counts_instead_of_blocking ... ok
+test diagnostic_sink::tests::events_reach_the_recorder_and_the_bridge_joins_after_the_sinks_drop ... ok
+test local_diagnostics::tests::resilient_sink_counts_and_swallows_write_and_flush_failures ... ok
+test panic_marker::tests::dropping_without_a_quiescence_proof_cannot_mutate_marker_state ... ok
+test panic_marker::tests::explicit_delete_uses_only_the_prepared_capability ... ok
+test panic_marker::tests::foreign_sibling_is_preserved_and_blocks_delete_and_reconciliation ... ok
+test panic_marker::tests::initially_missing_target_that_appears_is_not_overwritten_when_commit_is_rejected ... ok
+test panic_marker::tests::marker_schema_is_fixed_bounded_and_contains_no_sensitive_route ... ok
+test local_diagnostics::tests::saturated_queue_and_stalled_write_do_not_block_guard_drop ... ok
+test local_diagnostics::tests::saturated_queue_drops_records_without_blocking_producers ... ok
+test panic_marker::tests::native_bridge::native_failures_map_onto_the_store_vocabulary_with_codes ... ok
+test panic_marker::tests::native_bridge::native_capability_reports_truthful_semantics ... ok
+test local_diagnostics::tests::repeated_completed_lifecycles_leave_no_late_writer_resources ... ok
+test fonts::tests::missing_files_are_skipped_and_the_budget_is_enforced ... ok
+test panic_marker::tests::native_bridge::subprocess_child_panics_on_the_installing_thread ... ignored, subprocess helper
+test panic_marker::tests::native_bridge::subprocess_child_records_native_redacted_marker ... ignored, subprocess helper
+test panic_marker::tests::native_bridge::native_explicit_delete_uses_identity_matched_handles_only ... ok
+test panic_marker::tests::native_bridge::native_store_reports_unavailable_slots_and_preserved_siblings ... ok
+test panic_marker::tests::partial_native_post_commit_outcomes_preserve_the_only_known_copy ... ok
+test panic_marker::tests::preparation_failure_aborts_before_hook_capability_use ... ok
+test panic_marker::tests::prepared_snapshot_is_used_without_a_second_prepare_or_capability_read ... ok
+test panic_marker::tests::previous_snapshot_failure_is_sanitized_and_forbids_cleanup ... ok
+test panic_marker::tests::reconciliation_uncertainty_is_a_non_destructive_outcome ... ok
+test panic_marker::tests::recovery_uncertainty_disables_cleanup_even_after_a_verified_commit ... ok
+test panic_marker::tests::native_bridge::native_reconciliation_preserves_a_foreign_token ... ok
+test panic_marker::tests::role_guard_restores_only_the_static_allowlisted_role ... ok
+test panic_marker::tests::runtime_previews_its_retained_previous_snapshot_without_repreparing ... ok
+test panic_marker::tests::session_tokens_are_fixed_opaque_and_distinct ... ok
+test panic_marker::tests::native_bridge::native_commit_without_a_previous_marker_is_removed_after_quiescence ... ok
+test panic_marker::tests::subprocess_child_does_not_call_prior_hook ... ignored, subprocess helper
+test panic_marker::tests::subprocess_child_install_cas_precedes_store_prepare ... ignored, subprocess helper
+test panic_marker::tests::subprocess_child_records_redacted_marker ... ignored, subprocess helper
+test panic_marker::tests::subprocess_child_writer_failure_returns_without_deadlock ... ignored, subprocess helper
+test panic_marker::tests::native_bridge::native_reconciliation_is_identity_conditional_not_token_conditional ... ok
+test panic_marker::tests::native_bridge::native_commit_through_the_hook_path_restores_the_previous_marker ... ok
+test panic_marker::tests::target_identity_change_is_preserved_during_conditional_reconciliation ... ok
+test panic_marker::tests::validator_rejects_unbounded_malformed_or_noncanonical_snapshots ... ok
+test panic_marker::tests::verified_quiescence_restores_only_the_owned_session_marker ... ok
+test panic_marker::tests::standard_store_reports_semantic_uncertainty_without_deleting_complete_sibling ... ok
+test resolver::tests::strips_dot_components_without_popping_the_root ... ok
+test resolver::tests::verbatim_paths_are_also_lexically_normalized ... ok
+test local_diagnostics::tests::idle_worker_wakes_for_periodic_native_maintenance ... ok
+test scan_ui::tests::a_dismissed_dialog_returns_to_the_previous_results ... ok
+test scan_ui::tests::a_failed_dialog_keeps_the_previous_results_and_state ... ok
+test local_diagnostics::tests::initial_retention_handshake_reports_success_issues_timeout_and_unavailable ... ok
+test scan_ui::tests::cancellation_passes_through_cancelling_into_cancelled_with_results ... ok
+test scan_ui::tests::choose_resolve_scan_partial_complete_is_the_happy_path ... ok
+test scan_ui::tests::deferred_launch_shows_resolving_until_it_is_accepted_or_rejected ... ok
+test scan_ui::tests::idle_frames_do_not_request_repaint ... ok
+test scan_ui::tests::resolution_failure_is_typed_and_cleared_by_the_next_request ... ok
+test scan_ui::tests::runtime_observation_reduces_every_runtime_state ... ok
+test scan_ui::tests::scan_failures_map_to_the_typed_class_through_the_runtime_state ... ok
+test scan_ui::tests::stale_dialog_events_do_not_close_a_newer_dialog ... ok
+test shell::actions_ui::tests::late_or_duplicate_terminal_never_settles_a_different_attempt ... ok
+test shell::actions_ui::tests::safety_violation_blocks_later_mutations_but_retains_refresh_obligation ... ok
+test resolver::tests::stop_abandons_queued_jobs_and_rejects_new_ones ... ok
+test shell::actions_ui::tests::shutdown_handoff_keeps_obligation_and_reports_uncertainty ... ok
+test shell::support_ui::tests::every_export_starts_without_paths_or_destination ... ok
+test shell::support_ui::tests::exact_preview_pages_preserve_all_unicode_bytes ... ok
+test panic_marker::tests::standard_store_preview_is_bounded_and_uses_the_prepared_view ... ok
+test shell::support_ui::tests::exported_metrics_use_the_last_generation_and_leave_unmeasured_fields_unknown ... ok
+test shell::support_ui::tests::integration_states_have_distinct_localized_labels ... ok
+test shell::support_ui::tests::failed_attempts_replace_old_verified_state_and_keep_mutation_evidence ... ok
+test shell::support_ui::tests::partial_integration_can_be_completed_in_either_direction ... ok
+test resolver::tests::worker_resolves_paths_and_volumes_and_reports_typed_failures ... ok
+test local_diagnostics::tests::bounded_finish_hands_off_a_worker_stalled_in_flush ... ok
+test shell::tests::arc_includes_requested_endpoints ... ok
+test shell::tests::benchmark::frames_csv ... ignored, manual release A/B benchmark; see tools/diskpie-bench/scripts/ui-benchmark.ps1
+test shell::tests::a_stopped_picker_fails_the_open_dialog_without_touching_the_scan_state ... ok
+test shell::tests::complete_worker_summary_does_not_claim_partial_displayed_results_are_complete ... ok
+test shell::actions_ui::tests::service_loss_settles_once_and_status_remains_visible_without_panel_space ... ok
+test shell::tests::closing_during_a_scan_records_scan_cancelled_before_shutdown ... ok
+test shell::tests::deferred_actions_queue_in_order_and_refuse_beyond_the_bound ... ok
+test shell::tests::dialog_failure_classes_follow_the_adapter_stage ... ok
+test shell::tests::every_unavailable_reason_has_a_message_and_every_state_a_phase ... ok
+test shell::tests::exit_handoff_survives_a_poisoned_mutex ... ok
+test shell::tests::a_deferred_launch_keeps_the_recovered_parts_and_is_retried_next_frame ... ok
+test panic_marker::tests::installation_cas_precedes_every_store_operation ... ok
+test panic_marker::tests::installed_hook_never_calls_the_prior_hook_in_this_build ... ok
+test shell::tests::idle_logic_phase_does_not_request_repaint ... ok
+test shell::tests::launch_rejections_defer_only_backpressure_within_the_frame_budget ... ok
+test panic_marker::tests::native_bridge::subprocess_native_hook_leaves_a_redacted_marker_on_a_worker_panic ... ok
+test shell::tests::localized_cache_uses_the_typed_message_order ... ok
+test panic_marker::tests::native_bridge::subprocess_native_hook_does_not_swallow_the_panic ... ok
+test shell::tests::navigation_without_a_frame_is_ignored_and_availability_is_typed ... ok
+test shell::tests::optional_table_and_appearance_preferences_are_persisted_together ... ok
+test shell::tests::percent_formatting_is_bounded ... ok
+test shell::tests::preference_adapters_round_trip_every_closed_variant ... ok
+test shell::tests::pending_metric_requests_keep_values_and_partial_share_on_committed_basis ... ok
+test shell::tests::runtime_config_honours_the_layout_and_worker_settings ... ok
+test shell::tests::same_revision_and_root_cannot_reuse_another_generations_list ... ok
+test shell::tests::shell_failure_events_carry_request_class_and_outcome_only ... ok
+test panic_marker::tests::subprocess_hook_excludes_path_payload_thread_and_process_sentinels ... ok
+test shell::tests::shortcuts_map_to_typed_commands_and_escape_only_cancels_while_scanning ... ok
+test shell::tests::full_rescan_retries_unresolved_roots_until_the_original_selection_is_complete ... ok
+test shell::tests::visual_matrix::native_screenshot_matrix ... ignored, opens native QA windows; set DISKPIE_VISUAL_OUTPUT, optional DISKPIE_VISUAL_FILTER
+test shell::tests::context_targets_expire_with_snapshot_revision_and_generation ... ok
+test shell::tests::unknown_and_partial_sizes_are_never_exact_zero_in_either_locale ... ok
+test shutdown_tests::finishing_without_a_shell_exit_still_joins_the_root_owned_workers ... ok
+test shutdown_tests::startup_failure_after_starting_a_worker_has_no_clean_shutdown_proof ... ok
+test storage::tests::deeply_nested_unknown_data_hits_the_explicit_recursion_limit ... ok
+test storage::tests::distinguishes_missing_malformed_oversized_and_newer_data ... ok
+test panic_marker::tests::subprocess_writer_failure_is_bounded_and_has_no_fallback ... ok
+test storage::tests::malformed_current_documents_never_stage_a_replacement_without_edit ... ok
+test storage::tests::explicit_edit_stages_one_complete_document ... ok
+test storage::tests::native_preclassified_outcomes_do_not_require_document_bytes ... ok
+test storage::tests::newer_version_rejection_never_traverses_its_payload ... ok
+test storage::tests::schema_header_is_canonical_bounded_and_overflow_checked ... ok
+test shell::tests::startup_path_goes_through_the_resolver_and_reports_typed_failure ... ok
+test storage::tests::round_trips_a_valid_current_envelope ... ok
+test storage::tests::unavailable_store_is_nonfatal_and_protected ... ok
+test storage::tests::unknown_fields_are_tolerated_inside_the_current_schema ... ok
+test storage::tests::untouched_newer_documents_never_stage_a_downgrade ... ok
+test storage::tests::write_rejects_wrong_version_and_unvalidated_values ... ok
+test sunburst_view::tests::ancestry_colors_remain_identical_when_zoom_changes_sector_depth ... ok
+test sunburst_view::tests::a_changed_partial_layout_with_the_same_generation_invalidates_cache ... ok
+test sunburst_view::tests::hit_test_delegates_to_layout_then_rejects_rendered_gaps ... ok
+test sunburst_view::tests::keyboard_navigation_enter_and_escape_are_typed_requests ... ok
+test sunburst_view::tests::mesh_and_colors_are_deterministic_and_hover_does_not_invalidate_cache ... ok
+test sunburst_view::tests::mesh_budget_is_hard_and_degrades_without_panicking ... ok
+test shutdown_tests::runtime_shutdown_receipt_is_true_after_a_requested_shutdown ... ok
+test sunburst_view::tests::primary_click_routes_real_nodes_and_hub_without_double_activation ... ok
+test sunburst_view::tests::mesh_is_finite_consistently_wound_and_within_budget ... ok
+test sunburst_view::tests::synthetic_hits_never_emit_click_zoom_or_context_requests ... ok
+test sunburst_view::tests::tessellation_adapts_to_physical_dpi ... ok
+test sunburst_view::tests::visual_fixture_families_have_distinct_colors_independent_of_order ... ok
+test sunburst_view::tests::zero_weight_partial_layout_still_builds_a_finite_center ... ok
+test support_service::tests::support_debug_omits_native_paths ... ok
+test support_service::tests::integration_refreshes_after_partial_failure_and_retains_both_outcomes ... ok
+test shutdown_tests::quiescence_needs_every_ui_worker_to_have_stopped ... ok
+test sunburst_view::tests::family_variant_and_absolute_depth_invalidate_mesh_but_interaction_does_not ... ok
+test shell::tests::a_startup_path_scans_to_completion_and_a_failed_dialog_keeps_the_results ... ok
+test sunburst_view::tests::palette_is_stable_and_uses_lighter_descendant_tones_in_both_themes ... ok
+test support_service::tests::support_worker_bounds_results_and_joins_after_client_drop ... ok
+test shell::tests::deferred_navigation_never_rebinds_a_reused_node_to_a_new_snapshot ... ok
+test support_service::tests::support_export_tokens_are_single_use_and_save_exact_preview_bytes ... ok
+test shell::tests::full_rescan_scope_follows_the_visible_generation_when_a_new_scan_is_cancelled ... ok
+test shell::tests::focused_folder_row_space_selects_and_enter_navigates ... ok
+test shell::tests::renewed_shell_fits_minimum_viewport_and_keeps_toolbar_and_status_fixed ... ok
+test shell::tests::list_search_and_keyboard_reach_children_beyond_two_hundred ... ok
+test shell::actions_ui::tests::exact_target_and_word_render_in_both_locales_and_cancel_has_default_keyboard_focus ... ok
+
+test result: ok. 153 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 0.39s
+
+     Running unittests src\lib.rs (target\debug\deps\diskpie_app-8c1384844dd7f91b.exe)
+
+running 181 tests
+test actions::tests::classification_cancellation_before_and_after_mutation ... ok
+test actions::tests::classification_failed_item_depends_on_target_kind ... ok
+test actions::tests::classification_completed_requires_recycle_bin_evidence ... ok
+test actions::tests::classification_missing_callbacks_are_unknown_not_success ... ok
+test actions::tests::capabilities_cannot_be_forged_cloned_or_reused ... ok
+test actions::tests::classification_perform_and_finish_failures ... ok
+test actions::tests::a_new_snapshot_with_a_renamed_target_no_longer_matches ... ok
+test actions::tests::binding_detects_every_changed_field ... ok
+test actions::tests::classification_recycle_without_bin_item_is_a_safety_violation ... ok
+test actions::tests::classification_requires_the_object_to_be_gone_after_the_operation ... ok
+test actions::tests::classification_success_hresult_with_abort_is_partial_not_completed ... ok
+test actions::tests::cancel_is_available_from_every_state ... ok
+test actions::tests::debug_output_never_contains_paths ... ok
+test actions::tests::delete_flow_requires_the_exact_word ... ok
+test actions::tests::destructive_validation_without_an_executable_path_fails_closed ... ok
+test actions::tests::drive_root_and_scope_debug_render_the_letter_only ... ok
+test actions::tests::drive_root_scope_is_exact_and_never_empty ... ok
+test actions::tests::empty_bin_flow_binds_the_exact_scope_and_word ... ok
+test actions::tests::executable_comparison_is_case_and_prefix_insensitive ... ok
+test actions::tests::filesystem_root_detection_covers_drive_unc_and_volume_roots ... ok
+test actions::tests::identity_from_raw_widens_the_volume_serial ... ok
+test actions::tests::lossy_native_path_gets_a_lossless_escaped_presentation ... ok
+test actions::tests::open_reveal_and_installed_apps_bind_without_confirmation ... ok
+test actions::tests::open_or_reveal_validated_targets_cannot_start_a_destructive_flow ... ok
+test actions::tests::recycle_flow_issues_a_single_use_capability_bound_to_the_target ... ok
+test actions::tests::rejects_scan_root_and_filesystem_roots_for_destructive_purposes_only ... ok
+test actions::tests::rejects_stale_generation_before_anything_else ... ok
+test actions::tests::rejects_the_running_executable_and_its_containing_directories ... ok
+test actions::tests::rejects_unknown_hidden_and_synthetic_nodes ... ok
+test actions::tests::utf16_escape_round_trips_unpaired_surrogates_and_literal_escapes ... ok
+test actions::tests::reparse_target_presentation_carries_the_link_note ... ok
+test actions::tests::validates_a_real_current_file_with_sizes_identity_and_parent ... ok
+test branch_rescan::tests::rejects_cancelled_stale_and_file_targets_without_changing_baseline ... ok
+test branch_rescan::tests::fresh_identity_measurement_updates_aliases_outside_the_branch_and_omissions_propagate ... ok
+test branch_rescan::tests::removed_allocation_owner_promotes_preserved_alias_from_original_measurement ... ok
+test diagnostics::events::tests::configured_levels_are_fixed_and_monotonic ... ok
+test diagnostics::events::tests::event_field_storage_is_strictly_bounded ... ok
+test diagnostics::events::tests::event_golden_has_only_stable_allowlisted_fields ... ok
+test branch_rescan::tests::navigation_keeps_hidden_and_history_and_falls_back_from_deleted_selection ... ok
+test diagnostics::events::tests::persisted_levels_map_exhaustively_to_the_runtime_filter ... ok
+test diagnostics::events::tests::stable_codes_are_unique_and_nonempty ... ok
+test diagnostics::events::tests::version_target_and_os_are_numeric_or_closed ... ok
+test diagnostics::export::tests::log_source_debug_exposes_only_availability_and_length ... ok
+test diagnostics::export::tests::golden_export_is_stable_and_records_notices ... ok
+test diagnostics::export::tests::invalid_utf8_is_made_valid_and_reported ... ok
+test diagnostics::export::tests::only_complete_lines_are_exported_and_crlf_is_normalized ... ok
+test diagnostics::export::tests::output_contains_no_control_characters_except_line_feeds ... ok
+test diagnostics::export::tests::path_consent_never_weakens_mandatory_scrubs ... ok
+test diagnostics::export::tests::settings_allowlist_is_derived_only_from_validated_path_free_fields ... ok
+test diagnostics::export::tests::preview_and_artifact_are_the_exact_same_arc ... ok
+test diagnostics::redaction::tests::control_and_format_runs_are_visible_markers ... ok
+test diagnostics::export::tests::unmeasured_last_scan_values_are_unknown_not_zero_or_session_totals ... ok
+test diagnostics::redaction::tests::debug_output_never_repeats_redacted_content ... ok
+test diagnostics::redaction::tests::environment_like_assignments_are_removed_even_with_path_consent ... ok
+test diagnostics::redaction::tests::explicit_consent_keeps_paths_but_never_urls_or_secrets ... ok
+test diagnostics::redaction::tests::drive_unc_and_verbatim_paths_are_redacted ... ok
+test diagnostics::redaction::tests::ordinary_structured_fields_do_not_match_environment_assignments ... ok
+test diagnostics::redaction::tests::quoted_path_preserves_only_the_delimiters ... ok
+test diagnostics::redaction::tests::redaction_is_deterministic_and_idempotent ... ok
+test diagnostics::redaction::tests::urls_and_standalone_queries_are_always_redacted ... ok
+test diagnostics::redaction::tests::secret_headers_keys_and_auth_schemes_are_case_insensitive ... ok
+test diagnostics::redaction::tests::utf8_neighbors_survive_ascii_redaction_boundaries ... ok
+test explorer_integration::tests::command_template_quotes_verbatim_without_expansion ... ok
+test explorer_integration::tests::decision_table_matches_adr_items_three_to_five ... ok
+test explorer_integration::tests::executable_paths_that_cannot_be_quoted_are_rejected ... ok
+test explorer_integration::tests::fake_registry_names_are_case_insensitive_and_exact_subtree_scoped ... ok
+test explorer_integration::tests::debug_and_display_output_never_contain_executable_paths ... ok
+test explorer_integration::tests::failed_removal_reports_progress_and_notifies_after_a_partial_change ... ok
+test explorer_integration::tests::key_paths_are_exact_and_vendor_qualified ... ok
+test explorer_integration::tests::failed_rollback_is_reported_not_hidden ... ok
+test explorer_integration::tests::install_writes_exact_keys_and_removes_staging ... ok
+test explorer_integration::tests::matching_install_is_idempotent_without_writes ... ok
+test explorer_integration::tests::moved_executable_is_owned_stale_and_requires_a_decision ... ok
+test explorer_integration::tests::owned_strays_are_reported_and_removed_only_when_marked ... ok
+test explorer_integration::tests::partial_installation_is_reported_and_completed_by_install ... ok
+test diagnostics::export::tests::prefix_size_is_exact_across_numeric_boundaries_and_every_notice_combination ... ok
+test explorer_integration::tests::every_removal_failure_after_mutation_preserves_a_reconciliation_signal ... ok
+test explorer_integration::tests::staged_readback_mismatch_rolls_back ... ok
+test explorer_integration::tests::staging_collision_refuses_without_writing ... ok
+test explorer_integration::tests::repair_replaces_stale_keys_and_leaves_no_siblings ... ok
+test explorer_integration::tests::tokens_are_unique_and_registry_safe ... ok
+test explorer_integration::tests::verb_values_are_exact_reg_sz_entries ... ok
+test format::tests::formats_boundaries_without_rounding_up ... ok
+test format::tests::hides_only_windows_verbatim_display_prefixes ... ok
+test format::tests::supports_the_full_aggregate_range_without_overflow ... ok
+test explorer_integration::tests::remove_deletes_only_the_owned_subtrees_and_is_idempotent ... ok
+test format::tests::uses_the_selected_locale_decimal_separator ... ok
+test i18n::tests::message_table_order_matches_discriminants ... ok
+test explorer_integration::tests::foreign_and_ambiguous_keys_refuse_every_request_without_overwrite ... ok
+test i18n::tests::argument_free_messages_resolve_without_arguments_and_only_those ... ok
+test i18n::tests::spanish_resources_are_independently_authored ... ok
+test i18n::tests::every_locale_contains_every_typed_message ... ok
+test i18n::tests::plural_item_count_formats_in_both_languages ... ok
+test layout_service::tests::dropping_an_idle_service_joins_the_worker ... ok
+test layout_service::tests::computes_without_exposing_work_to_the_caller_thread ... ok
+test layout_service::tests::submit_retires_displaced_values_on_the_worker_and_returns_backpressure_owned ... ok
+test layout_service::tests::invalid_layout_is_reported_as_plain_data ... ok
+test navigation::tests::deleted_targets_fall_back_to_the_deepest_safe_ancestor ... ok
+test navigation::tests::full_rescan_uses_the_current_snapshots_root_index_after_replacement ... ok
+test layout_service::tests::latest_request_wins_even_if_an_older_result_was_ready ... ok
+test navigation::tests::hidden_branches_are_validated_restored_and_remapped_exactly ... ok
+test explorer_integration::tests::partial_install_rolls_back_on_every_injected_failure ... ok
+test navigation::tests::hidden_mutations_append_persistent_edits_without_copying_the_base_set ... ok
+test navigation::tests::history_is_bounded_and_zero_limit_is_deterministic ... ok
+test navigation::tests::hidden_edit_ceiling_returns_typed_busy_until_background_materialization_is_ready ... ok
+test navigation::tests::replacement_preserves_moved_ids_by_identity_and_metric_does_not_change_identity ... ok
+test navigation::tests::stale_snapshots_and_commands_are_rejected_without_mutation ... ok
+test navigation::tests::synthetic_multi_volume_summary_is_a_view_but_never_an_action_target ... ok
+test navigation::tests::zoom_back_parent_and_selection_are_independent ... ok
+test explorer_integration::tests::install_rolls_back_on_every_injected_failure ... ok
+test diagnostics::export::tests::oversized_utf8_lines_are_cut_only_at_boundaries ... ok
+test presentation::tests::family_identity_survives_generation_reorder_metric_and_branch_replacement ... ok
+test item_list_service::tests::changing_sort_invalidates_rank_cache_but_query_keeps_that_order ... ok
+test presentation::tests::folded_name_ties_use_exact_native_name_then_node_identity ... ok
+test presentation::tests::identical_names_under_different_parents_have_different_path_keys ... ok
+test presentation::tests::largest_children_switches_metric_and_breaks_ties_by_native_name ... ok
+test presentation::tests::rejects_unknown_nodes_without_panicking ... ok
+test navigation::tests::repeated_hidden_cycles_keep_depth_lookup_and_retained_nodes_bounded ... ok
+test presentation::tests::root_color_does_not_depend_on_a_synthetic_summary_label ... ok
+test runtime::tests::bounded_reaper_runs_large_destruction_on_its_worker ... ok
+test runtime::tests::branch_readiness_observes_inbox_to_reserved_handoff_atomically ... ok
+test navigation::tests::restore_all_is_a_constant_size_persistent_edit ... ok
+test runtime::tests::branch_fatal_failure_keeps_baseline_and_recoverable_failure_commits_partial ... ok
+test runtime::tests::branch_scan_preserves_baseline_until_atomic_replacement_and_rejects_stale_intents ... ok
+test runtime::tests::cancellation_freezes_observed_state_before_a_provider_returns ... ok
+test runtime::tests::coalesced_layout_replacement_retires_the_displaced_frame_off_ui ... ok
+test explorer_integration::tests::repair_rolls_back_on_every_injected_failure ... ok
+test runtime::tests::disconnected_session_reaper_returns_scan_ownership_without_leaking ... ok
+test runtime::tests::drop_detaches_a_blocked_provider_without_waiting_for_it ... ok
+test runtime::tests::cancellation_publishes_observed_data_with_the_real_terminal_counters ... ok
+test navigation::tests::replacement_and_parent_walk_ten_thousand_levels_iteratively ... ok
+test runtime::tests::accepted_cancel_during_branch_preparation_never_publishes_replacement ... ok
+test runtime::tests::failed_candidate_layout_keeps_the_last_committed_frame ... ok
+test runtime::tests::cancelled_branch_keeps_baseline_and_a_later_generation_wins ... ok
+test runtime::tests::navigation_geometry_commits_atomically_and_rescan_performs_no_io ... ok
+test runtime::tests::rejected_scan_debug_exposes_counts_but_never_root_paths ... ok
+test runtime::tests::ready_layout_and_staged_frame_are_retired_off_ui_before_navigation_resubmits ... ok
+test runtime::tests::same_generation_preparation_keeps_append_only_navigation_ids ... ok
+test runtime::tests::saturated_reaper_returns_ownership_and_destroys_it_after_capacity_recovers ... ok
+test runtime::tests::replacement_preserves_identity_and_stale_publications_do_not_mutate_the_frame ... ok
+test runtime::tests::saturated_scan_admission_returns_the_request_and_preserves_pending ... ok
+test runtime::tests::saturated_runtime_drop_uses_reserved_payload_and_reaper_exits_without_leaks ... ok
+test runtime::tests::releasing_generation_one_after_generation_two_commits_is_not_an_error ... ok
+test runtime::tests::retiring_cap_allows_immediate_replacement_then_coalesces ... ok
+test runtime::tests::unobserved_cancel_and_shutdown_epochs_prevent_lost_wakes ... ok
+test runtime::tests::shutdown_rejects_navigation_and_repaint_matches_completion ... ok
+test session::tests::access_denied_omission_marks_parent_and_session_partial ... ok
+test session::tests::cancellation_preserves_partial_tree_and_terminal_progress ... ok
+test session::tests::contradictory_complete_terminal_is_typed_error_and_not_applied ... ok
+test session::tests::invalid_ids_and_counter_overflow_do_not_partially_mutate ... ok
+test session::tests::multi_root_progression_preserves_mapping_selection_paths_and_navigation_replacement ... ok
+test runtime::tests::validation_precedes_generation_consumption_and_cancellation ... ok
+test session::tests::node_id_capacity_accounts_for_the_reserved_multi_root_summary ... ok
+test runtime::tests::supervisor_step_panic_stops_and_transfers_blocked_sessions_without_joining ... ok
+test session::tests::observed_cancellation_materializes_once_without_terminalizing_the_reducer ... ok
+test runtime::tests::reducer_fault_keeps_budgetedly_draining_until_the_session_can_finish ... ok
+test session::tests::ordered_batches_build_explicit_mapping_and_complete_snapshot ... ok
+test session::tests::pure_snapshot_and_drain_limits_are_deterministic ... ok
+test session::tests::resolver_omissions_stay_on_summary_without_changing_protocol_counters ... ok
+test session::tests::selection_prefers_file_identity_then_falls_back_to_deepest_ancestor ... ok
+test session::tests::stale_generation_is_rejected_without_mutation ... ok
+test session::tests::sparse_changes_publish_by_max_interval_and_immediate_policy_never_waits ... ok
+test session::tests::unvisited_directories_are_partial_then_cancelled_but_completed_siblings_stay_complete ... ok
+test session::tests::two_or_more_roots_have_exactly_one_uncounted_summary ... ok
+test session::tests::partial_publication_spacing_grows_with_staged_node_count ... ok
+test settings::tests::additive_list_preferences_preserve_old_settings_and_default_to_hidden ... ok
+test settings::tests::current_settings_load_without_implicit_rewrite ... ok
+test settings::tests::failed_save_remains_dirty_for_a_later_retry ... ok
+test settings::tests::item_list_preferences_persist_only_after_an_explicit_edit ... ok
+test settings::tests::newer_malformed_and_oversized_values_are_preserved_until_explicit_edit ... ok
+test settings::tests::payload_schema_has_no_path_or_history_fields ... ok
+test settings::tests::validates_every_untrusted_numeric_domain ... ok
+test item_list_service::tests::all_children_and_case_insensitive_filter_keep_native_ids ... ok
+test session::tests::ten_thousand_levels_materialize_without_recursion ... ok
+test presentation::tests::all_sort_modes_use_the_same_binary_search_order_beyond_six_hundred_rows ... ok
+test runtime::tests::terminal_publication_replaces_partial_even_when_the_reaper_is_saturated ... ok
+test runtime::tests::progressive_frames_are_prebuilt_throttled_and_terminal_is_not_starved ... ok
+test item_list_service::tests::obsolete_request_never_publishes_and_drop_does_not_join ... ok
+test diagnostics::export::tests::bounded_suffix_matches_reference_for_short_lines_sources_redaction_and_truncation ... ok
+test presentation::tests::cancellable_complete_ranking_matches_reference_across_merge_chunks ... ok
+test diagnostics::export::tests::total_cap_selects_the_newest_chronological_suffix ... ok
+
+test result: ok. 181 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.24s
+
+     Running unittests src\lib.rs (target\debug\deps\diskpie_core-f833648dcc33cf0d.exe)
+
+running 53 tests
+test model::tests::aggregate_addition_checks_instead_of_wrapping ... ok
+test model::tests::builder_and_snapshot_reject_invalid_ids_and_invalid_parents ... ok
+test model::tests::a_known_alias_measurement_supplies_the_identity_even_when_the_owner_is_unknown ... ok
+test model::tests::counts_files_directories_and_omissions_by_subtree ... ok
+test model::tests::depth_tracks_positive_bytes_after_deduplication_independently_for_each_metric ... ok
+test model::tests::directories_keep_policy_zero_and_reparse_files_keep_their_kind_when_deduplicated ... ok
+test model::tests::equal_file_ids_on_different_volumes_are_not_deduplicated ... ok
+test model::tests::containers_always_contribute_zero_own_bytes ... ok
+test model::tests::hard_link_ownership_crosses_directories_and_sorted_roots ... ok
+test model::tests::insertion_order_drives_first_child_and_sibling_links_deterministically ... ok
+test model::tests::file_identity_is_portable_and_optional ... ok
+test model::tests::node_id_conversion_reports_arena_exhaustion ... ok
+test model::tests::missing_identities_count_allocation_per_path_and_expose_precision_loss ... ok
+test model::tests::owner_order_uses_the_raw_relative_path_not_component_order ... ok
+test model::tests::positive_depth_metadata_reuses_existing_aggregate_padding ... ok
+test model::tests::partial_and_cancelled_states_propagate_without_erasing_complete_subtrees ... ok
+test model::tests::preserves_unicode_emoji_names_and_reconstructs_paths_lazily ... ok
+test model::tests::raw_utf16_order_supports_names_that_cannot_be_unicode_strings ... ok
+test model::tests::root_indices_include_nested_real_roots_and_exclude_ordinary_descendants ... ok
+test model::tests::structural_validation_detects_broken_parent_reference ... ok
+test model::tests::synthetic_group_is_not_inserted_into_real_root_path ... ok
+test model::tests::u128_totals_preserve_values_beyond_u64_and_four_gibibytes ... ok
+test model::tests::unicode_is_not_normalized_when_selecting_an_owner ... ok
+test model::tests::unknown_allocation_is_contributed_once_for_an_identified_file ... ok
+test model::tests::unknown_metrics_keep_reason_source_and_propagate_counts ... ok
+test model::tests::same_directory_hard_links_are_order_independent_and_keep_path_metrics ... ok
+test sunburst::tests::aggregate_weights_above_four_gib_and_u64_use_u128_without_wrapping ... ok
+test sunburst::tests::a_small_hidden_branch_is_not_absorbed_by_threshold_grouping ... ok
+test sunburst::tests::an_arbitrary_zoom_root_resets_depth_and_overrides_its_hidden_marker ... ok
+test sunburst::tests::equal_weights_use_native_name_then_node_id_as_a_stable_tie_break ... ok
+test sunburst::tests::exact_radial_boundaries_belong_to_the_outer_ring ... ok
+test sunburst::tests::hidden_sectors_are_non_actionable_and_restore_exactly ... ok
+test sunburst::tests::hit_testing_owns_center_angular_and_outer_boundaries_deterministically ... ok
+test sunburst::tests::invalid_parameters_and_unknown_ids_return_typed_errors ... ok
+test sunburst::tests::missing_descendants_are_real_angular_gaps_in_outer_rings ... ok
+test sunburst::tests::partitions_exact_weight_and_forces_the_final_boundary ... ok
+test sunburst::tests::logical_and_allocated_metrics_select_independent_u128_weights ... ok
+test sunburst::tests::sector_budget_is_hard_and_coalesces_overflow_deterministically ... ok
+test sunburst::tests::shallow_and_deep_trees_fill_the_available_radius_up_to_the_depth_limit ... ok
+test sunburst::tests::small_real_siblings_are_grouped_without_a_fake_node_id ... ok
+test sunburst::tests::wraparound_sectors_and_exact_shared_boundaries_hit_correctly ... ok
+test sunburst::tests::radial_scale_precedes_hiding_threshold_grouping_and_sector_budget ... ok
+test sunburst::tests::large_grouping_budget_and_member_copy_observe_cancellation ... ok
+test sunburst::tests::zero_and_unknown_metrics_never_create_nan_geometry ... ok
+test sunburst::tests::zero_weight_list_is_scoped_to_the_zoom_root_and_capped ... ok
+test sunburst::tests::depth_lookup_uses_each_metric_and_does_not_walk_wide_descendants ... ok
+test model::tests::reconstructs_very_deep_paths_and_aggregates_without_recursion ... ok
+test sunburst::tests::obsolete_layout_stops_while_collecting_a_wide_directory ... ok
+test sunburst::tests::deterministic_fuzz_like_trees_preserve_geometry_and_hit_invariants ... ok
+test sunburst::tests::cancellable_sort_matches_stable_reference_and_can_abandon_every_phase ... ok
+test sunburst::tests::a_very_deep_tree_is_laid_out_iteratively ... ok
+test model::tests::freezing_can_be_cancelled_across_materialization_phases_without_a_partial_snapshot ... ok
+test sunburst::tests::direct_copy_merge_is_stable_for_partial_chunks_and_cancels_in_every_phase ... ok
+
+test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running unittests src\lib.rs (target\debug\deps\diskpie_platform-10432a5e22360ad5.exe)
+
+running 174 tests
+test windows::diagnostic_files::tests::commit_record_is_monotonic_and_reports_contention_as_uncertain ... ok
+test windows::diagnostic_files::tests::destination_classification_distinguishes_local_and_unc_paths ... ok
+test windows::diagnostic_files::tests::directory_parser_enforces_per_buffer_record_budget ... ok
+test windows::diagnostic_files::tests::directory_parser_is_bounded_and_makes_forward_progress ... ok
+test windows::diagnostic_files::tests::exact_log_name_requires_a_real_calendar_date ... ok
+test windows::diagnostic_files::tests::active_created_file_cleanup_is_armed_before_validation ... ok
+test windows::diagnostic_files::tests::injected_partial_replacement_runs_recovery_and_preserves_the_complete_sibling ... ok
+test windows::diagnostic_files::tests::export_temporary_denies_every_competing_open ... ok
+test windows::diagnostic_files::tests::case_sensitive_directory_keeps_exact_active_spelling ... ok
+test windows::diagnostic_files::tests::export_native_create_only_publication_refuses_a_final_interval_alias ... ok
+test windows::diagnostic_files::tests::collection_rejects_a_source_replaced_after_directory_enumeration ... ok
+test windows::diagnostic_files::tests::diagnostic_collection_discards_partial_prefix_records_under_tail_cap ... ok
+test windows::diagnostic_files::tests::export_refuses_reparse_destination_and_oversized_input ... ok
+test windows::diagnostic_files::tests::export_refuses_owned_path_and_hard_link_identity ... ok
+test windows::diagnostic_files::tests::marker_session_does_not_replace_an_initially_missing_target_that_appears ... ok
+test windows::diagnostic_files::tests::marker_session_preserves_a_leftover_sibling_and_refuses_to_commit_over_it ... ok
+test windows::diagnostic_files::tests::export_replacement_does_not_inherit_old_alternate_data_streams ... ok
+test windows::diagnostic_files::tests::marker_session_debug_and_errors_never_render_paths ... ok
+test windows::diagnostic_files::tests::export_creates_and_atomically_replaces_a_regular_destination ... ok
+test windows::diagnostic_files::tests::marker_session_rejects_invalid_payloads_before_touching_the_filesystem ... ok
+test windows::diagnostic_files::tests::diagnostic_collection_uses_recent_bounded_non_alias_sources ... ok
+test windows::diagnostic_files::tests::marker_session_rejects_non_sibling_network_and_same_name_layouts ... ok
+test windows::diagnostic_files::tests::export_supports_native_paths_longer_than_max_path ... ok
+test windows::diagnostic_files::tests::marker_session_lost_create_only_race_removes_the_never_renamed_sibling ... ok
+test windows::diagnostic_files::tests::marker_session_reports_oversized_and_non_ascii_slots_without_bytes ... ok
+test windows::diagnostic_files::tests::ordering_of_valid_names_matches_date_order ... ok
+test windows::diagnostic_files::tests::marker_session_reconcile_preserves_a_foreign_identity_or_owner ... ok
+test windows::diagnostic_files::tests::marker_session_delete_explicit_deletes_only_identity_matched_slots ... ok
+test windows::diagnostic_files::tests::marker_session_refuses_a_swapped_target_identity_at_commit ... ok
+test windows::diagnostic_files::tests::native_marker_writer_is_bounded_redacted_and_sibling_only ... ok
+test windows::diagnostic_files::tests::marker_session_creates_and_replaces_without_leaving_a_sibling ... ok
+test windows::diagnostic_files::tests::retention_cycle_enforces_total_entry_budget_without_wraparound ... ok
+test windows::diagnostic_files::tests::marker_session_recreates_an_inspected_target_that_disappeared ... ok
+test windows::diagnostic_files::tests::public_errors_never_render_paths ... ok
+test windows::diagnostic_files::tests::native_marker_writer_refuses_reparse_or_directory_target_and_cleans_sibling ... ok
+test windows::diagnostic_files::tests::prepared_export_does_not_write_until_commit_and_refuses_new_destination ... ok
+test windows::diagnostic_files::tests::prepared_export_retains_owned_source_and_refuses_late_alias ... ok
+test windows::diagnostic_files::tests::marker_session_reports_reparse_directory_and_hard_link_targets_untouched ... ok
+test windows::diagnostic_files::tests::wide_helpers_preserve_non_scalar_units ... ok
+test windows::diagnostic_files::tests::windows_not_found_codes_map_without_localized_text ... ok
+test windows::diagnostic_files::tests::prepared_export_retains_existing_identity_and_protects_log_aliases ... ok
+test windows::diagnostic_files::tests::marker_session_reconcile_restores_previous_or_removes_owned_marker ... ok
+test windows::diagnostic_files::tests::retention_rejects_a_reparse_root_without_touching_its_target ... ok
+test windows::diagnostic_files::tests::tail_reader_seeks_once_reads_only_initial_tail_and_refuses_a_short_read ... ok
+test windows::diagnostic_files::tests::marker_session_supports_native_paths_longer_than_max_path ... ok
+test windows::diagnostic_files::tests::writer_real_clock_creates_the_current_utc_name ... ok
+test windows::diagnostic_files::tests::native_marker_writer_creates_and_replaces_complete_content ... ok
+test windows::diagnostic_files::tests::writer_detects_or_blocks_ancestor_namespace_replacement ... ok
+test windows::diagnostic_files::tests::writer_refuses_a_second_concurrent_active_writer ... ok
+test windows::diagnostic_files::tests::writer_refuses_an_existing_competing_write_handle ... ok
+test windows::diagnostic_files::tests::writer_rejects_active_hard_link_identity ... ok
+test windows::diagnostic_files::tests::writer_rejects_append_when_existing_active_file_is_oversized ... ok
+test windows::diagnostic_files::tests::writer_rejects_active_leaf_reparse_without_touching_target ... ok
+test windows::diagnostic_files::tests::retention_caps_safe_future_names_without_evicting_the_active_log ... ok
+test windows::explorer_integration::tests::command_templates_round_trip_selected_paths_through_the_windows_argv_parser ... ok
+test windows::diagnostic_files::tests::retention_keeps_only_eight_newest_exact_regular_files ... ok
+test windows::explorer_integration::tests::foreign_key_reports_conflict_without_overwrite ... ok
+test windows::diagnostic_files::tests::writer_enforces_complete_record_daily_byte_cap ... ok
+test windows::diagnostic_files::tests::retention_never_follows_a_matching_reparse_point ... ok
+test windows::diagnostic_files::tests::retention_preserves_a_leaf_when_delete_sharing_is_denied ... ok
+test windows::filesystem::tests::converts_unc_and_preserves_existing_extended_paths ... ok
+test windows::diagnostic_files::tests::retention_preserves_multiply_linked_exact_leaf_and_reports_residual ... ok
+test windows::diagnostic_files::tests::writer_uses_injected_utc_date_and_rolls_before_the_next_record ... ok
+test windows::filesystem::tests::directory_parser_preserves_native_names_and_rejects_malformed_buffers ... ok
+test windows::filesystem::tests::direct_cancel_token_stops_before_opening_directory ... ok
+test windows::explorer_integration::tests::port_operations_are_exact_and_errors_carry_no_paths ... ok
+test windows::filesystem::tests::directory_reparse_points_are_boundaries_and_reparse_roots_are_rejected ... ok
+test windows::filesystem::tests::disappearance_after_enumeration_reports_unknown_allocation_and_an_omission ... ok
+test windows::filesystem::tests::cancellation_during_retained_batch_stops_before_the_next_entry ... ok
+test windows::filesystem::tests::empty_directory_finishes_and_file_roots_are_rejected ... ok
+test windows::filesystem::tests::directory_below_a_junction_is_rejected_before_any_entry_is_emitted ... ok
+test windows::filesystem::tests::native_open_accepts_case_insensitive_dos_root_spelling ... ok
+test windows::filesystem::tests::path_conversion_preserves_non_scalar_utf16_and_rejects_device_namespaces ... ok
+test windows::filesystem::tests::prefixes_absolute_dos_paths_without_resolving_components ... ok
+test windows::filesystem::tests::enumerates_one_level_with_unicode_and_emoji_names ... ok
+test windows::filesystem::tests::hard_links_share_volume_and_128_bit_file_identity ... ok
+test windows::filesystem::tests::pure_classification_fails_closed_for_reparse_and_cloud_boundaries ... ok
+test windows::filesystem::tests::full_directory_information_fallback_keeps_names_and_reparse_boundaries ... ok
+test windows::diagnostic_files::tests::writer_supports_long_and_non_unicode_directory_names ... ok
+test windows::explorer_integration::tests::install_writes_exact_reg_sz_keys_and_round_trips_native_text ... ok
+test windows::explorer_integration::tests::remove_deletes_only_owned_subtrees_and_is_idempotent ... ok
+test windows::explorer_integration::tests::repeated_install_is_idempotent_and_leaves_the_tree_byte_identical ... ok
+test windows::explorer_integration::tests::leftover_staging_sibling_is_visible_as_a_stray_and_removed ... ok
+test windows::project_paths::tests::com_scope_classification_balances_success_but_not_existing_apartment ... ok
+test windows::project_paths::tests::debug_output_reports_availability_without_absolute_paths ... ok
+test windows::project_paths::tests::directory_creation_is_explicit_scoped_and_injectable ... ok
+test windows::project_paths::tests::errors_retain_exact_hresult_category_without_absolute_path ... ok
+test windows::project_paths::tests::failure_output_is_released_before_hresult_is_returned ... ok
+test windows::project_paths::tests::independent_root_failures_keep_other_facilities_available ... ok
+test windows::project_paths::tests::layout_uses_exact_stable_native_components ... ok
+test windows::filesystem::tests::retained_directory_handle_supports_policy_and_enumeration_queries ... ok
+test windows::project_paths::tests::successful_null_or_relative_output_is_invalid_native_data ... ok
+test windows::project_paths::tests::successful_utf16_copy_is_lossless_and_allocation_is_released ... ok
+test windows::filesystem::tests::reparse_files_are_reported_but_never_target_opened ... ok
+test windows::project_paths::tests::unavailable_and_io_creation_errors_are_sanitized_without_paths ... ok
+test windows::explorer_integration::tests::moved_executable_is_reported_stale_without_mutation_and_repair_replaces_it ... ok
+test windows::settings_file::tests::commit_rejects_oversized_and_empty_payloads ... ok
+test windows::settings_file::tests::committed_outcome_is_debug_and_eq_safe ... ok
+test windows::project_paths::tests::real_resolution_uses_an_existing_sta_without_changing_its_mode ... ok
+test windows::project_paths::tests::real_resolution_is_absolute_read_only_and_matches_known_folder_layout ... ok
+test windows::settings_file::tests::error_display_never_contains_a_path ... ok
+test windows::explorer_integration::tests::adjacent_keys_are_byte_identical_across_install_repair_and_remove ... ok
+test windows::settings_file::tests::directory_target_is_rejected ... ok
+test windows::settings_file::tests::hard_linked_target_is_rejected ... ok
+test windows::shell_actions::tests::delete_flag_profiles_are_exact ... ok
+test windows::shell_actions::tests::empty_bin_classification_reports_partial_mutation_honestly ... ok
+test windows::settings_file::tests::initially_missing_target_that_appears_is_a_conflict ... ok
+test windows::shell_actions::tests::installed_apps_uses_only_the_fixed_uri_and_reports_failure ... ok
+test windows::settings_file::tests::oversized_document_is_reported_without_reading_payload ... ok
+test windows::settings_file::tests::reparse_target_is_rejected_without_touching_its_target ... ok
+test windows::shell_actions::tests::open_marshals_the_exact_path_verb_owner_and_mask ... ok
+test windows::shell_actions::tests::recycle_bin_root_is_null_only_for_all_drives ... ok
+test windows::shell_actions::tests::open_reports_each_failing_stage_and_never_executes_after_item_failure ... ok
+test windows::filesystem::tests::retained_native_paths_support_long_directories_and_non_scalar_names ... ok
+test windows::shell_actions::tests::reveal_parses_the_display_name_and_selects_without_a_command_line ... ok
+test windows::shell_actions::tests::win32_code_unwraps_only_facility_win32_hresults ... ok
+test windows::filesystem::tests::replacing_open_directory_with_junction_does_not_redirect_later_metadata ... ok
+test windows::filesystem::tests::replacing_ancestor_with_junction_does_not_redirect_later_metadata ... ok
+test windows::settings_file::tests::read_missing_and_commit_creates_atomically ... ok
+test windows::shell_actions::tests::identity_validation_matches_missing_kind_and_identity_changes ... ok
+test windows::shell_service::tests::cancellation_is_only_the_documented_hresult ... ok
+test windows::shell_service::tests::a_payload_rewrapped_in_the_other_destructive_variant_is_refused_unrun ... ok
+test windows::shell_actions::tests::post_operation_observation_distinguishes_gone_present_and_swapped ... ok
+test windows::shell_actions::tests::run_delete_refuses_scan_and_filesystem_roots_before_any_native_call ... ok
+test windows::shell_service::tests::com_startup_classification_balances_all_success_codes ... ok
+test windows::shell_service::tests::cleanup_error_mapping_preserves_primary_hresult ... ok
+test windows::shell_service::tests::cleanup_guard_runs_once_on_finish_and_during_unwind ... ok
+test windows::shell_service::tests::completed_modal_stays_outstanding_until_its_event_is_delivered ... ok
+test windows::shell_service::tests::configuration_rejects_unbounded_or_empty_capacity ... ok
+test windows::shell_service::tests::disconnected_queue_releases_modal_reservation ... ok
+test windows::shell_service::tests::disconnected_reaper_returns_the_payload_without_blocking ... ok
+test windows::shell_service::tests::gated_deleting_a_directory_link_leaves_the_external_sentinel_intact ... ok
+test windows::settings_file::tests::commit_replaces_an_existing_owned_document ... ok
+test windows::shell_service::tests::gated_permanent_delete_of_a_temp_file_completes_without_recycle_evidence ... ok
+test windows::shell_service::tests::destructive_requests_are_serialized_and_redact_paths ... ok
+test windows::shell_service::tests::gated_recycle_of_a_temp_directory_produces_recycle_bin_evidence ... ok
+test windows::shell_service::tests::gated_recycle_of_a_temp_file_produces_recycle_bin_evidence ... ok
+test windows::shell_service::tests::options_preserve_existing_bits_and_add_exact_folder_contract ... ok
+test windows::shell_service::tests::owned_events_and_requests_are_send_without_com_pointers ... ok
+test windows::shell_service::tests::legacy_shutdown_repeats_a_recorded_worker_panic ... ok
+test windows::shell_service::tests::queue_is_nonblocking_bounded_and_modal_is_serialized ... ok
+test windows::shell_service::tests::queued_shutdown_emits_plain_failed_event_and_releases_modal ... ok
+test windows::shell_actions::tests::run_delete_refuses_a_swapped_target_without_mutating_it ... ok
+test windows::shell_service::tests::request_panic_produces_one_terminal_event_and_releases_modal_on_delivery ... ok
+test windows::shell_service::tests::precancelled_requests_never_reach_the_shell ... ok
+test windows::settings_file::tests::inspected_target_that_disappears_is_recreated_not_a_permanent_failure ... ok
+test windows::settings_file::tests::repeated_commits_track_replacement_state_and_leave_no_sibling ... ok
+test windows::shell_service::tests::selected_event_debug_output_redacts_the_native_path ... ok
+test windows::shell_service::tests::request_shutdown_is_nonblocking_idempotent_and_closes_acceptance ... ok
+test windows::shell_service::tests::precreated_reaper_is_shared_by_every_start_in_a_registry ... ok
+test windows::shell_service::tests::terminal_event_mapping_covers_every_request_kind ... ok
+test windows::shell_service::tests::utf16_copy_helper_preserves_unpaired_surrogates ... ok
+test windows::shell_service::tests::terminal_transition_drains_a_submit_already_inside_the_acceptance_gate ... ok
+test windows::shell_service::tests::service_starts_pumps_and_shuts_down_without_showing_ui ... ok
+test windows::startup_feedback::tests::attaching_in_a_console_process_is_idempotent_and_keeps_existing_handles ... ok
+test windows::shell_service::tests::finish_of_a_clean_worker_reports_exit_and_allows_restart ... ok
+test windows::startup_feedback::tests::wide_strings_are_nul_terminated_without_interior_nuls ... ok
+test windows::startup_feedback::tests::win32_error_classification_requires_the_win32_facility ... ok
+test windows::volumes::tests::deterministic_fallback_key_is_stable_case_insensitive_and_lossless ... ok
+test windows::volumes::tests::device_identity_groups_partitions_only_with_explicit_device_evidence ... ok
+test windows::volumes::tests::extended_path_conversion_accepts_only_absolute_dos_and_unc ... ok
+test windows::volumes::tests::parses_multisz_mount_points_without_lossy_conversion ... ok
+test windows::volumes::tests::storage_classification_never_guesses_fixed_media ... ok
+test windows::volumes::tests::volume_guid_is_parsed_directly_without_hashing ... ok
+test windows::volumes::tests::discovery_is_read_only_partial_and_contains_stable_volume_records ... ok
+test windows::shell_service::tests::cancel_registry_tracks_outstanding_requests_only ... ok
+test windows::shell_service::tests::panicking_worker_reports_the_panic_and_releases_the_claim ... ok
+test windows::volumes::tests::resolves_current_absolute_path_read_only_and_stably ... ok
+test windows::filesystem::tests::disappearing_entries_do_not_abort_or_panic ... ok
+test windows::shell_service::tests::swapped_target_reports_target_changed_through_the_live_service_without_mutation ... ok
+test windows::shell_service::tests::reaper_joins_the_worker_before_releasing_its_claim ... ok
+test windows::shell_service::tests::saturated_reaper_fails_closed_and_retains_the_claim ... ok
+test windows::shell_service::tests::drop_of_a_stalled_service_returns_promptly_and_restart_waits_for_real_exit ... ok
+test windows::shell_service::tests::finish_hands_a_stalled_worker_to_the_reaper_within_the_deadline ... ok
+
+test result: ok. 174 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.15s
+
+     Running tests\scan_integration.rs (target\debug\deps\scan_integration-e2769c309e8840a6.exe)
+
+running 10 tests
+test sparse_files_over_4_gib_report_logical_eof_and_tiny_allocation ... ok
+test unicode_emoji_and_non_scalar_names_survive_end_to_end ... ok
+test junction_loop_is_a_boundary_and_counts_are_exact ... ok
+test scan_to_layout_conserves_angles_and_keeps_boundaries_childless ... ok
+test symlink_loop_is_a_boundary_and_counts_are_exact ... ok
+test denied_directory_is_an_omission_and_siblings_complete ... ok
+test hard_links_count_paths_logically_and_identity_once_for_allocation ... ok
+test long_native_paths_are_scanned_to_the_bottom ... ok
+test compressed_file_reports_filesystem_allocation_below_logical_size ... ok
+test repeated_cancel_and_rescan_neither_leaks_nor_drifts ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.06s
+
+     Running unittests src\lib.rs (target\debug\deps\diskpie_scan-2a64bdc173000795.exe)
+
+running 17 tests
+test coordinator::pending_queue_tests::a_rejected_item_returns_to_the_head_of_its_volume_and_rotation ... ok
+test coordinator::pending_queue_tests::keeps_fifo_within_a_volume_and_rotates_across_volumes ... ok
+test coordinator::pending_queue_tests::clear_empties_every_volume ... ok
+test tests::already_cancelled_token_prevents_any_filesystem_visit ... ok
+test tests::emits_bounded_partial_batches_and_directory_completion ... ok
+test coordinator::pending_queue_tests::a_saturated_volume_is_skipped_without_losing_its_work ... ok
+test tests::directory_reparse_points_are_reported_but_never_enqueued ... ok
+test tests::access_denied_is_an_omission_and_other_directories_continue ... ok
+test tests::provider_panic_surfaces_as_typed_failure_and_cleans_up ... ok
+test coordinator::pending_queue_tests::wide_frontier_shares_native_parent_and_materializes_only_selected_child ... ok
+test tests::cancellation_mid_directory_returns_promptly_with_partial_progress ... ok
+test tests::cancellation_escapes_full_event_and_result_channels ... ok
+test tests::exposes_nonblocking_coordinator_completion_for_ui_polling ... ok
+test tests::per_volume_network_cap_bounds_workers_and_join_releases_every_arc ... ok
+test tests::generations_reject_late_events_from_a_cancelled_scan ... ok
+test tests::scans_deep_and_wide_trees_iteratively ... ok
+test tests::event_and_result_backpressure_resume_without_busy_spinning ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.95s
+
+   Doc-tests diskpie_app
+
+running 1 test
+test crates\diskpie-app\src\diagnostics\events.rs - diagnostics::events::DiagnosticEvent (line 479) - compile fail ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+   Doc-tests diskpie_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests diskpie_platform
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests diskpie_scan
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

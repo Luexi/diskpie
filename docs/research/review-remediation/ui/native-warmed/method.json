@@ -1,0 +1,7 @@
+﻿{
+    "DateUTC":  "2026-09-07T23:42:30.2307630Z",
+    "Runs":  7,
+    "FixtureAccess":  "read-only",
+    "Warmup":  "One entire baseline process using the same real fixture before every measured process; warmup excluded from reported timers",
+    "ProcessSampling":  "none in this short control"
+}

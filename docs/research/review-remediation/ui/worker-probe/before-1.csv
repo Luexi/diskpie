@@ -1,0 +1,3 @@
+variant,run,phase,was_busy_before_request,elapsed_ms
+before,1,supersede_to_small_completion,true,425.686100
+before,1,shutdown_drop_to_join,true,388.713700

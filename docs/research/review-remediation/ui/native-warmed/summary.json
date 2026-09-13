@@ -1,0 +1,20 @@
+{
+  "before": {
+    "scan_reduce_ms": 285.009,
+    "snapshot_ms": 5.892,
+    "layout_ms": 0.687,
+    "first_batch_ms": 16.51,
+    "cancel_join_ms": 0.82,
+    "min_scan_reduce_ms": 254.492,
+    "max_scan_reduce_ms": 311.037
+  },
+  "after": {
+    "scan_reduce_ms": 287.016,
+    "snapshot_ms": 6.349,
+    "layout_ms": 0.615,
+    "first_batch_ms": 17.029,
+    "cancel_join_ms": 0.539,
+    "min_scan_reduce_ms": 266.305,
+    "max_scan_reduce_ms": 409.908
+  }
+}

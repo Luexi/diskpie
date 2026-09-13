@@ -20,3 +20,11 @@ adapter, defer pending benchmarks, study without copying, or reject.
 
 Product-facing UI decisions are recorded in
 [`ui-product-direction.md`](ui-product-direction.md).
+The accepted Scanner renovado implementation has a separate
+[`validation record`](scanner-renovado-validation.md) for native captures,
+automated checks and the limits of its CPU benchmarks.
+
+The subsequent [review remediation record](review-remediation-validation.md)
+tracks correctness fixes, retained native enumeration, schema-2 diagnostics,
+depth/root indexing and new performance measurements. It preserves the original
+reference sources, raw results and acceptance limits.

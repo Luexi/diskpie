@@ -1,0 +1,14 @@
+   Compiling diskpie-core v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-core)
+   Compiling diskpie-scan v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-scan)
+   Compiling diskpie-app v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-app)
+   Compiling diskpie-platform v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-platform)
+   Compiling diskpie-bench v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\tools\diskpie-bench)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.96s
+     Running unittests src\main.rs (target/bench-tests\debug\deps\diskpie_bench-422e50a2ce9b0fc8.exe)
+
+running 2 tests
+test batch_prototype::tests::rejects_truncated_and_invalid_offsets ... ok
+test tests::batch_matches_conventional_for_native_names_hard_links_and_directories ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -1,0 +1,14 @@
+   Compiling diskpie-app v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-app)
+   Compiling diskpie-platform v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-platform)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.62s
+     Running unittests src\lib.rs (target\debug\deps\diskpie_platform-85ae97973ea98204.exe)
+
+running 4 tests
+test windows::shell_service::tests::gated_deleting_a_directory_link_leaves_the_external_sentinel_intact ... ok
+test windows::shell_service::tests::gated_permanent_delete_of_a_temp_file_completes_without_recycle_evidence ... ok
+test windows::shell_service::tests::gated_recycle_of_a_temp_directory_produces_recycle_bin_evidence ... directory recycle evidence: Completed { items: [ItemResult { code: 2555912, effect: Recycled { receipt: RecycleReceipt { display_name_present: true } } }], assurance: KindOnly }
+ok
+test windows::shell_service::tests::gated_recycle_of_a_temp_file_produces_recycle_bin_evidence ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 170 filtered out; finished in 0.72s
+

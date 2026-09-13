@@ -1,0 +1,8 @@
+﻿{
+    "DateUTC":  "2026-09-07T23:30:04.7913974Z",
+    "Runs":  7,
+    "Fixture":  "C:\\Users\\Luis\\Desktop\\scan\\diskpie\\target\\bench-fixture-10000",
+    "FixtureAccess":  "read-only",
+    "SamplingMilliseconds":  10,
+    "Note":  "CPU and process samples; not GPU/display FPS or causal allocation accounting."
+}

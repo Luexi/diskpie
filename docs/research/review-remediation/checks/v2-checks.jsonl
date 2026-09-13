@@ -1,0 +1,8 @@
+{"Name":"v2-fmt","ExitCode":0,"Seconds":0.7479594,"Command":"cargo fmt --all -- --check"}
+{"Name":"v2-clippy","ExitCode":0,"Seconds":5.803155,"Command":"cargo clippy --workspace --all-targets --all-features --locked -- -D warnings"}
+{"Name":"v2-test","ExitCode":0,"Seconds":18.2370153,"Command":"cargo test --workspace --all-features --locked"}
+{"Name":"v2-doc","ExitCode":0,"Seconds":22.3428704,"Command":"cargo doc --workspace --no-deps --locked"}
+{"Name":"v2-release","ExitCode":0,"Seconds":22.1649244,"Command":"cargo build --release -p diskpie --locked"}
+{"Name":"v2-harness-fmt","ExitCode":0,"Seconds":0.9950141,"Command":"cargo fmt --manifest-path tools/diskpie-bench/Cargo.toml --all -- --check"}
+{"Name":"v2-harness-clippy","ExitCode":0,"Seconds":3.1781086,"Command":"cargo clippy --manifest-path tools/diskpie-bench/Cargo.toml --all-targets --locked --target-dir target/bench-tests -- -D warnings"}
+{"Name":"v2-harness-test","ExitCode":0,"Seconds":10.4258374,"Command":"cargo test --manifest-path tools/diskpie-bench/Cargo.toml --locked --target-dir target/bench-tests"}
