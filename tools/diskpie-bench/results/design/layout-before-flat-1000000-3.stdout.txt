@@ -1,0 +1,2 @@
+variant,run,scenario,requested_entries,nodes,scan_reduce_ms,snapshot_ms,layout_ms,first_batch_ms,cancel_join_ms,peak_pending,sectors,node_record_bytes,logical_bytes,allocated_bytes
+before,3,flat,1000000,1000001,739.953,1020.965,586.537,0.709,0.382,1,2,288,500500000,4096000000
