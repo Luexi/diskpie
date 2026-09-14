@@ -26,6 +26,21 @@ other navigation may be appropriate when demonstrated by the actual screens.
 Create original design assets and wording; DiskBuddy's public features are a
 scope reference, not permission to copy its code, graphics or interface.
 
+## Implemented composition (2026-09-07)
+
+[ADR 0021](../adr/0021-scanner-renovado.md) records the current map-first
+composition: one compact toolbar (location, navigation, rescan, cancel, metric,
+Show list, Tools), an informative map center, a footer with hover/focus detail
+and progress, and an optional 260–400 point list panel with search, name/size
+ordering and collapsible details; below 800 points the control switches between
+map and list. Surfaces are neutral light/dark, Segoe UI is preferred when
+installed, body text is 14 points and small/numeric text 13 points. Sunburst
+rings adapt their depth to the tree and color families follow native paths.
+Native captures and checks are in the
+[redesign validation record](scanner-renovado-validation.md). This composition
+is the starting point for the view switcher, inspector and cleanup basket below,
+not a finished design for them.
+
 ## Information and interaction
 
 - Keep the current location, scan state and primary navigation easy to find.

@@ -1,0 +1,6 @@
+   Compiling diskpie-core v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-core)
+   Compiling diskpie-scan v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-scan)
+   Compiling diskpie-app v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-app)
+   Compiling diskpie-platform v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-platform)
+   Compiling diskpie v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie)
+    Finished `release` profile [optimized] target(s) in 22.07s

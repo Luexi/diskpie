@@ -1,0 +1,30 @@
+fixture=event run=1 variant=before schema=1 sources=8 input_bytes=7930000 lines=65000 artifact_bytes=7931137 elapsed_ms=291.769
+fixture=event run=1 variant=after schema=2 sources=8 input_bytes=7930000 lines=65000 artifact_bytes=7931119 elapsed_ms=204.847
+fixture=event run=2 variant=after schema=2 sources=8 input_bytes=7930000 lines=65000 artifact_bytes=7931119 elapsed_ms=218.120
+fixture=event run=2 variant=before schema=1 sources=8 input_bytes=7930000 lines=65000 artifact_bytes=7931137 elapsed_ms=274.773
+fixture=event run=3 variant=before schema=1 sources=8 input_bytes=7930000 lines=65000 artifact_bytes=7931137 elapsed_ms=286.472
+fixture=event run=3 variant=after schema=2 sources=8 input_bytes=7930000 lines=65000 artifact_bytes=7931119 elapsed_ms=200.724
+fixture=event run=4 variant=after schema=2 sources=8 input_bytes=7930000 lines=65000 artifact_bytes=7931119 elapsed_ms=202.734
+fixture=event run=4 variant=before schema=1 sources=8 input_bytes=7930000 lines=65000 artifact_bytes=7931137 elapsed_ms=277.432
+fixture=event run=5 variant=before schema=1 sources=8 input_bytes=7930000 lines=65000 artifact_bytes=7931137 elapsed_ms=276.000
+fixture=event run=5 variant=after schema=2 sources=8 input_bytes=7930000 lines=65000 artifact_bytes=7931119 elapsed_ms=194.791
+fixture=event run=6 variant=after schema=2 sources=8 input_bytes=7930000 lines=65000 artifact_bytes=7931119 elapsed_ms=201.169
+fixture=event run=6 variant=before schema=1 sources=8 input_bytes=7930000 lines=65000 artifact_bytes=7931137 elapsed_ms=281.284
+fixture=event run=7 variant=before schema=1 sources=8 input_bytes=7930000 lines=65000 artifact_bytes=7931137 elapsed_ms=278.898
+fixture=event run=7 variant=after schema=2 sources=8 input_bytes=7930000 lines=65000 artifact_bytes=7931119 elapsed_ms=207.166
+fixture=blank run=1 variant=before schema=1 sources=8 input_bytes=1048576 lines=1048576 artifact_bytes=1049717 elapsed_ms=1176.004
+fixture=blank run=1 variant=after schema=2 sources=8 input_bytes=1048576 lines=1048576 artifact_bytes=1049699 elapsed_ms=29.229
+fixture=blank run=2 variant=after schema=2 sources=8 input_bytes=1048576 lines=1048576 artifact_bytes=1049699 elapsed_ms=28.815
+fixture=blank run=2 variant=before schema=1 sources=8 input_bytes=1048576 lines=1048576 artifact_bytes=1049717 elapsed_ms=1186.860
+fixture=blank run=3 variant=before schema=1 sources=8 input_bytes=1048576 lines=1048576 artifact_bytes=1049717 elapsed_ms=1260.000
+fixture=blank run=3 variant=after schema=2 sources=8 input_bytes=1048576 lines=1048576 artifact_bytes=1049699 elapsed_ms=32.903
+fixture=blank run=4 variant=after schema=2 sources=8 input_bytes=1048576 lines=1048576 artifact_bytes=1049699 elapsed_ms=31.044
+fixture=blank run=4 variant=before schema=1 sources=8 input_bytes=1048576 lines=1048576 artifact_bytes=1049717 elapsed_ms=1187.749
+fixture=blank run=5 variant=before schema=1 sources=8 input_bytes=1048576 lines=1048576 artifact_bytes=1049717 elapsed_ms=1171.839
+fixture=blank run=5 variant=after schema=2 sources=8 input_bytes=1048576 lines=1048576 artifact_bytes=1049699 elapsed_ms=30.639
+fixture=blank run=6 variant=after schema=2 sources=8 input_bytes=1048576 lines=1048576 artifact_bytes=1049699 elapsed_ms=33.439
+fixture=blank run=6 variant=before schema=1 sources=8 input_bytes=1048576 lines=1048576 artifact_bytes=1049717 elapsed_ms=1166.614
+fixture=blank run=7 variant=before schema=1 sources=8 input_bytes=1048576 lines=1048576 artifact_bytes=1049717 elapsed_ms=1337.725
+fixture=blank run=7 variant=after schema=2 sources=8 input_bytes=1048576 lines=1048576 artifact_bytes=1049699 elapsed_ms=30.438
+median fixture=event before_ms=278.898 after_ms=202.734 change_percent=-27.31
+median fixture=blank before_ms=1186.86 after_ms=30.639 change_percent=-97.42

@@ -115,7 +115,8 @@ pub struct LayoutOptions {
     pub size_basis: SizeBasis,
     /// Clockwise start angle in radians; zero points right in screen space.
     pub start_angle: f64,
-    /// Radius of the central root sector in normalized chart coordinates.
+    /// Radius of the central root sector when descendant rings exist.
+    /// A root without representable descendants fills the normalized disk.
     pub center_radius: f64,
     /// Maximum number of descendant rings. The center has depth zero.
     pub max_depth: u32,
@@ -133,7 +134,7 @@ impl LayoutOptions {
             root,
             size_basis: SizeBasis::Logical,
             start_angle: -std::f64::consts::FRAC_PI_2,
-            center_radius: 0.2,
+            center_radius: 0.28,
             max_depth: 8,
             minimum_sweep: 0.002,
             max_sectors: 10_000,
@@ -296,6 +297,7 @@ pub struct SunburstLayout {
     source_generation: GenerationId,
     root: NodeId,
     size_basis: SizeBasis,
+    effective_depth: u32,
     sectors: Vec<Sector>,
     rings: Vec<Ring>,
     member_pool: Vec<NodeId>,
@@ -320,6 +322,13 @@ impl SunburstLayout {
     #[must_use]
     pub const fn size_basis(&self) -> SizeBasis {
         self.size_basis
+    }
+
+    /// Positive-weight depth before hiding, grouping or applying sector budgets.
+    /// It is capped by the request's maximum depth, not by emitted geometry.
+    #[must_use]
+    pub const fn effective_depth(&self) -> u32 {
+        self.effective_depth
     }
 
     /// Displayed sectors, grouped by depth and sorted by start angle per ring.
@@ -577,7 +586,7 @@ struct PendingSector {
     sweep_angle: f64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct ChildCandidate {
     node_id: NodeId,
     weight: u128,
@@ -614,11 +623,27 @@ pub fn compute_layout(
     options: LayoutOptions,
     hidden_branches: &HiddenBranches,
 ) -> Result<SunburstLayout, LayoutError> {
+    Ok(compute_layout_cancellable(snapshot, options, hidden_branches, || false)?
+        .expect("an uncancelled layout produces a result"))
+}
+
+/// Computes a layout off-thread, abandoning obsolete work at traversal boundaries.
+/// Cancellation yields no partial geometry. The ordinary API has identical output.
+pub fn compute_layout_cancellable(
+    snapshot: &TreeSnapshot,
+    options: LayoutOptions,
+    hidden_branches: &HiddenBranches,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<Option<SunburstLayout>, LayoutError> {
+    if cancelled() {
+        return Ok(None);
+    }
     validate_options(snapshot, options)?;
     let root_record =
         snapshot.node(options.root).ok_or(LayoutError::UnknownRoot { root: options.root })?;
     let (root_weight, root_unknown_entries) = selected_size(root_record, options.size_basis);
     let start_angle = normalize_angle(options.start_angle);
+    let effective_depth = effective_depth(root_record, options);
 
     let mut sectors = Vec::with_capacity(options.max_sectors.min(snapshot.len().max(1)));
     sectors.push(Sector {
@@ -628,7 +653,7 @@ pub fn compute_layout(
         start_angle,
         sweep_angle: FULL_TURN,
         inner_radius: 0.0,
-        outer_radius: options.center_radius,
+        outer_radius: if effective_depth == 0 { 1.0 } else { options.center_radius },
         weight: root_weight,
         unknown_entries: root_unknown_entries,
     });
@@ -643,66 +668,107 @@ pub fn compute_layout(
         });
     }
 
-    let ring_width = if options.max_depth == 0 {
+    let ring_width = if effective_depth == 0 {
         0.0
     } else {
-        (1.0 - options.center_radius) / f64::from(options.max_depth)
+        (1.0 - options.center_radius) / f64::from(effective_depth)
     };
     let mut member_pool = Vec::new();
     let mut zero_weight_nodes = Vec::new();
     let mut budget_exhausted = false;
 
     while let Some(parent) = pending.pop_front() {
+        if cancelled() {
+            return Ok(None);
+        }
         if parent.depth >= options.max_depth {
             continue;
         }
+        // Preserve the root's bounded zero-weight list, but never enumerate
+        // descendants of sectors when the output budget is already exhausted.
+        if parent.depth > 0 && sectors.len() == options.max_sectors {
+            budget_exhausted |=
+                snapshot.node(parent.node_id).is_some_and(|node| node.first_child().is_some());
+            continue;
+        }
 
-        let mut children = collect_children(
+        let Some(mut children) = collect_children(
             snapshot,
             options.size_basis,
             hidden_branches,
             parent.node_id,
             (parent.depth == 0).then_some((&mut zero_weight_nodes, options.max_sectors)),
-        )?;
+            &mut cancelled,
+        )?
+        else {
+            return Ok(None);
+        };
         if children.is_empty() {
             continue;
         }
-        children.sort_by(|left, right| compare_candidates(left, right, snapshot));
+        if sectors.len() == options.max_sectors {
+            budget_exhausted = true;
+            continue;
+        }
+        if !sort_copy_cancellable(
+            &mut children,
+            |left, right| compare_candidates(left, right, snapshot),
+            &mut cancelled,
+        ) {
+            return Ok(None);
+        }
 
-        let total_weight = children.iter().try_fold(0_u128, |total, child| {
-            total
+        let mut total_weight = 0_u128;
+        for (index, child) in children.iter().enumerate() {
+            if index.is_multiple_of(256) && cancelled() {
+                return Ok(None);
+            }
+            total_weight = total_weight
                 .checked_add(child.weight)
-                .ok_or(LayoutError::WeightOverflow { parent: parent.node_id })
-        })?;
-        let mut units = group_small_children(
+                .ok_or(LayoutError::WeightOverflow { parent: parent.node_id })?;
+        }
+        let Some(mut units) = group_small_children(
             children,
             total_weight,
             parent.sweep_angle,
             options.minimum_sweep,
             parent.node_id,
-        )?;
-        sort_units(&mut units, snapshot);
+            &mut cancelled,
+        )?
+        else {
+            return Ok(None);
+        };
+        if !sort_units(&mut units, snapshot, &mut cancelled) {
+            return Ok(None);
+        }
 
         let remaining = options.max_sectors - sectors.len();
         if units.len() > remaining {
             budget_exhausted = true;
-            enforce_budget(&mut units, remaining, parent.node_id)?;
-            sort_units(&mut units, snapshot);
+            if !enforce_budget(&mut units, remaining, parent.node_id, &mut cancelled)?
+                || !sort_units(&mut units, snapshot, &mut cancelled)
+            {
+                return Ok(None);
+            }
         }
         if units.is_empty() {
             continue;
         }
 
-        let displayed_total = units.iter().try_fold(0_u128, |total, unit| {
-            total
+        let mut displayed_total = 0_u128;
+        for (index, unit) in units.iter().enumerate() {
+            if index.is_multiple_of(256) && cancelled() {
+                return Ok(None);
+            }
+            displayed_total = displayed_total
                 .checked_add(unit.weight)
-                .ok_or(LayoutError::WeightOverflow { parent: parent.node_id })
-        })?;
+                .ok_or(LayoutError::WeightOverflow { parent: parent.node_id })?;
+        }
         debug_assert_eq!(displayed_total, total_weight);
 
         let child_depth = parent.depth + 1;
         let inner_radius = options.center_radius + ring_width * f64::from(child_depth - 1);
-        let outer_radius = if child_depth == options.max_depth {
+        let outer_radius = if child_depth == effective_depth {
             1.0
         } else {
             options.center_radius + ring_width * f64::from(child_depth)
@@ -713,6 +779,9 @@ pub fn compute_layout(
         let unit_count = units.len();
 
         for (index, unit) in units.into_iter().enumerate() {
+            if index.is_multiple_of(256) && cancelled() {
+                return Ok(None);
+            }
             prefix = prefix
                 .checked_add(unit.weight)
                 .ok_or(LayoutError::WeightOverflow { parent: parent.node_id })?;
@@ -727,11 +796,19 @@ pub fn compute_layout(
             let (node_id, kind) = match unit.kind {
                 UnitKind::Real => (unit.node_id, SectorKind::Real),
                 UnitKind::Hidden => {
-                    let members = append_members(&mut member_pool, &unit.members);
+                    let Some(members) =
+                        append_members(&mut member_pool, &unit.members, &mut cancelled)
+                    else {
+                        return Ok(None);
+                    };
                     (None, SectorKind::Hidden { members })
                 }
                 UnitKind::Other(cause) => {
-                    let members = append_members(&mut member_pool, &unit.members);
+                    let Some(members) =
+                        append_members(&mut member_pool, &unit.members, &mut cancelled)
+                    else {
+                        return Ok(None);
+                    };
                     (None, SectorKind::Other { parent: parent.node_id, members, cause })
                 }
             };
@@ -764,19 +841,38 @@ pub fn compute_layout(
         }
     }
 
-    sectors.sort_by(compare_sectors_for_index);
-    let rings = build_rings(&sectors);
+    if !sort_cancellable(&mut sectors, compare_sectors_for_index, &mut cancelled) {
+        return Ok(None);
+    }
+    let Some(rings) = build_rings(&sectors, &mut cancelled) else {
+        return Ok(None);
+    };
 
-    Ok(SunburstLayout {
+    if cancelled() {
+        return Ok(None);
+    }
+    Ok(Some(SunburstLayout {
         source_generation: snapshot.generation(),
         root: options.root,
         size_basis: options.size_basis,
+        effective_depth,
         sectors,
         rings,
         member_pool,
         zero_weight_nodes,
         budget_exhausted,
-    })
+    }))
+}
+
+/// The aggregation pass already measured the deepest positive descendant for
+/// each metric. Looking it up preserves radial scale without revisiting the
+/// tree for every zoom, metric or hidden-branch request.
+fn effective_depth(root: &NodeRecord, options: LayoutOptions) -> u32 {
+    let size = match options.size_basis {
+        SizeBasis::Logical => root.aggregate().logical(),
+        SizeBasis::Allocated => root.aggregate().allocated(),
+    };
+    size.positive_descendant_depth().min(options.max_depth)
 }
 
 fn validate_options(snapshot: &TreeSnapshot, options: LayoutOptions) -> Result<(), LayoutError> {
@@ -810,11 +906,15 @@ fn collect_children(
     hidden_branches: &HiddenBranches,
     parent: NodeId,
     mut zero_weight_sink: Option<(&mut Vec<NodeId>, usize)>,
-) -> Result<Vec<ChildCandidate>, LayoutError> {
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<Vec<ChildCandidate>>, LayoutError> {
     let children =
         snapshot.children(parent).map_err(|_| LayoutError::InvalidTreeLink { parent })?;
     let mut candidates = Vec::new();
-    for (node_id, record) in children {
+    for (index, (node_id, record)) in children.enumerate() {
+        if index % 256 == 0 && cancelled() {
+            return Ok(None);
+        }
         let (weight, unknown_entries) = selected_size(record, size_basis);
         if weight == 0 {
             if let Some((sink, cap)) = zero_weight_sink.as_mut()
@@ -831,7 +931,7 @@ fn collect_children(
             });
         }
     }
-    Ok(candidates)
+    Ok(Some(candidates))
 }
 
 fn group_small_children(
@@ -840,13 +940,17 @@ fn group_small_children(
     parent_sweep: f64,
     minimum_sweep: f64,
     parent: NodeId,
-) -> Result<Vec<DisplayUnit>, LayoutError> {
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<Option<Vec<DisplayUnit>>, LayoutError> {
     let mut units = Vec::with_capacity(children.len());
     let mut small_members = Vec::new();
     let mut small_weight = 0_u128;
     let mut small_unknown_entries = 0_u64;
 
-    for child in children {
+    for (index, child) in children.into_iter().enumerate() {
+        if index.is_multiple_of(256) && cancelled() {
+            return Ok(None);
+        }
         let projected_sweep = parent_sweep * ratio_to_f64(child.weight, total_weight);
         if !child.hidden && projected_sweep < minimum_sweep {
             small_members.push(child.node_id);
@@ -877,34 +981,39 @@ fn group_small_children(
             unknown_entries: small_unknown_entries,
         });
     }
-    Ok(units)
+    Ok(Some(units))
 }
 
 fn enforce_budget(
     units: &mut Vec<DisplayUnit>,
     remaining: usize,
     parent: NodeId,
-) -> Result<(), LayoutError> {
+    cancelled: &mut impl FnMut() -> bool,
+) -> Result<bool, LayoutError> {
     if units.len() <= remaining {
-        return Ok(());
+        return Ok(true);
     }
     if remaining == 0 {
         units.clear();
-        return Ok(());
+        return Ok(true);
     }
 
     let tail = units.split_off(remaining - 1);
-    let includes_threshold_group = tail.iter().any(|unit| {
-        matches!(
-            unit.kind,
-            UnitKind::Other(OtherCause::MinimumSweep | OtherCause::MinimumSweepAndSectorBudget)
-        )
-    });
+    let mut includes_threshold_group = false;
     let mut members = Vec::new();
     let mut weight = 0_u128;
     let mut unknown_entries = 0_u64;
-    for unit in tail {
-        members.extend(unit.members);
+    for (index, unit) in tail.into_iter().enumerate() {
+        if index.is_multiple_of(256) && cancelled() {
+            return Ok(false);
+        }
+        includes_threshold_group |= matches!(
+            unit.kind,
+            UnitKind::Other(OtherCause::MinimumSweep | OtherCause::MinimumSweepAndSectorBudget)
+        );
+        if append_members(&mut members, &unit.members, cancelled).is_none() {
+            return Ok(false);
+        }
         weight = weight.checked_add(unit.weight).ok_or(LayoutError::WeightOverflow { parent })?;
         unknown_entries = unknown_entries
             .checked_add(unit.unknown_entries)
@@ -921,7 +1030,7 @@ fn enforce_budget(
         weight,
         unknown_entries,
     });
-    Ok(())
+    Ok(true)
 }
 
 fn selected_size(record: &NodeRecord, size_basis: SizeBasis) -> (u128, u64) {
@@ -938,10 +1047,19 @@ fn ratio_to_f64(numerator: u128, denominator: u128) -> f64 {
     (numerator as f64) / (denominator as f64)
 }
 
-fn append_members(pool: &mut Vec<NodeId>, members: &[NodeId]) -> MemberRange {
+fn append_members(
+    pool: &mut Vec<NodeId>,
+    members: &[NodeId],
+    cancelled: &mut impl FnMut() -> bool,
+) -> Option<MemberRange> {
     let range = MemberRange { start: pool.len(), len: members.len() };
-    pool.extend_from_slice(members);
-    range
+    for chunk in members.chunks(256) {
+        if cancelled() {
+            return None;
+        }
+        pool.extend_from_slice(chunk);
+    }
+    Some(range)
 }
 
 fn compare_candidates(
@@ -955,10 +1073,199 @@ fn compare_candidates(
         .then_with(|| compare_node_identity(left.node_id, right.node_id, snapshot))
 }
 
-fn sort_units(units: &mut [DisplayUnit], snapshot: &TreeSnapshot) {
-    units.sort_by(|left, right| {
-        right.weight.cmp(&left.weight).then_with(|| compare_unit_identity(left, right, snapshot))
-    });
+fn sort_units(
+    units: &mut [DisplayUnit],
+    snapshot: &TreeSnapshot,
+    cancelled: &mut impl FnMut() -> bool,
+) -> bool {
+    sort_cancellable(
+        units,
+        |left, right| {
+            right
+                .weight
+                .cmp(&left.weight)
+                .then_with(|| compare_unit_identity(left, right, snapshot))
+        },
+        cancelled,
+    )
+}
+
+/// Stable cancellable sorting without cloning sector/member payloads. Large
+/// inputs sort indices in bounded chunks, merge those indices with periodic
+/// checks, then apply the permutation using swaps. Cancellation may leave
+/// private working data unordered; callers discard it rather than publish it.
+fn sort_cancellable<T>(
+    values: &mut [T],
+    compare: impl Fn(&T, &T) -> Ordering,
+    cancelled: &mut impl FnMut() -> bool,
+) -> bool {
+    const CHUNK: usize = 1024;
+    if cancelled() {
+        return false;
+    }
+    match sorted_cancellable(values, &compare, cancelled) {
+        Some(true) => return !cancelled(),
+        None => return false,
+        Some(false) => {}
+    }
+    if values.len() <= CHUNK {
+        values.sort_by(compare);
+        return !cancelled();
+    }
+    let mut order = Vec::with_capacity(values.len());
+    let mut scratch = Vec::with_capacity(values.len());
+    for index in 0..values.len() {
+        if index.is_multiple_of(256) && cancelled() {
+            return false;
+        }
+        order.push(index);
+        scratch.push(0);
+    }
+    let compare_indices = |&left: &usize, &right: &usize| {
+        compare(&values[left], &values[right]).then_with(|| left.cmp(&right))
+    };
+    for chunk in order.chunks_mut(CHUNK) {
+        if cancelled() {
+            return false;
+        }
+        chunk.sort_unstable_by(compare_indices);
+    }
+    let mut width = CHUNK;
+    while width < values.len() {
+        for start in (0..values.len()).step_by(width.saturating_mul(2)) {
+            let middle = (start + width).min(values.len());
+            let end = (middle + width).min(values.len());
+            let (mut left, mut right) = (start, middle);
+            for (offset, slot) in scratch[start..end].iter_mut().enumerate() {
+                if offset.is_multiple_of(256) && cancelled() {
+                    return false;
+                }
+                if left < middle
+                    && (right == end
+                        || compare_indices(&order[left], &order[right]) != Ordering::Greater)
+                {
+                    *slot = order[left];
+                    left += 1;
+                } else {
+                    *slot = order[right];
+                    right += 1;
+                }
+            }
+        }
+        std::mem::swap(&mut order, &mut scratch);
+        width = width.saturating_mul(2);
+    }
+    // Convert destination -> source into source -> destination in the spare
+    // index buffer. This supports cycles without moving/cloning owned members.
+    for (destination, &source) in order.iter().enumerate() {
+        if destination.is_multiple_of(256) && cancelled() {
+            return false;
+        }
+        scratch[source] = destination;
+    }
+    let mut swaps = 0_usize;
+    for index in 0..values.len() {
+        if index.is_multiple_of(256) && cancelled() {
+            return false;
+        }
+        while scratch[index] != index {
+            if swaps.is_multiple_of(256) && cancelled() {
+                return false;
+            }
+            swaps += 1;
+            let destination = scratch[index];
+            values.swap(index, destination);
+            scratch.swap(index, destination);
+        }
+    }
+    !cancelled()
+}
+
+/// Candidate records are small copyable values: merging them directly keeps
+/// weight comparisons local instead of chasing a large index permutation.
+/// Owned sector/member payloads continue to use `sort_cancellable` above.
+fn sort_copy_cancellable<T: Copy>(
+    values: &mut [T],
+    compare: impl Fn(&T, &T) -> Ordering,
+    cancelled: &mut impl FnMut() -> bool,
+) -> bool {
+    const CHUNK: usize = 1024;
+    if cancelled() {
+        return false;
+    }
+    match sorted_cancellable(values, &compare, cancelled) {
+        Some(true) => return !cancelled(),
+        None => return false,
+        Some(false) => {}
+    }
+    for chunk in values.chunks_mut(CHUNK) {
+        if cancelled() {
+            return false;
+        }
+        chunk.sort_by(&compare);
+    }
+    if values.len() <= CHUNK {
+        return !cancelled();
+    }
+    let mut scratch = Vec::with_capacity(values.len());
+    for chunk in values.chunks(256) {
+        if cancelled() {
+            return false;
+        }
+        scratch.extend_from_slice(chunk);
+    }
+    let mut width = CHUNK;
+    let mut source_is_values = true;
+    while width < values.len() {
+        let (source, destination): (&[T], &mut [T]) =
+            if source_is_values { (values, &mut scratch) } else { (&scratch, values) };
+        for start in (0..source.len()).step_by(width.saturating_mul(2)) {
+            let middle = (start + width).min(source.len());
+            let end = (middle + width).min(source.len());
+            let (mut left, mut right) = (start, middle);
+            for (offset, slot) in destination[start..end].iter_mut().enumerate() {
+                if offset.is_multiple_of(256) && cancelled() {
+                    return false;
+                }
+                if left < middle
+                    && (right == end || compare(&source[left], &source[right]) != Ordering::Greater)
+                {
+                    *slot = source[left];
+                    left += 1;
+                } else {
+                    *slot = source[right];
+                    right += 1;
+                }
+            }
+        }
+        source_is_values = !source_is_values;
+        width = width.saturating_mul(2);
+    }
+    if !source_is_values {
+        for (destination, source) in values.chunks_mut(256).zip(scratch.chunks(256)) {
+            if cancelled() {
+                return false;
+            }
+            destination.copy_from_slice(source);
+        }
+    }
+    !cancelled()
+}
+
+fn sorted_cancellable<T>(
+    values: &[T],
+    compare: &impl Fn(&T, &T) -> Ordering,
+    cancelled: &mut impl FnMut() -> bool,
+) -> Option<bool> {
+    for (index, pair) in values.windows(2).enumerate() {
+        if index.is_multiple_of(256) && cancelled() {
+            return None;
+        }
+        if compare(&pair[0], &pair[1]) == Ordering::Greater {
+            return Some(false);
+        }
+    }
+    Some(true)
 }
 
 fn compare_unit_identity(
@@ -1013,7 +1320,7 @@ fn compare_sectors_for_index(left: &Sector, right: &Sector) -> Ordering {
         .then_with(|| left.node_id.cmp(&right.node_id))
 }
 
-fn build_rings(sectors: &[Sector]) -> Vec<Ring> {
+fn build_rings(sectors: &[Sector], cancelled: &mut impl FnMut() -> bool) -> Option<Vec<Ring>> {
     let mut rings = Vec::new();
     let mut start = 0;
     while start < sectors.len() {
@@ -1022,12 +1329,15 @@ fn build_rings(sectors: &[Sector]) -> Vec<Ring> {
         let outer_radius = sectors[start].outer_radius;
         let mut end = start + 1;
         while end < sectors.len() && sectors[end].depth == depth {
+            if end.is_multiple_of(256) && cancelled() {
+                return None;
+            }
             end += 1;
         }
         rings.push(Ring { depth, inner_radius, outer_radius, sectors: start..end });
         start = end;
     }
-    rings
+    Some(rings)
 }
 
 fn normalize_angle(angle: f64) -> f64 {
@@ -1700,5 +2010,234 @@ mod tests {
             }
             assert_close(sweep_sum, parent.sweep_angle);
         }
+    }
+    #[test]
+    fn obsolete_layout_stops_while_collecting_a_wide_directory() {
+        let mut builder = TreeBuilder::new(GenerationId::new(91));
+        let root = builder.add_root(NodeSpec::root("root")).expect("root");
+        for n in 0..10_000 {
+            builder.add_child(root, NodeSpec::directory(format!("d{n}"))).expect("directory");
+        }
+        let snapshot = builder.freeze().expect("snapshot");
+        let mut checks = 0;
+        let cancelled = compute_layout_cancellable(
+            &snapshot,
+            LayoutOptions::new(root),
+            &HiddenBranches::new(),
+            || {
+                checks += 1;
+                checks == 4
+            },
+        )
+        .expect("cancellation is not an error");
+        assert!(cancelled.is_none());
+        assert_eq!(checks, 4);
+        let normal = compute_layout(&snapshot, LayoutOptions::new(root), &HiddenBranches::new())
+            .expect("normal");
+        let cooperative = compute_layout_cancellable(
+            &snapshot,
+            LayoutOptions::new(root),
+            &HiddenBranches::new(),
+            || false,
+        )
+        .expect("cooperative")
+        .expect("not cancelled");
+        assert_eq!(normal, cooperative);
+    }
+
+    #[test]
+    fn shallow_and_deep_trees_fill_the_available_radius_up_to_the_depth_limit() {
+        for actual_depth in [0, 1, 2, 8, 12] {
+            let mut builder = TreeBuilder::new(GenerationId::new(92));
+            let root = builder.add_root(NodeSpec::root("root")).unwrap();
+            let mut parent = root;
+            for depth in 1..=actual_depth {
+                parent = builder
+                    .add_child(
+                        parent,
+                        if depth == actual_depth {
+                            file("leaf", 1, 1)
+                        } else {
+                            NodeSpec::directory("branch")
+                        },
+                    )
+                    .unwrap();
+            }
+            let snapshot = builder.freeze().unwrap();
+            let layout =
+                compute_layout(&snapshot, LayoutOptions::new(root), &HiddenBranches::new())
+                    .unwrap();
+            assert_eq!(layout.effective_depth(), actual_depth.min(8));
+            assert_close(layout.rings().last().unwrap().outer_radius, 1.0);
+            assert_close(
+                layout.sectors()[0].outer_radius,
+                if actual_depth == 0 { 1.0 } else { 0.28 },
+            );
+            for sector in layout.sectors() {
+                let radius = (sector.inner_radius + sector.outer_radius) * 0.5;
+                let angle = sector.start_angle + sector.sweep_angle * 0.5;
+                assert_eq!(layout.hit_test_polar(angle, radius).unwrap(), Some(sector));
+            }
+        }
+    }
+
+    #[test]
+    fn radial_scale_precedes_hiding_threshold_grouping_and_sector_budget() {
+        let mut builder = TreeBuilder::new(GenerationId::new(93));
+        let root = builder.add_root(NodeSpec::root("root")).unwrap();
+        let branch = builder.add_child(root, NodeSpec::directory("deep")).unwrap();
+        let nested = builder.add_child(branch, NodeSpec::directory("nested")).unwrap();
+        builder.add_child(nested, file("tiny", 1, 1)).unwrap();
+        builder.add_child(root, file("large", 1000, 1000)).unwrap();
+        let snapshot = builder.freeze().unwrap();
+        for budget in [1, 2, 100] {
+            for hidden in [HiddenBranches::new(), [branch].into_iter().collect()] {
+                for minimum_sweep in [0.0, 0.2] {
+                    let mut options = LayoutOptions::new(root);
+                    options.max_sectors = budget;
+                    options.minimum_sweep = minimum_sweep;
+                    let layout = compute_layout(&snapshot, options, &hidden).unwrap();
+                    assert_eq!(layout.effective_depth(), 3);
+                    assert_close(layout.sectors()[0].outer_radius, 0.28);
+                    for sector in layout.sectors().iter().filter(|sector| sector.depth == 1) {
+                        assert_close(sector.inner_radius, 0.28);
+                        assert_close(sector.outer_radius, 0.52);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn depth_lookup_uses_each_metric_and_does_not_walk_wide_descendants() {
+        let mut builder = TreeBuilder::new(GenerationId::new(94));
+        let root = builder.add_root(NodeSpec::root("root")).unwrap();
+        let branch = builder.add_child(root, NodeSpec::directory("logical-only")).unwrap();
+        let nested = builder.add_child(branch, NodeSpec::directory("nested")).unwrap();
+        builder.add_child(nested, file("file", 1, 0)).unwrap();
+        for index in 0..10_000 {
+            builder.add_child(root, file(&format!("flat-{index}"), 1, 1)).unwrap();
+        }
+        let snapshot = builder.freeze().unwrap();
+        let mut options = LayoutOptions::new(root);
+        options.size_basis = SizeBasis::Allocated;
+        assert_eq!(effective_depth(snapshot.node(root).unwrap(), options), 1);
+        options.size_basis = SizeBasis::Logical;
+        assert_eq!(effective_depth(snapshot.node(root).unwrap(), options), 3);
+        options.max_depth = 2;
+        assert_eq!(effective_depth(snapshot.node(root).unwrap(), options), 2);
+        options.max_depth = 0;
+        assert_eq!(effective_depth(snapshot.node(root).unwrap(), options), 0);
+    }
+
+    #[test]
+    fn cancellable_sort_matches_stable_reference_and_can_abandon_every_phase() {
+        let original =
+            (0..4_133).map(|index| ((index * 1_037 + 17) % 101, index)).collect::<Vec<_>>();
+        let compare = |left: &(usize, usize), right: &(usize, usize)| left.0.cmp(&right.0);
+        let mut expected = original.clone();
+        expected.sort_by(compare);
+        let mut actual = original.clone();
+        let mut checks = 0;
+        assert!(sort_cancellable(&mut actual, compare, &mut || {
+            checks += 1;
+            false
+        }));
+        assert_eq!(actual, expected, "equal keys retain their original order");
+        // Includes index creation, chunk sorting, merge passes and permutation;
+        // each interrupted result is private and must never be published.
+        for stop_at in [1, 3, 17, 37, checks / 2, checks - 10, checks] {
+            let mut interrupted = original.clone();
+            let mut observed = 0;
+            assert!(!sort_cancellable(&mut interrupted, compare, &mut || {
+                observed += 1;
+                observed == stop_at
+            }));
+            assert_eq!(observed, stop_at);
+            interrupted.sort_by_key(|value| value.1);
+            assert_eq!(interrupted, original, "cancellation cannot lose or duplicate payloads");
+        }
+    }
+
+    #[test]
+    fn direct_copy_merge_is_stable_for_partial_chunks_and_cancels_in_every_phase() {
+        let make =
+            |len| (0..len).map(|index| ((index * 1_037 + 17) % 101, index)).collect::<Vec<_>>();
+        let compare = |left: &(usize, usize), right: &(usize, usize)| left.0.cmp(&right.0);
+        for len in [0, 1, 513, 1024, 1025, 4_133, 10_000] {
+            let mut values = make(len);
+            let mut expected = values.clone();
+            expected.sort_by(compare);
+            assert!(sort_copy_cancellable(&mut values, compare, &mut || false));
+            assert_eq!(values, expected);
+            assert!(sort_copy_cancellable(&mut values, compare, &mut || false));
+            assert_eq!(values, expected, "already ordered inputs preserve equal-key order");
+        }
+        let mut checks = 0;
+        assert!(sort_copy_cancellable(&mut make(4_133), compare, &mut || {
+            checks += 1;
+            false
+        }));
+        for stop_at in 1..=checks {
+            let mut observed = 0;
+            assert!(!sort_copy_cancellable(&mut make(4_133), compare, &mut || {
+                observed += 1;
+                observed == stop_at
+            }));
+            assert_eq!(observed, stop_at);
+        }
+    }
+
+    #[test]
+    fn large_grouping_budget_and_member_copy_observe_cancellation() {
+        let children = (0..4_096)
+            .map(|index| ChildCandidate {
+                node_id: NodeId::from_raw(index),
+                weight: 1,
+                unknown_entries: 0,
+                hidden: false,
+            })
+            .collect::<Vec<_>>();
+        let mut checks = 0;
+        assert!(
+            group_small_children(
+                children.clone(),
+                children.len() as u128,
+                FULL_TURN,
+                0.1,
+                NodeId::from_raw(0),
+                &mut || {
+                    checks += 1;
+                    checks == 3
+                },
+            )
+            .unwrap()
+            .is_none()
+        );
+        let mut units =
+            group_small_children(children, 4_096, FULL_TURN, 0.0, NodeId::from_raw(0), &mut || {
+                false
+            })
+            .unwrap()
+            .unwrap();
+        let mut checks = 0;
+        assert!(
+            !enforce_budget(&mut units, 2, NodeId::from_raw(0), &mut || {
+                checks += 1;
+                checks == 3
+            })
+            .unwrap()
+        );
+        let members = (0..4_096).map(NodeId::from_raw).collect::<Vec<_>>();
+        let mut pool = Vec::new();
+        let mut checks = 0;
+        assert!(
+            append_members(&mut pool, &members, &mut || {
+                checks += 1;
+                checks == 3
+            })
+            .is_none()
+        );
+        assert!(pool.len() < members.len());
     }
 }

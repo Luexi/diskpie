@@ -3,8 +3,9 @@
 //! The embedded Ubuntu and Hack faces render Latin, Greek, and Cyrillic. File
 //! names in CJK, Thai, Devanagari, Arabic, Myanmar, Tibetan, or Javanese would
 //! otherwise appear as boxes. At startup, before the native window exists, the
-//! composition root reads well-known Windows font files when they are present
-//! and appends them as fallbacks after the embedded fonts. Missing files are
+//! composition root reads well-known Windows font files when they are present,
+//! uses Segoe UI as the proportional face, and appends other system faces as
+//! fallbacks after the embedded fonts. Missing files are
 //! skipped silently; a read failure never fails startup; the fonts are read at
 //! runtime from the user's own Windows installation and never redistributed.
 
@@ -63,7 +64,8 @@ impl SystemFonts {
         self.loaded.is_empty()
     }
 
-    /// Appends the loaded fonts as fallbacks after every embedded face.
+    /// Prefers Windows' Segoe UI for proportional text; other scripts and the
+    /// monospace family retain the embedded faces and append system fallbacks.
     ///
     /// Consumes the loaded bytes: they move into egui's font data so that up
     /// to the whole byte budget is resident once, never twice.
@@ -74,9 +76,14 @@ impl SystemFonts {
             let data =
                 FontData { font: Cow::Owned(bytes), index: face_index, tweak: Default::default() };
             for family in [FontFamily::Proportional, FontFamily::Monospace] {
+                let primary = family == FontFamily::Proportional && name == "system-segoeui.ttf-0";
                 let names = definitions.families.entry(family).or_default();
                 if !names.iter().any(|existing| existing == &name) {
-                    names.push(name.clone());
+                    if primary {
+                        names.insert(0, name.clone());
+                    } else {
+                        names.push(name.clone());
+                    }
                 }
             }
             definitions.font_data.insert(name, Arc::new(data));
@@ -201,5 +208,18 @@ mod tests {
     fn fonts_directory_falls_back_to_the_default_windows_root() {
         let directory = windows_fonts_directory();
         assert!(directory.ends_with("Fonts"));
+    }
+
+    #[test]
+    fn segoe_ui_leads_proportional_text_without_replacing_monospace_or_fallbacks() {
+        let name = "system-segoeui.ttf-0";
+        let fonts = SystemFonts {
+            loaded: vec![LoadedFont { name: name.to_owned(), bytes: vec![0], face_index: 0 }],
+            skipped_for_budget: 0,
+        };
+        let definitions = fonts.apply_to(FontDefinitions::default());
+        assert_eq!(definitions.families[&FontFamily::Proportional][0], name);
+        assert_ne!(definitions.families[&FontFamily::Monospace][0], name);
+        assert!(definitions.families[&FontFamily::Proportional].len() > 1);
     }
 }

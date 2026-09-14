@@ -1,0 +1,12 @@
+segoe_ui_loaded=true
+skipped_for_budget=0
+system-segoeui.ttf-0;face=0;bytes=959752
+system-msyh.ttc-0;face=0;bytes=19704352
+system-malgun.ttf-0;face=0;bytes=13459196
+system-YuGothR.ttc-0;face=0;bytes=13835976
+system-Nirmala.ttc-0;face=0;bytes=5304988
+system-leelawad.ttf-0;face=0;bytes=94064
+system-ebrima.ttf-0;face=0;bytes=949408
+system-mmrtext.ttf-0;face=0;bytes=336912
+system-himalaya.ttf-0;face=0;bytes=572776
+system-javatext.ttf-0;face=0;bytes=305448

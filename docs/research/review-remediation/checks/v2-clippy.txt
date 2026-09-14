@@ -1,0 +1,5 @@
+    Checking diskpie-scan v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-scan)
+    Checking diskpie-app v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-app)
+    Checking diskpie-platform v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-platform)
+    Checking diskpie v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.63s

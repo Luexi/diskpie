@@ -1,0 +1,1 @@
+ChildCandidate=32 AggregateSize=32 NodeRecord=288

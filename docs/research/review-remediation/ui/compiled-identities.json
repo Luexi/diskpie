@@ -1,0 +1,42 @@
+[
+  {
+    "Algorithm": "SHA256",
+    "Hash": "1DF64B3B3487A2DEC24A645E5223EBEB8C5868EB9E70EE8EE5D5E513BE75C029",
+    "Path": "C:\\Users\\Luis\\Desktop\\scan\\diskpie\\target\\review-ui-perf-after-20260907-v2\\src\\main.rs"
+  },
+  {
+    "Algorithm": "SHA256",
+    "Hash": "5B4A5A6950686A32B4A34AA4A88661C34C525DBDD57EB0DC31C2FCA09458674C",
+    "Path": "C:\\Users\\Luis\\Desktop\\scan\\diskpie\\target\\review-ui-perf-after-20260907-v2\\Cargo.toml"
+  },
+  {
+    "Algorithm": "SHA256",
+    "Hash": "454CBC6FC6ABB616CEB3E31098E7278C801646D90F2F309005B6A8AD45522AF4",
+    "Path": "C:\\Users\\Luis\\Desktop\\scan\\diskpie\\target\\review-ui-perf-after-20260907-v2\\Cargo.lock"
+  },
+  {
+    "Algorithm": "SHA256",
+    "Hash": "95BBC5FDE2B0B35B228389F01C09F721D6940ED99CB801A1E97DB6597C748B18",
+    "Path": "C:\\Users\\Luis\\Desktop\\scan\\diskpie\\target\\review-ui-perf-after-20260907-v2\\build\\release\\diskpie-review-ui-perf.exe"
+  },
+  {
+    "Algorithm": "SHA256",
+    "Hash": "38C71CA24381CB5E25DA740E14F7ACD8F2A144E3AA8F3DECFE335DF04DC2960B",
+    "Path": "C:\\Users\\Luis\\Desktop\\scan\\diskpie\\target\\review-ui-perf-after-20260907-v2\\build\\release\\diskpie-bench.exe"
+  },
+  {
+    "Algorithm": "SHA256",
+    "Hash": "4E544821940238EFA86048478E5BB0DC5B00629E773FEABE451E015BAAD820F3",
+    "Path": "C:\\Users\\Luis\\Desktop\\scan\\diskpie\\target\\review-ui-perf-after-20260907-v2\\type-probe\\main.rs"
+  },
+  {
+    "Algorithm": "SHA256",
+    "Hash": "BC7E70EE9771B33174CFEC852F7FF85A288498970458538C5D514174763561F4",
+    "Path": "C:\\Users\\Luis\\Desktop\\scan\\diskpie\\target\\review-ui-perf-after-20260907-v2\\type-probe\\sunburst.rs"
+  },
+  {
+    "Algorithm": "SHA256",
+    "Hash": "C984742921F3EC30B7485CA792AEAE73D1C04104083C04D56ABF212DCD49B6C7",
+    "Path": "C:\\Users\\Luis\\Desktop\\scan\\diskpie\\target\\review-ui-perf-after-20260907-v2\\type-probe\\type-probe.exe"
+  }
+]

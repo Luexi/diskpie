@@ -3,10 +3,12 @@
 #![forbid(unsafe_code)]
 
 pub mod actions;
+pub mod branch_rescan;
 pub mod diagnostics;
 pub mod explorer_integration;
 pub mod format;
 pub mod i18n;
+pub mod item_list_service;
 pub mod layout_service;
 pub mod navigation;
 pub mod presentation;

@@ -21,6 +21,18 @@ records when changing that area, not all records for every task. The
 - Old release-blocking full-Scanner plans and mandatory investigation/review
   rituals are superseded by scoped usable deliveries and proportional checks.
 
+## Recent records
+
+- [0020: complete product composition](0020-complete-product-composition.md)
+  records branch merging, background list/support composition and the
+  create-only export refinement of ADR 0016. Its connected permanent-delete
+  and empty-bin surfaces are superseded by the owner decision above.
+- [0021: Scanner renovado](0021-scanner-renovado.md), including the depth-index
+  addendum, records the map-first composition, adaptive radial depth, stable
+  color families and additive list preferences.
+- [0022: retained Windows directory enumeration](0022-retained-directory-enumeration.md)
+  records the shared directory handle for enumeration and child metadata.
+
 For a new lasting decision, use 0000-template.md, explain the concrete tradeoff
 and link evidence. Ordinary edits/refactoring do not need a new ADR. Mark
 replaced decisions as superseded with a link instead of erasing their history.

@@ -1,0 +1,11 @@
+    Checking diskpie-core v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-core)
+ Documenting diskpie-core v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-core)
+    Checking diskpie-scan v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-scan)
+ Documenting diskpie-scan v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-scan)
+    Checking diskpie-app v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-app)
+ Documenting diskpie-app v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-app)
+    Checking diskpie-platform v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-platform)
+ Documenting diskpie-platform v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie-platform)
+ Documenting diskpie v0.1.0 (C:\Users\Luis\Desktop\scan\diskpie\crates\diskpie)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 22.26s
+   Generated C:\Users\Luis\Desktop\scan\diskpie\target\doc\diskpie\index.html and 4 other files

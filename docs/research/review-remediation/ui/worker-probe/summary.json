@@ -1,0 +1,26 @@
+{
+  "supersede_to_small_completion-before": {
+    "median_ms": 255.7001,
+    "min_ms": 234.8012,
+    "max_ms": 425.6861,
+    "busy_runs": 7
+  },
+  "supersede_to_small_completion-after": {
+    "median_ms": 3.3937,
+    "min_ms": 3.0223,
+    "max_ms": 4.7648,
+    "busy_runs": 7
+  },
+  "shutdown_drop_to_join-before": {
+    "median_ms": 264.2042,
+    "min_ms": 232.6525,
+    "max_ms": 388.7137,
+    "busy_runs": 7
+  },
+  "shutdown_drop_to_join-after": {
+    "median_ms": 2.7465,
+    "min_ms": 2.4531,
+    "max_ms": 4.0477,
+    "busy_runs": 7
+  }
+}

@@ -316,6 +316,9 @@ impl ScanState {
 pub struct AggregateSize {
     known_bytes: u128,
     unknown_entries: u64,
+    // Fits in the existing padding after `unknown_entries` on the supported
+    // 64-bit targets. Computed with totals, after hard-link ownership settles.
+    positive_descendant_depth: u32,
 }
 
 impl AggregateSize {
@@ -334,12 +337,22 @@ impl AggregateSize {
         self.unknown_entries == 0
     }
 
+    /// Distance to the deepest descendant with positive known bytes.
+    ///
+    /// A leaf or a wholly zero/unknown subtree has depth zero. Each metric
+    /// keeps its own depth; layout grouping, visibility and budgets cannot
+    /// change this immutable measurement of the tree.
+    #[must_use]
+    pub const fn positive_descendant_depth(self) -> u32 {
+        self.positive_descendant_depth
+    }
+
     fn from_metric(metric: SizeMetric) -> Self {
         match metric {
             SizeMetric::Known { bytes, .. } => {
-                Self { known_bytes: u128::from(bytes), unknown_entries: 0 }
+                Self { known_bytes: u128::from(bytes), ..Self::default() }
             }
-            SizeMetric::Unknown { .. } => Self { known_bytes: 0, unknown_entries: 1 },
+            SizeMetric::Unknown { .. } => Self { unknown_entries: 1, ..Self::default() },
         }
     }
 
@@ -360,6 +373,14 @@ impl AggregateSize {
             .ok_or(ModelError::AggregateOverflow { node, field: unknown_field })?;
         self.known_bytes = known_bytes;
         self.unknown_entries = unknown_entries;
+        if other.known_bytes != 0 {
+            // A valid arena has at most u32::MAX + 1 nodes, so no real path
+            // can exceed u32::MAX edges. Saturation also protects isolated
+            // arithmetic callers without weakening total-overflow checks.
+            self.positive_descendant_depth = self
+                .positive_descendant_depth
+                .max(other.positive_descendant_depth.saturating_add(1));
+        }
         Ok(())
     }
 }
@@ -573,6 +594,7 @@ pub struct NodeRecord {
     next_sibling: Option<NodeId>,
     own: OwnMetrics,
     aggregate: Aggregate,
+    observed_allocation: SizeMetric,
     file_identity: Option<FileIdentity>,
     hard_link_status: HardLinkStatus,
     own_omissions: u64,
@@ -608,6 +630,13 @@ impl NodeRecord {
     #[must_use]
     pub const fn own_metrics(&self) -> OwnMetrics {
         self.own
+    }
+
+    /// Original measurements before identity-based allocation deduplication.
+    /// Rebuilding a tree from `own_metrics()` would lose an alias's allocation.
+    #[must_use]
+    pub const fn observed_metrics(&self) -> OwnMetrics {
+        OwnMetrics::new(self.own.logical, self.observed_allocation)
     }
 
     #[must_use]
@@ -684,6 +713,12 @@ impl TreeBuilder {
         Self { generation, scan_state: ScanState::Complete, nodes: Vec::new() }
     }
 
+    /// Reserves the known arena size without changing checked node insertion.
+    #[must_use]
+    pub fn with_capacity(generation: GenerationId, capacity: usize) -> Self {
+        Self { generation, scan_state: ScanState::Complete, nodes: Vec::with_capacity(capacity) }
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.nodes.len()
@@ -748,14 +783,32 @@ impl TreeBuilder {
     }
 
     /// Computes subtree totals iteratively and consumes the builder.
-    pub fn freeze(mut self) -> Result<TreeSnapshot, ModelError> {
-        self.resolve_hard_link_owners()?;
+    pub fn freeze(self) -> Result<TreeSnapshot, ModelError> {
+        Ok(self.freeze_cancellable(|| false)?.expect("an uncancelled freeze completes"))
+    }
 
-        for node in &mut self.nodes {
+    /// Computes a complete snapshot, abandoning superseded work between
+    /// bounded batches. Cancellation consumes the builder and exposes no
+    /// partially deduplicated or aggregated tree.
+    pub fn freeze_cancellable(
+        mut self,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<Option<TreeSnapshot>, ModelError> {
+        if cancelled() || !self.resolve_hard_link_owners(&mut cancelled)? {
+            return Ok(None);
+        }
+
+        for (index, node) in self.nodes.iter_mut().enumerate() {
+            if index.is_multiple_of(256) && cancelled() {
+                return Ok(None);
+            }
             node.record.aggregate = Aggregate::from_node(&node.record);
         }
 
         for index in (0..self.nodes.len()).rev() {
+            if index.is_multiple_of(256) && cancelled() {
+                return Ok(None);
+            }
             let aggregate = self.nodes[index].record.aggregate;
             if let Some(parent) = self.nodes[index].record.parent {
                 let parent_index = parent.index();
@@ -764,25 +817,67 @@ impl TreeBuilder {
         }
 
         let mut snapshot_state = self.scan_state;
-        for node in &mut self.nodes {
+        let mut roots = Vec::new();
+        let mut filesystem_roots = Vec::new();
+        for (index, node) in self.nodes.iter_mut().enumerate() {
+            if index.is_multiple_of(256) && cancelled() {
+                return Ok(None);
+            }
+            let id = NodeId::from_index(index)?;
+            if node.record.kind == EntryKind::Root {
+                filesystem_roots.push(id);
+            }
             if node.record.parent.is_none() {
+                roots.push(id);
                 node.record.aggregate.state = node.record.aggregate.state.combine(self.scan_state);
                 snapshot_state = snapshot_state.combine(node.record.aggregate.state);
             }
         }
 
-        let nodes =
-            self.nodes.into_iter().map(|node| node.record).collect::<Vec<_>>().into_boxed_slice();
-        let snapshot = TreeSnapshot { generation: self.generation, state: snapshot_state, nodes };
-        snapshot.validate_structure().map_err(ModelError::InvalidStructure)?;
-        Ok(snapshot)
+        // Keep a consuming iterator that allows Vec to reuse its allocation,
+        // rather than explicitly allocating a second arena for the checks.
+        let mut materialization_cancelled = false;
+        let nodes = self
+            .nodes
+            .into_iter()
+            .enumerate()
+            .take_while(|(index, _)| {
+                materialization_cancelled = index.is_multiple_of(256) && cancelled();
+                !materialization_cancelled
+            })
+            .map(|(_, node)| node.record)
+            .collect::<Vec<_>>();
+        if materialization_cancelled {
+            return Ok(None);
+        }
+        let snapshot = TreeSnapshot {
+            generation: self.generation,
+            state: snapshot_state,
+            nodes: nodes.into_boxed_slice(),
+            roots: roots.into_boxed_slice(),
+            filesystem_roots: filesystem_roots.into_boxed_slice(),
+        };
+        if !snapshot
+            .validate_structure_cancellable(&mut cancelled)
+            .map_err(ModelError::InvalidStructure)?
+            || cancelled()
+        {
+            return Ok(None);
+        }
+        Ok(Some(snapshot))
     }
 
-    fn resolve_hard_link_owners(&mut self) -> Result<(), ModelError> {
+    fn resolve_hard_link_owners(
+        &mut self,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<bool, ModelError> {
         let mut owners = HashMap::<FileIdentity, IdentityOwner>::new();
         let nodes = &self.nodes;
 
         for (index, node) in nodes.iter().enumerate() {
+            if index.is_multiple_of(256) && cancelled() {
+                return Ok(false);
+            }
             if !node.record.kind.contributes_own_bytes() {
                 continue;
             }
@@ -843,6 +938,9 @@ impl TreeBuilder {
         }
 
         for (index, node) in self.nodes.iter_mut().enumerate() {
+            if index.is_multiple_of(256) && cancelled() {
+                return Ok(false);
+            }
             let record = &mut node.record;
             if !record.kind.contributes_own_bytes() {
                 record.hard_link_status = HardLinkStatus::NotApplicable;
@@ -864,7 +962,7 @@ impl TreeBuilder {
                 record.own.allocated = SizeMetric::known(0, MetricSource::HardLinkAlias);
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     fn push_node(&mut self, parent: Option<NodeId>, spec: NodeSpec) -> Result<NodeId, ModelError> {
@@ -878,6 +976,7 @@ impl TreeBuilder {
                 next_sibling: None,
                 own: spec.own,
                 aggregate: Aggregate::default(),
+                observed_allocation: spec.own.allocated,
                 file_identity: spec.file_identity,
                 hard_link_status: HardLinkStatus::NotApplicable,
                 own_omissions: spec.omissions,
@@ -937,6 +1036,8 @@ pub struct TreeSnapshot {
     generation: GenerationId,
     state: ScanState,
     nodes: Box<[NodeRecord]>,
+    roots: Box<[NodeId]>,
+    filesystem_roots: Box<[NodeId]>,
 }
 
 impl TreeSnapshot {
@@ -982,14 +1083,14 @@ impl TreeSnapshot {
 
     /// Iterates top-level roots and synthetic groups in insertion order.
     pub fn roots(&self) -> impl Iterator<Item = (NodeId, &NodeRecord)> + '_ {
-        self.nodes.iter().enumerate().filter_map(|(index, node)| {
-            if node.parent.is_none() {
-                // A valid snapshot cannot contain more than the NodeId range.
-                NodeId::from_index(index).ok().map(|id| (id, node))
-            } else {
-                None
-            }
-        })
+        self.roots.iter().map(|&id| (id, &self.nodes[id.index()]))
+    }
+
+    /// Iterates real filesystem roots, including roots below a summary group.
+    /// The immutable index is built with the snapshot, so enumerating roots
+    /// never visits unrelated files or directories on the frame thread.
+    pub fn filesystem_roots(&self) -> impl ExactSizeIterator<Item = NodeId> + '_ {
+        self.filesystem_roots.iter().copied()
     }
 
     /// Iterates direct children in deterministic insertion order.
@@ -1033,6 +1134,13 @@ impl TreeSnapshot {
 
     /// Checks all arena references, parent order, sibling order, and reachability.
     pub fn validate_structure(&self) -> Result<(), StructureError> {
+        self.validate_structure_cancellable(&mut || false).map(|_| ())
+    }
+
+    fn validate_structure_cancellable(
+        &self,
+        cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<bool, StructureError> {
         if let Some(last_index) = self.nodes.len().checked_sub(1)
             && NodeId::from_index(last_index).is_err()
         {
@@ -1040,6 +1148,9 @@ impl TreeSnapshot {
         }
 
         for (index, node) in self.nodes.iter().enumerate() {
+            if index.is_multiple_of(256) && cancelled() {
+                return Ok(false);
+            }
             let id = NodeId::from_index(index)
                 .map_err(|_| StructureError::TooManyNodes { count: self.nodes.len() })?;
             if let Some(parent) = node.parent {
@@ -1066,13 +1177,21 @@ impl TreeSnapshot {
         }
 
         let mut seen_as_child = vec![false; self.nodes.len()];
+        let mut visited_links = 0_usize;
         for (parent_index, parent_node) in self.nodes.iter().enumerate() {
+            if parent_index.is_multiple_of(256) && cancelled() {
+                return Ok(false);
+            }
             let parent = NodeId::from_index(parent_index)
                 .map_err(|_| StructureError::TooManyNodes { count: self.nodes.len() })?;
             let mut previous = None;
             let mut next = parent_node.first_child;
             let mut link_field = LinkField::FirstChild;
             while let Some(child) = next {
+                if visited_links.is_multiple_of(256) && cancelled() {
+                    return Ok(false);
+                }
+                visited_links += 1;
                 let child_index = self.reference_index(parent, link_field, child)?;
                 let child_node = &self.nodes[child_index];
                 if child_node.parent != Some(parent) {
@@ -1102,13 +1221,16 @@ impl TreeSnapshot {
         }
 
         for (index, node) in self.nodes.iter().enumerate() {
+            if index.is_multiple_of(256) && cancelled() {
+                return Ok(false);
+            }
             if node.parent.is_some() && !seen_as_child[index] {
                 let node = NodeId::from_index(index)
                     .map_err(|_| StructureError::TooManyNodes { count: self.nodes.len() })?;
                 return Err(StructureError::OrphanedChild { node });
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     fn reference_index(
@@ -1987,10 +2109,14 @@ mod tests {
     #[test]
     fn aggregate_addition_checks_instead_of_wrapping() {
         let node = NodeId::from_raw(0);
-        let mut size = AggregateSize { known_bytes: u128::MAX, unknown_entries: 0 };
+        let mut size = AggregateSize {
+            known_bytes: u128::MAX,
+            unknown_entries: 0,
+            ..AggregateSize::default()
+        };
         let error = size
             .checked_add(
-                AggregateSize { known_bytes: 1, unknown_entries: 0 },
+                AggregateSize { known_bytes: 1, unknown_entries: 0, ..AggregateSize::default() },
                 node,
                 AggregateField::LogicalBytes,
                 AggregateField::LogicalUnknownEntries,
@@ -2002,10 +2128,14 @@ mod tests {
         );
         assert_eq!(size.known_bytes, u128::MAX);
 
-        let mut unknowns = AggregateSize { known_bytes: 17, unknown_entries: u64::MAX };
+        let mut unknowns = AggregateSize {
+            known_bytes: 17,
+            unknown_entries: u64::MAX,
+            ..AggregateSize::default()
+        };
         let error = unknowns
             .checked_add(
-                AggregateSize { known_bytes: 5, unknown_entries: 1 },
+                AggregateSize { known_bytes: 5, unknown_entries: 1, ..AggregateSize::default() },
                 node,
                 AggregateField::LogicalBytes,
                 AggregateField::LogicalUnknownEntries,
@@ -2017,13 +2147,25 @@ mod tests {
         );
         assert_eq!(
             unknowns,
-            AggregateSize { known_bytes: 17, unknown_entries: u64::MAX },
+            AggregateSize {
+                known_bytes: 17,
+                unknown_entries: u64::MAX,
+                ..AggregateSize::default()
+            },
             "a failed checked addition must not partially update the total"
         );
 
         let mut aggregate = Aggregate {
-            logical: AggregateSize { known_bytes: 41, unknown_entries: 2 },
-            allocated: AggregateSize { known_bytes: u128::MAX, unknown_entries: 3 },
+            logical: AggregateSize {
+                known_bytes: 41,
+                unknown_entries: 2,
+                ..AggregateSize::default()
+            },
+            allocated: AggregateSize {
+                known_bytes: u128::MAX,
+                unknown_entries: 3,
+                ..AggregateSize::default()
+            },
             allocation_deduplication_unavailable_entries: 5,
             file_count: 7,
             directory_count: 11,
@@ -2032,8 +2174,16 @@ mod tests {
         };
         let original = aggregate;
         let increment = Aggregate {
-            logical: AggregateSize { known_bytes: 1, unknown_entries: 1 },
-            allocated: AggregateSize { known_bytes: 1, unknown_entries: 1 },
+            logical: AggregateSize {
+                known_bytes: 1,
+                unknown_entries: 1,
+                ..AggregateSize::default()
+            },
+            allocated: AggregateSize {
+                known_bytes: 1,
+                unknown_entries: 1,
+                ..AggregateSize::default()
+            },
             allocation_deduplication_unavailable_entries: 1,
             file_count: 1,
             directory_count: 1,
@@ -2055,7 +2205,11 @@ mod tests {
         };
         let original = aggregate;
         let increment = Aggregate {
-            logical: AggregateSize { known_bytes: 1, unknown_entries: 0 },
+            logical: AggregateSize {
+                known_bytes: 1,
+                unknown_entries: 0,
+                ..AggregateSize::default()
+            },
             allocation_deduplication_unavailable_entries: 1,
             ..Aggregate::default()
         };
@@ -2098,6 +2252,117 @@ mod tests {
         let path = snapshot.path(file).expect("path");
         assert_eq!(path, Path::new("C:\\").join("file.bin"));
         assert!(!path.to_string_lossy().contains("All volumes"));
+    }
+
+    #[test]
+    fn depth_tracks_positive_bytes_after_deduplication_independently_for_each_metric() {
+        let mut builder = TreeBuilder::new(GenerationId::new(12));
+        let root = builder.add_root(NodeSpec::root("root")).unwrap();
+        let identity = identity(1, 17);
+        let owner = builder
+            .add_child(root, NodeSpec::file("a-owner", metrics(1, 8)).with_file_identity(identity))
+            .unwrap();
+        let branch = builder.add_child(root, NodeSpec::directory("z-branch")).unwrap();
+        let nested = builder.add_child(branch, NodeSpec::directory("nested")).unwrap();
+        let alias = builder
+            .add_child(nested, NodeSpec::file("alias", metrics(1, 8)).with_file_identity(identity))
+            .unwrap();
+        let deeper = builder.add_child(nested, NodeSpec::directory("zero-or-unknown")).unwrap();
+        builder.add_child(deeper, NodeSpec::file("zero", metrics(0, 0))).unwrap();
+        builder
+            .add_child(
+                deeper,
+                NodeSpec::file(
+                    "unknown",
+                    OwnMetrics::new(
+                        SizeMetric::unknown(UnknownReason::AccessDenied, LOGICAL_SOURCE),
+                        SizeMetric::unknown(UnknownReason::AccessDenied, ALLOCATED_SOURCE),
+                    ),
+                ),
+            )
+            .unwrap();
+        let snapshot = builder.freeze().unwrap();
+        let aggregate = snapshot.node(root).unwrap().aggregate();
+        assert_eq!(snapshot.hard_link_owner(alias).unwrap(), Some(owner));
+        assert_eq!(aggregate.logical().positive_descendant_depth(), 3);
+        assert_eq!(aggregate.allocated().positive_descendant_depth(), 1);
+        assert_eq!(
+            snapshot.node(branch).unwrap().aggregate().allocated().positive_descendant_depth(),
+            0
+        );
+        assert_eq!(
+            snapshot.node(deeper).unwrap().aggregate().logical().positive_descendant_depth(),
+            0
+        );
+        assert_eq!(aggregate.logical().unknown_entries(), 1);
+    }
+
+    #[test]
+    fn root_indices_include_nested_real_roots_and_exclude_ordinary_descendants() {
+        let mut builder = TreeBuilder::new(GenerationId::new(13));
+        let group = builder.add_root(NodeSpec::synthetic_group("All volumes")).unwrap();
+        let first = builder.add_child(group, NodeSpec::root("C:\\")).unwrap();
+        builder.add_child(first, complete_file("file", 1)).unwrap();
+        let second = builder.add_child(group, NodeSpec::root("D:\\")).unwrap();
+        let independent = builder.add_root(NodeSpec::root("E:\\")).unwrap();
+        let snapshot = builder.freeze().unwrap();
+        assert_eq!(snapshot.roots().map(|(id, _)| id).collect::<Vec<_>>(), [group, independent]);
+        assert_eq!(snapshot.filesystem_roots().collect::<Vec<_>>(), [first, second, independent]);
+        assert_eq!(snapshot.clone().filesystem_roots().len(), 3);
+        assert_eq!(
+            TreeBuilder::new(GenerationId::new(14)).freeze().unwrap().filesystem_roots().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn freezing_can_be_cancelled_across_materialization_phases_without_a_partial_snapshot() {
+        let build = || {
+            let mut builder = TreeBuilder::new(GenerationId::new(15));
+            let root = builder.add_root(NodeSpec::root("root")).unwrap();
+            for index in 0..513 {
+                builder
+                    .add_child(
+                        root,
+                        NodeSpec::file(format!("file-{index}"), metrics(3, 8))
+                            .with_file_identity(identity(1, index % 31)),
+                    )
+                    .unwrap();
+            }
+            builder
+        };
+        let expected = build().freeze().unwrap();
+        let mut checks = 0;
+        let actual = build()
+            .freeze_cancellable(|| {
+                checks += 1;
+                false
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual, expected);
+        // Exercise every available phase boundary, including structural
+        // validation after arena materialization, rather than just launch.
+        for stop_at in 1..=checks {
+            let mut observed = 0;
+            assert!(
+                build()
+                    .freeze_cancellable(|| {
+                        observed += 1;
+                        observed == stop_at
+                    })
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(observed, stop_at);
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn positive_depth_metadata_reuses_existing_aggregate_padding() {
+        assert!(std::mem::size_of::<AggregateSize>() <= 32);
+        assert!(std::mem::size_of::<NodeRecord>() <= 288);
     }
 
     #[cfg(target_pointer_width = "64")]

@@ -41,6 +41,7 @@ tracing-subscriber = { version = "=0.3.23", default-features = false, features =
 unic-langid = "=0.9.6"
 windows = { version = "=0.62.2", default-features = false, features = [
     "std",
+    "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Globalization",

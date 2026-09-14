@@ -18,3 +18,14 @@ permanent-delete fallback or an empty-bin feature. Older research cannot
 authorize those features or other platforms. Parallel agents and independent
 review are tools for bounded work and meaningful risk, not prerequisites for
 each task. Follow [AGENTS.md](../../AGENTS.md).
+
+## Validation records
+
+- [Scanner renovado validation](scanner-renovado-validation.md): native
+  captures, automated checks and the CPU benchmark limits of the map-first
+  redesign (ADR 0021).
+- [Review remediation validation](review-remediation-validation.md):
+  correctness fixes, retained native enumeration, schema-2 diagnostics,
+  depth/root indexing and performance measurements with their raw results.
+- [Benchmark harness](../../tools/diskpie-bench/README.md): reproducible
+  seven-run comparisons; smoke data is not acceptance evidence.

@@ -1,9 +1,8 @@
 # DiskPie product roadmap and agent handoff
 
-> Product decisions updated 2026-09-11. This documentation change does not
-> implement features or establish new runtime verification. Existing evidence
-> below is recorded against source baseline
-> `f9a9a5fe8c6c5a108fae9edadda0f674a74a63b1`.
+> Product decisions updated 2026-09-11. Baseline and delivery status updated
+> 2026-09-13 after the integration of the Scanner renovado redesign, the
+> review remediation and the connected action flows (ADRs 0020–0022).
 
 ## Product contract
 
@@ -39,23 +38,32 @@ remain available as an archive.
 
 ## Current baseline and limits of the evidence
 
-The connected application already scans selected roots, discovers drives,
-streams partial results, cancels, renders a sunburst with a synchronized list,
-navigates, switches size metrics, and persists settings. English and Spanish
-strings and themes exist. Native Open/Reveal and recycle adapters exist below
-the UI; those buttons and confirmation flows are not connected. Branch rescan,
-Explorer settings integration, and diagnostic export also have remaining work.
+The connected application scans selected roots, discovers drives, streams
+partial results, cancels, renders the map-first sunburst with an optional
+searchable, virtualized list, navigates, switches size metrics, rescans one
+branch or the whole selection, and persists settings. Contextual Open and
+Reveal are connected, as is single-item recycling for proven fixed local NTFS
+with exact-path review. Tools offers the Installed Apps handoff, Explorer
+verb install/repair/remove with real registry inspection, and a redacted
+diagnostics preview with a native Save As flow. English and Spanish strings
+(188 messages) and themes exist. See [architecture](docs/architecture.md) and
+the validation records under `docs/research/` for the evidence.
 
-Recorded on 2026-09-04: 499 tests passed, six subprocess helpers were ignored
-by design, the local validation gate passed, and a static-CRT release executable
-measured 10.0 MB. A Windows 11 build 26200 smoke check is recorded. These are
-historical observations, not a fresh build or proof of Windows 10 compatibility.
-Check current source and CI before claiming a feature is ready.
+Two connected controls predate the 2026-09-11 decision and contradict it: a
+typed permanent-delete flow on items and an Empty Recycle Bin flow in Tools.
+Removing them from the interface is the first task of delivery 2.
 
-Still pending: clean Windows 10/11 checks, Recycle Bin provider/directory
-fixtures, OneDrive hydration checks, Narrator, DPI, and measured performance.
-See traceability for each requirement. No stable release was recorded at the
-baseline. Linux CI checks portable logic; Linux is not a product target.
+Recorded on 2026-09-13: format, Clippy, rustdoc and 589 workspace tests pass
+locally and in every CI job; the security workflow passes. A reproducible
+benchmark harness exists under `tools/diskpie-bench` with recorded seven-run
+comparisons. Native captures cover both themes, both languages and 100–200 %
+scaling. These are development observations, not release readiness.
+
+Still pending: clean Windows 10/11 checks, the no-fallback recycling policy
+and its provider/directory fixtures, OneDrive hydration checks, Narrator,
+physical mixed-DPI transitions and broader performance acceptance. See
+traceability for each requirement. No release has been published. Linux CI
+checks portable logic; Linux is not a product target.
 
 ## Non-negotiable cleanup behavior
 
@@ -88,21 +96,21 @@ retain the working engine and avoid speculative abstraction or new infrastructur
 
 | Capability | Complete-product outcome | Initial state |
 | --- | --- | --- |
-| Scan and navigate | Folders, drives, multi-drive summary, progressive results, cancel, full/branch rescan | Connected; branch rescan missing |
-| Folder view | Clear navigable folder list with sorting and shared selection | Largest-children companion exists; full view pending |
-| Sunburst | Interactive proportional rings | Connected; visual polish pending |
-| Top items | Ranked largest items with scope and exact metrics | Companion list exists; dedicated experience pending |
+| Scan and navigate | Folders, drives, multi-drive summary, progressive results, cancel, full/branch rescan | Connected, including branch rescan |
+| Folder view | Clear navigable folder list with sorting and shared selection | Searchable complete child list with name/size ordering exists; dedicated view pending |
+| Sunburst | Interactive proportional rings | Connected; Scanner renovado composition with adaptive depth and stable colors |
+| Top items | Ranked largest items with scope and exact metrics | Per-folder size ordering exists; whole-scan ranked view pending |
 | Treemap | Proportional rectangles using the same snapshot | New |
 | Age | Group by last-modified date; never equate age with disuse | New |
 | Flame, bubbles, mindmap | Three further views with consistent navigation | New |
-| Inspector and Shell | Size, allocation, dates, counts, native path, Open, Reveal, copy path, supported previews | Partial; Shell wiring and previews pending |
-| Cleanup basket | Multi-item review, estimates, recycle confirmation and per-item outcomes | Single-item logic/adapters exist; integration pending |
+| Inspector and Shell | Size, allocation, dates, counts, native path, Open, Reveal, copy path, supported previews | Details, Open and Reveal connected; dates, copy path and previews pending |
+| Cleanup basket | Multi-item review, estimates, recycle confirmation and per-item outcomes | Single-item recycle flow connected; basket and no-fallback policy pending |
 | Duplicates | Compare content; choose copies to keep before recycling | New |
 | Quick cleanup candidates | Explain reviewable downloads, caches, temporary/build files | New; no automatic deletion |
-| Applications and leftovers | Footprint, explicit official uninstall handoff, attributable leftovers | Installed Apps adapter exists; module pending |
+| Applications and leftovers | Footprint, explicit official uninstall handoff, attributable leftovers | Installed Apps handoff connected in Tools; module pending |
 | Snapshots | Save scans and compare growth, additions, removals | New |
 | System monitor | CPU, memory, network, storage activity, relevant processes | New |
-| Usability/distribution | English/Spanish, themes, keyboard, DPI, accessibility, local operation, portable download | Partial; verification/publication pending |
+| Usability/distribution | English/Spanish, themes, keyboard, DPI, accessibility, local operation, portable download | Connected; Windows 10/11, Narrator and publication pending |
 
 The eight views are folders, sunburst, top items, treemap, age, flame, bubbles,
 and mindmap. The [public reference inventory](https://diskbuddy.com/mac-disk-space-analyzer)
@@ -126,9 +134,15 @@ Resolve concrete usability obstacles before adding more views or infrastructure.
 open an item and reveal it in Explorer. Record checks and remaining platform
 limitations; publish a useful analysis release when its supported flows pass.
 
+**Status 2026-09-13:** implemented and covered by automated checks and native
+captures (ADR 0021, redesign and remediation validation records, benchmark
+harness). The clean Windows 10/11 walkthrough and the analysis release remain.
+
 ### 2. Clear exploration and recycle-only cleanup
 
-Polish folders, sunburst and top items; add treemap. Connect the shared inspector
+First remove the connected permanent-delete and empty-bin controls so the
+interface matches the recycle-only contract. Then polish folders, sunburst
+and top items; add treemap. Connect the shared inspector
 and selection to a cleanup basket with exact-path review, duplicate selection
 normalization, per-item results, and refresh after attempts. Complete branch
 rescan where needed. Verify no-fallback recycling before enabling each provider
@@ -179,9 +193,10 @@ checks not run without implying they passed. Update traceability only when new
 evidence supports the claim. No feature is complete merely because a backend
 adapter exists. Compare footprint when adding significant dependencies or work.
 
-**Next assignment:** wire Open and Reveal from the existing adapters, verify
-selection/state/path handling and a Windows smoke flow, and record the result.
-Inspect current sizes read-only where useful; do not make cleanup of the
-owner's development machine a prerequisite. Routine implementation decisions
-are autonomous; changes of product scope, stack, external cost, major rewrites,
-or irreversible user-data operations require the owner's decision.
+**Next assignment (delivery 2):** remove the permanent-delete and empty-bin
+controls from the interface, then add the treemap view and the multi-item
+cleanup basket on the shared snapshot, selection and inspector. Verify the
+no-fallback recycling policy with disposable fixtures before widening provider
+support. Routine implementation decisions are autonomous; changes of product
+scope, stack, external cost, major rewrites, or irreversible user-data
+operations require the owner's decision.

@@ -1,7 +1,7 @@
 # DiskPie architecture
 
 > Current direction: Windows 10/11 x64 only, permanently; free and open source.
-> Updated 2026-09-11. This guide replaces the paused-work assumptions in the
+> Updated 2026-09-11; entry points and baseline refreshed 2026-09-13. This guide replaces the paused-work assumptions in the
 > [historical architecture](https://github.com/Luexi/diskpie/blob/f9a9a5fe8c6c5a108fae9edadda0f674a74a63b1/docs/architecture.md).
 > Product decisions and delivery order live in [ROADMAP](../ROADMAP.md);
 > verified status lives in [requirements traceability](requirements-traceability.md).
@@ -25,9 +25,9 @@ establish that the application architecture is oversized.
 | --- | --- | --- |
 | `diskpie-core` | Native names, node identity, immutable trees, logical/allocated metrics, sunburst layout and hit testing. No UI or OS API dependency. | `src/model.rs`, `src/sunburst.rs` |
 | `diskpie-scan` | Blocking scan orchestration through `ScanFs`: coordinator, bounded workers/channels, batches and cancellation. | `src/fs.rs`, `src/protocol.rs`, `src/coordinator.rs` |
-| `diskpie-app` | UI-independent runtime, sessions, navigation, presentation, layout service, action policy and settings. | `src/runtime.rs`, `src/session.rs`, `src/navigation.rs`, `src/actions.rs`, `src/layout_service.rs` |
+| `diskpie-app` | UI-independent runtime, sessions, navigation, presentation, layout and list services, branch rescan, action policy, diagnostics export and settings. | `src/runtime.rs`, `src/session.rs`, `src/navigation.rs`, `src/actions.rs`, `src/layout_service.rs`, `src/item_list_service.rs`, `src/branch_rescan.rs` |
 | `diskpie-platform` | Windows filesystem/volume access, Shell STA, native settings, registry and diagnostic transport. Normal home for project-authored unsafe code. | `src/windows/filesystem.rs`, `src/windows/volumes.rs`, `src/windows/shell_service.rs`, `src/windows/shell_actions.rs`, `src/windows/settings_file.rs` |
-| `diskpie` | Executable composition, responsive egui surfaces, theme, localization and lifecycle handoff. No project-authored unsafe code. | `src/main.rs`, `src/shell.rs`, `src/scan_ui.rs`, `src/resolver.rs`, `src/sunburst_view.rs` |
+| `diskpie` | Executable composition, responsive egui surfaces, action and support dialogs, theme, localization and lifecycle handoff. No project-authored unsafe code. | `src/main.rs`, `src/shell.rs`, `src/shell/actions_ui.rs`, `src/shell/support_ui.rs`, `src/support_service.rs`, `src/scan_ui.rs`, `src/resolver.rs`, `src/sunburst_view.rs` |
 
 Paths are relative to `crates/<crate>/`. The executable composes app and
 platform services; platform may implement app/scan ports; app uses scan/core;
@@ -43,12 +43,15 @@ do not recreate them from older documents that call them planned. Diagnostics,
 panic-marker lifecycle, English/Spanish strings and Windows font fallback also
 exist. See the traceability matrix for remaining verification gaps.
 
-Open/reveal, recycle, Installed Apps and Explorer-integration adapters exist,
-but their user-facing bindings still need work. Branch rescan has no connected
-engine path. The staged cleanup list and the expanded views/tools below are
-future product work, not capabilities established by this documentation change.
-Legacy permanent-delete/empty-bin code is excluded from the new product; its
-presence does not authorize wiring it into the interface.
+Open/reveal, single-item recycle, Installed Apps handoff, Explorer-integration
+preferences and diagnostic export are connected through a bounded support
+worker and the Shell STA (ADR 0020). Branch rescan merges an isolated
+enumeration into the committed tree after the coordinator joins. Windows
+enumeration and child metadata share one retained directory handle (ADR 0022).
+The complete child list is ranked and filtered off-thread by `ItemListService`.
+The staged cleanup basket and the expanded views/tools below are future
+product work. Permanent-delete and empty-bin flows were connected before the
+recycle-only decision; remove those controls rather than extending them.
 
 ## Scan, frame and lifetime invariants
 
@@ -123,8 +126,7 @@ Validate cancellation, unsupported-provider behavior and Shell outcomes with
 self-created disposable fixtures before enabling a provider class. Keep
 unverified directory-recycle cases unavailable. Report per-item outcomes,
 partial completion and uncertainty honestly. Reconcile affected scan data after
-an attempt; until branch rescan exists, use the supported full rescan where
-needed. Staged selection and space estimates must not double-count nested items
+an attempt through the existing branch or full rescan. Staged selection and space estimates must not double-count nested items
 or imply that hard-link/cloud logical bytes are all reclaimable.
 
 ## Adding the remaining tools (target)

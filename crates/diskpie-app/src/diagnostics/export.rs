@@ -6,9 +6,9 @@ use super::{
     events::{AppVersion, CoarseOsVersion, DiagnosticLevel, Target},
     redaction::{RedactionCounts, RedactionPolicy, redact},
 };
-use std::{fmt, fmt::Write as _, sync::Arc};
+use std::{collections::VecDeque, fmt, fmt::Write as _, sync::Arc};
 
-pub const EXPORT_SCHEMA_VERSION: u32 = 1;
+pub const EXPORT_SCHEMA_VERSION: u32 = 2;
 pub const DIAGNOSTICS_POLICY_VERSION: u32 = 1;
 pub const MAX_EXPORT_BYTES: usize = 8 * 1_024 * 1_024;
 pub const MAX_INPUT_LINE_BYTES: usize = 16 * 1_024;
@@ -134,17 +134,37 @@ impl From<&crate::settings::Settings> for AllowlistedSettings {
     }
 }
 
-/// Path-free aggregate support metrics.
+/// Result of the most recently settled scan, not an accumulated session count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScanOutcome {
+    Complete,
+    Partial,
+    Cancelled,
+    Failed,
+}
+
+impl ScanOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Path-free metrics for the most recently settled scan. A branch scan's
+/// counters describe that scan, not the complete merged snapshot. Unmeasured
+/// fields stay unknown, including when no scan has settled yet.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AggregateMetrics {
-    pub scan_generations: u64,
-    pub completed_scans: u64,
-    pub failed_scans: u64,
-    pub cancelled_scans: u64,
-    pub items_observed: u64,
-    pub bytes_observed: u64,
-    pub scan_omissions: u64,
-    pub total_scan_duration_millis: u64,
+    pub generation: Option<u64>,
+    pub outcome: Option<ScanOutcome>,
+    pub items_observed: Option<u64>,
+    pub bytes_observed: Option<u64>,
+    pub scan_omissions: Option<u64>,
+    pub scan_duration_millis: Option<u64>,
 }
 
 /// Health counters supplied by the logging adapter. The policy itself neither
@@ -354,14 +374,10 @@ impl DiagnosticExport {
 /// candidates, and sources must be ordered oldest to newest.
 #[must_use]
 pub fn build_export(request: &ExportRequest<'_>) -> DiagnosticExport {
-    let (lines, preparation) = prepare_lines(request);
-    let selection = choose_newest_suffix(request, &lines, preparation);
-    let mut stats = selection.stats;
+    let PreparedLogs { mut reversed_bytes, mut stats } = prepare_logs(request, MAX_EXPORT_BYTES);
     let mut artifact = render_prefix(request, stats);
-    for line in &lines[selection.start..] {
-        artifact.extend_from_slice(line.text.as_bytes());
-        artifact.push(b'\n');
-    }
+    reversed_bytes.reverse();
+    artifact.extend_from_slice(&reversed_bytes);
     debug_assert!(artifact.len() <= MAX_EXPORT_BYTES);
     debug_assert!(std::str::from_utf8(&artifact).is_ok());
 
@@ -383,11 +399,15 @@ pub fn build_export(request: &ExportRequest<'_>) -> DiagnosticExport {
     }
 }
 
-#[derive(Clone, Debug)]
-struct PreparedLine {
+struct RetainedLine {
     source_index: usize,
-    text: String,
+    byte_len: usize,
     redactions: RedactionCounts,
+}
+
+struct PreparedLogs {
+    reversed_bytes: Vec<u8>,
+    stats: ExportStats,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -400,48 +420,92 @@ struct PreparationStats {
     invalid_utf8_lines: u64,
 }
 
-fn prepare_lines(request: &ExportRequest<'_>) -> (Vec<PreparedLine>, PreparationStats) {
-    let mut lines = Vec::new();
-    let mut stats = PreparationStats {
+fn prepare_logs(request: &ExportRequest<'_>, byte_limit: usize) -> PreparedLogs {
+    let prefix_size = PrefixSize::new(request);
+    let metadata_limit = prefix_size.maximum_len();
+    debug_assert!(metadata_limit < byte_limit);
+    let mut preparation = PreparationStats {
         source_files: usize_to_u64(request.log_sources.len()),
         ..PreparationStats::default()
     };
     let policy = RedactionPolicy { include_paths: request.include_paths };
+    let mut reversed_bytes = Vec::new();
+    let mut oldest_lines = VecDeque::new();
+    let mut source_lines = vec![0_u64; request.log_sources.len()];
+    let mut included_lines = 0_u64;
+    let mut included_sources = 0_u64;
+    let mut redactions = RedactionCounts::default();
+    let mut retaining = true;
 
-    for (source_index, source) in request.log_sources.iter().enumerate() {
+    // Start at the newest complete record. Once the raw suffix fills the byte
+    // cap, older lines cannot be selected, but still contribute input statistics.
+    // Stored bytes are reversed so prepending an older line is amortized O(line).
+    for (source_index, source) in request.log_sources.iter().enumerate().rev() {
         let Some(bytes) = source.bytes else {
-            stats.unreadable_source_files = stats.unreadable_source_files.saturating_add(1);
+            preparation.unreadable_source_files =
+                preparation.unreadable_source_files.saturating_add(1);
             continue;
         };
-        let mut start = 0;
-        for (end, byte) in bytes.iter().enumerate() {
-            if *byte != b'\n' {
-                continue;
-            }
-            let mut raw_line = &bytes[start..end];
+        let Some(last_newline) = bytes.iter().rposition(|byte| *byte == b'\n') else {
+            preparation.partial_lines_omitted =
+                preparation.partial_lines_omitted.saturating_add(u64::from(!bytes.is_empty()));
+            continue;
+        };
+        if last_newline + 1 < bytes.len() {
+            preparation.partial_lines_omitted = preparation.partial_lines_omitted.saturating_add(1);
+        }
+        for mut raw_line in bytes[..last_newline].rsplit(|byte| *byte == b'\n') {
             if raw_line.ends_with(b"\r") {
                 raw_line = &raw_line[..raw_line.len() - 1];
             }
             let prepared = prepare_line(raw_line, policy);
-            stats.complete_input_lines = stats.complete_input_lines.saturating_add(1);
+            preparation.complete_input_lines = preparation.complete_input_lines.saturating_add(1);
             if prepared.truncated {
-                stats.truncated_input_lines = stats.truncated_input_lines.saturating_add(1);
+                preparation.truncated_input_lines =
+                    preparation.truncated_input_lines.saturating_add(1);
             }
             if prepared.invalid_utf8 {
-                stats.invalid_utf8_lines = stats.invalid_utf8_lines.saturating_add(1);
+                preparation.invalid_utf8_lines = preparation.invalid_utf8_lines.saturating_add(1);
             }
-            lines.push(PreparedLine {
-                source_index,
-                text: prepared.text,
-                redactions: prepared.redactions,
-            });
-            start = end + 1;
-        }
-        if start < bytes.len() {
-            stats.partial_lines_omitted = stats.partial_lines_omitted.saturating_add(1);
+            let byte_len = prepared.text.len() + 1;
+            if retaining && reversed_bytes.len() + byte_len <= byte_limit {
+                reversed_bytes.push(b'\n');
+                reversed_bytes.extend(prepared.text.as_bytes().iter().rev());
+                included_lines += 1;
+                if source_lines[source_index] == 0 {
+                    included_sources += 1;
+                }
+                source_lines[source_index] += 1;
+                redactions.merge(prepared.redactions);
+                oldest_lines.push_front(RetainedLine {
+                    source_index,
+                    byte_len,
+                    redactions: prepared.redactions,
+                });
+                // Only the oldest header-sized margin can need trimming. Each
+                // line includes a newline byte, so at most this many records
+                // can be removed to make room for the bounded header.
+                if oldest_lines.len() > metadata_limit {
+                    oldest_lines.pop_back();
+                }
+            } else {
+                retaining = false;
+            }
         }
     }
-    (lines, stats)
+    let mut stats = make_stats(request, preparation, included_lines, included_sources, redactions);
+    while prefix_size.len(stats) + reversed_bytes.len() > byte_limit {
+        let oldest = oldest_lines.pop_front().expect("header margin retains every removable line");
+        reversed_bytes.truncate(reversed_bytes.len() - oldest.byte_len);
+        included_lines -= 1;
+        source_lines[oldest.source_index] -= 1;
+        if source_lines[oldest.source_index] == 0 {
+            included_sources -= 1;
+        }
+        subtract_redactions(&mut redactions, oldest.redactions);
+        stats = make_stats(request, preparation, included_lines, included_sources, redactions);
+    }
+    PreparedLogs { reversed_bytes, stats }
 }
 
 struct PreparedText {
@@ -490,51 +554,108 @@ fn truncate_utf8_with_marker(text: &mut String, maximum: usize) {
     text.push_str(LINE_TRUNCATION_MARKER);
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Selection {
-    start: usize,
-    stats: ExportStats,
+fn subtract_redactions(total: &mut RedactionCounts, removed: RedactionCounts) {
+    total.paths -= removed.paths;
+    total.urls -= removed.urls;
+    total.query_strings -= removed.query_strings;
+    total.assignments -= removed.assignments;
+    total.secrets -= removed.secrets;
+    total.control_runs -= removed.control_runs;
 }
 
-fn choose_newest_suffix(
-    request: &ExportRequest<'_>,
-    lines: &[PreparedLine],
-    preparation: PreparationStats,
-) -> Selection {
-    let mut included_sources = vec![false; request.log_sources.len()];
-    let mut included_source_count = 0_u64;
-    let mut suffix_bytes = 0_usize;
-    let mut suffix_redactions = RedactionCounts::default();
-    let mut best = Selection {
-        start: lines.len(),
-        stats: make_stats(request, preparation, 0, 0, RedactionCounts::default()),
-    };
+/// The request portion is immutable. Statistics change only numeric widths
+/// and the five explicit optional notice lines; no prefix allocation or
+/// formatting is needed while selecting the suffix.
+struct PrefixSize {
+    fixed_bytes: usize,
+}
 
-    // The no-log artifact is fixed and comfortably below the cap.
-    debug_assert!(render_prefix(request, best.stats).len() <= MAX_EXPORT_BYTES);
-
-    for start in (0..lines.len()).rev() {
-        let line = &lines[start];
-        suffix_bytes = suffix_bytes.saturating_add(line.text.len().saturating_add(1));
-        suffix_redactions.merge(line.redactions);
-        if !included_sources[line.source_index] {
-            included_sources[line.source_index] = true;
-            included_source_count = included_source_count.saturating_add(1);
-        }
-        let included_lines = usize_to_u64(lines.len() - start);
-        let stats = make_stats(
-            request,
-            preparation,
-            included_lines,
-            included_source_count,
-            suffix_redactions,
-        );
-        let prefix_len = render_prefix(request, stats).len();
-        if prefix_len.saturating_add(suffix_bytes) <= MAX_EXPORT_BYTES {
-            best = Selection { start, stats };
-        }
+impl PrefixSize {
+    fn new(request: &ExportRequest<'_>) -> Self {
+        let empty = ExportStats::default();
+        let variable = statistics_width(empty) + notices_len(empty);
+        Self { fixed_bytes: render_prefix(request, empty).len() - variable }
     }
-    best
+
+    fn len(&self, stats: ExportStats) -> usize {
+        self.fixed_bytes + statistics_width(stats) + notices_len(stats)
+    }
+
+    fn maximum_len(&self) -> usize {
+        let maximum = ExportStats {
+            omitted_source_files: u64::MAX,
+            omitted_lines: u64::MAX,
+            partial_lines_omitted: u64::MAX,
+            capacity_lines_omitted: u64::MAX,
+            dropped_events: u64::MAX,
+            write_failures: u64::MAX,
+            truncated_input_lines: u64::MAX,
+            sink_truncated_lines: u64::MAX,
+            invalid_utf8_lines: u64::MAX,
+            ..ExportStats::default()
+        };
+        self.fixed_bytes + statistic_fields(maximum).len() * 20 + notices_len(maximum)
+    }
+}
+
+fn decimal_width(value: u64) -> usize {
+    if value == 0 { 1 } else { value.ilog10() as usize + 1 }
+}
+
+fn statistics_width(stats: ExportStats) -> usize {
+    statistic_fields(stats).iter().map(|(_, value)| decimal_width(*value)).sum()
+}
+
+fn notices_len(stats: ExportStats) -> usize {
+    let mut bytes = 0;
+    if stats.omitted_source_files != 0 || stats.omitted_lines != 0 {
+        bytes += "NOTICE omission files= lines= partial= capacity=\n".len()
+            + decimal_width(stats.omitted_source_files)
+            + decimal_width(stats.omitted_lines)
+            + decimal_width(stats.partial_lines_omitted)
+            + decimal_width(stats.capacity_lines_omitted);
+    }
+    if stats.dropped_events != 0 {
+        bytes += "NOTICE appender_drop count=\n".len() + decimal_width(stats.dropped_events);
+    }
+    if stats.write_failures != 0 {
+        bytes +=
+            "NOTICE appender_write_failure count=\n".len() + decimal_width(stats.write_failures);
+    }
+    if stats.truncated_input_lines != 0 || stats.sink_truncated_lines != 0 {
+        bytes += "NOTICE line_truncation input= appender=\n".len()
+            + decimal_width(stats.truncated_input_lines)
+            + decimal_width(stats.sink_truncated_lines);
+    }
+    if stats.invalid_utf8_lines != 0 {
+        bytes += "NOTICE invalid_utf8 lines=\n".len() + decimal_width(stats.invalid_utf8_lines);
+    }
+    if bytes == 0 { "notice=none\n".len() } else { bytes }
+}
+
+fn statistic_fields(stats: ExportStats) -> [(&'static str, u64); 20] {
+    [
+        ("source_files", stats.source_files),
+        ("unreadable_source_files", stats.unreadable_source_files),
+        ("included_source_files", stats.included_source_files),
+        ("omitted_source_files", stats.omitted_source_files),
+        ("complete_input_lines", stats.complete_input_lines),
+        ("included_lines", stats.included_lines),
+        ("omitted_lines", stats.omitted_lines),
+        ("partial_lines_omitted", stats.partial_lines_omitted),
+        ("capacity_lines_omitted", stats.capacity_lines_omitted),
+        ("truncated_input_lines", stats.truncated_input_lines),
+        ("invalid_utf8_lines", stats.invalid_utf8_lines),
+        ("appender_dropped_events", stats.dropped_events),
+        ("appender_write_failures", stats.write_failures),
+        ("appender_truncated_lines", stats.sink_truncated_lines),
+        ("redacted_paths", stats.redactions.paths),
+        ("redacted_urls", stats.redactions.urls),
+        ("redacted_query_strings", stats.redactions.query_strings),
+        ("redacted_assignments", stats.redactions.assignments),
+        ("redacted_secrets", stats.redactions.secrets),
+        ("redacted_control_runs", stats.redactions.control_runs),
+    ]
 }
 
 fn make_stats(
@@ -614,64 +735,27 @@ fn render_prefix(request: &ExportRequest<'_>, stats: ExportStats) -> Vec<u8> {
         .expect("writing to String cannot fail");
 
     let aggregates = request.aggregates;
-    writeln!(output, "\n[aggregates]").expect("writing to String cannot fail");
-    writeln!(output, "scan_generations={}", aggregates.scan_generations)
+    writeln!(output, "\n[last_scan]").expect("writing to String cannot fail");
+    writeln!(output, "outcome={}", aggregates.outcome.map_or("unknown", ScanOutcome::as_str))
         .expect("writing to String cannot fail");
-    writeln!(output, "completed_scans={}", aggregates.completed_scans)
+    for (name, value) in [
+        ("generation", aggregates.generation),
+        ("items_observed", aggregates.items_observed),
+        ("bytes_observed", aggregates.bytes_observed),
+        ("scan_omissions", aggregates.scan_omissions),
+        ("scan_duration_ms", aggregates.scan_duration_millis),
+    ] {
+        match value {
+            Some(value) => writeln!(output, "{name}={value}"),
+            None => writeln!(output, "{name}=unknown"),
+        }
         .expect("writing to String cannot fail");
-    writeln!(output, "failed_scans={}", aggregates.failed_scans)
-        .expect("writing to String cannot fail");
-    writeln!(output, "cancelled_scans={}", aggregates.cancelled_scans)
-        .expect("writing to String cannot fail");
-    writeln!(output, "items_observed={}", aggregates.items_observed)
-        .expect("writing to String cannot fail");
-    writeln!(output, "bytes_observed={}", aggregates.bytes_observed)
-        .expect("writing to String cannot fail");
-    writeln!(output, "scan_omissions={}", aggregates.scan_omissions)
-        .expect("writing to String cannot fail");
-    writeln!(output, "total_scan_duration_ms={}", aggregates.total_scan_duration_millis)
-        .expect("writing to String cannot fail");
+    }
 
     writeln!(output, "\n[statistics]").expect("writing to String cannot fail");
-    writeln!(output, "source_files={}", stats.source_files).expect("writing to String cannot fail");
-    writeln!(output, "unreadable_source_files={}", stats.unreadable_source_files)
-        .expect("writing to String cannot fail");
-    writeln!(output, "included_source_files={}", stats.included_source_files)
-        .expect("writing to String cannot fail");
-    writeln!(output, "omitted_source_files={}", stats.omitted_source_files)
-        .expect("writing to String cannot fail");
-    writeln!(output, "complete_input_lines={}", stats.complete_input_lines)
-        .expect("writing to String cannot fail");
-    writeln!(output, "included_lines={}", stats.included_lines)
-        .expect("writing to String cannot fail");
-    writeln!(output, "omitted_lines={}", stats.omitted_lines)
-        .expect("writing to String cannot fail");
-    writeln!(output, "partial_lines_omitted={}", stats.partial_lines_omitted)
-        .expect("writing to String cannot fail");
-    writeln!(output, "capacity_lines_omitted={}", stats.capacity_lines_omitted)
-        .expect("writing to String cannot fail");
-    writeln!(output, "truncated_input_lines={}", stats.truncated_input_lines)
-        .expect("writing to String cannot fail");
-    writeln!(output, "invalid_utf8_lines={}", stats.invalid_utf8_lines)
-        .expect("writing to String cannot fail");
-    writeln!(output, "appender_dropped_events={}", stats.dropped_events)
-        .expect("writing to String cannot fail");
-    writeln!(output, "appender_write_failures={}", stats.write_failures)
-        .expect("writing to String cannot fail");
-    writeln!(output, "appender_truncated_lines={}", stats.sink_truncated_lines)
-        .expect("writing to String cannot fail");
-    writeln!(output, "redacted_paths={}", stats.redactions.paths)
-        .expect("writing to String cannot fail");
-    writeln!(output, "redacted_urls={}", stats.redactions.urls)
-        .expect("writing to String cannot fail");
-    writeln!(output, "redacted_query_strings={}", stats.redactions.query_strings)
-        .expect("writing to String cannot fail");
-    writeln!(output, "redacted_assignments={}", stats.redactions.assignments)
-        .expect("writing to String cannot fail");
-    writeln!(output, "redacted_secrets={}", stats.redactions.secrets)
-        .expect("writing to String cannot fail");
-    writeln!(output, "redacted_control_runs={}", stats.redactions.control_runs)
-        .expect("writing to String cannot fail");
+    for (name, value) in statistic_fields(stats) {
+        writeln!(output, "{name}={value}").expect("writing to String cannot fail");
+    }
 
     writeln!(output, "\n[notices]").expect("writing to String cannot fail");
     let mut any_notice = false;
@@ -758,6 +842,8 @@ mod tests {
             theme: crate::settings::UiTheme::Dark,
             size_preference: crate::settings::SizePreference::Logical,
             show_both_sizes: false,
+            show_item_list: false,
+            item_list_width_points: 300,
             ui_scale: Some(f32::INFINITY),
             layout_max_sectors: u32::MAX,
             layout_max_depth: 0,
@@ -794,6 +880,158 @@ mod tests {
     }
 
     #[test]
+    fn unmeasured_last_scan_values_are_unknown_not_zero_or_session_totals() {
+        let mut request = request(&[]);
+        let absent = build_export(&request);
+        assert!(
+            absent.artifact().text().contains("[last_scan]\noutcome=unknown\ngeneration=unknown\n")
+        );
+        assert!(absent.artifact().text().contains("bytes_observed=unknown\n"));
+        assert!(absent.artifact().text().contains("scan_duration_ms=unknown\n"));
+        assert!(!absent.artifact().text().contains("completed_scans="));
+        request.aggregates = AggregateMetrics {
+            generation: Some(42),
+            outcome: Some(ScanOutcome::Complete),
+            items_observed: Some(0),
+            bytes_observed: Some(0),
+            scan_duration_millis: Some(0),
+            scan_omissions: Some(0),
+        };
+        let measured = build_export(&request);
+        assert!(measured.artifact().text().contains("outcome=complete\ngeneration=42\n"));
+        assert!(measured.artifact().text().contains("bytes_observed=0\n"));
+        assert!(measured.artifact().text().contains("scan_duration_ms=0\n"));
+    }
+
+    #[test]
+    fn prefix_size_is_exact_across_numeric_boundaries_and_every_notice_combination() {
+        let request = request(&[]);
+        let size = PrefixSize::new(&request);
+        for value in [0, 1, 9, 10, 99, 100, u64::MAX] {
+            for notices in 0..32 {
+                let stats = ExportStats {
+                    source_files: value,
+                    unreadable_source_files: value,
+                    included_source_files: value,
+                    omitted_source_files: if notices & 1 != 0 { value } else { 0 },
+                    complete_input_lines: value,
+                    included_lines: value,
+                    omitted_lines: if notices & 1 != 0 { value } else { 0 },
+                    partial_lines_omitted: value,
+                    capacity_lines_omitted: value,
+                    dropped_events: if notices & 2 != 0 { value } else { 0 },
+                    write_failures: if notices & 4 != 0 { value } else { 0 },
+                    truncated_input_lines: if notices & 8 != 0 { value } else { 0 },
+                    sink_truncated_lines: if notices & 8 != 0 { value } else { 0 },
+                    invalid_utf8_lines: if notices & 16 != 0 { value } else { 0 },
+                    redactions: RedactionCounts {
+                        paths: value,
+                        urls: value,
+                        query_strings: value,
+                        assignments: value,
+                        secrets: value,
+                        control_runs: value,
+                    },
+                    ..ExportStats::default()
+                };
+                let actual = render_prefix(&request, stats).len();
+                assert_eq!(size.len(stats), actual, "value={value} notices={notices}");
+                assert!(size.maximum_len() >= actual);
+            }
+        }
+    }
+
+    // Deliberately simple forward/all-lines oracle for the suffix contract.
+    // This is the previous selection strategy, restricted to small test inputs.
+    fn reference_suffix(request: &ExportRequest<'_>, cap: usize) -> (Vec<u8>, ExportStats) {
+        let mut lines = Vec::new();
+        let mut preparation = PreparationStats {
+            source_files: usize_to_u64(request.log_sources.len()),
+            ..Default::default()
+        };
+        for (source_index, source) in request.log_sources.iter().enumerate() {
+            let Some(bytes) = source.bytes else {
+                preparation.unreadable_source_files += 1;
+                continue;
+            };
+            for record in bytes.split_inclusive(|byte| *byte == b'\n') {
+                if !record.ends_with(b"\n") {
+                    preparation.partial_lines_omitted += 1;
+                    continue;
+                }
+                let mut raw = &record[..record.len() - 1];
+                if raw.ends_with(b"\r") {
+                    raw = &raw[..raw.len() - 1];
+                }
+                let prepared =
+                    prepare_line(raw, RedactionPolicy { include_paths: request.include_paths });
+                preparation.complete_input_lines += 1;
+                preparation.truncated_input_lines += u64::from(prepared.truncated);
+                preparation.invalid_utf8_lines += u64::from(prepared.invalid_utf8);
+                lines.push((source_index, prepared));
+            }
+        }
+        let mut source_included = vec![false; request.log_sources.len()];
+        let mut source_count = 0;
+        let mut bytes = 0;
+        let mut redactions = RedactionCounts::default();
+        let mut selected = (lines.len(), make_stats(request, preparation, 0, 0, redactions));
+        for start in (0..lines.len()).rev() {
+            let (source, line) = &lines[start];
+            bytes += line.text.len() + 1;
+            redactions.merge(line.redactions);
+            if !source_included[*source] {
+                source_included[*source] = true;
+                source_count += 1;
+            }
+            let stats = make_stats(
+                request,
+                preparation,
+                usize_to_u64(lines.len() - start),
+                source_count,
+                redactions,
+            );
+            if render_prefix(request, stats).len() + bytes <= cap {
+                selected = (start, stats);
+            }
+        }
+        let mut artifact = render_prefix(request, selected.1);
+        for (_, line) in &lines[selected.0..] {
+            artifact.extend_from_slice(line.text.as_bytes());
+            artifact.push(b'\n');
+        }
+        (artifact, selected.1)
+    }
+
+    #[test]
+    fn bounded_suffix_matches_reference_for_short_lines_sources_redaction_and_truncation() {
+        let old = b"old\n\n\r\npartial".repeat(30);
+        let short = b"x\n\n".repeat(5_000);
+        let mixed = b"token=abc\nC:\\private\\path\r\nbad\xff\n".repeat(40);
+        let long = format!("{}\n", "z".repeat(MAX_INPUT_LINE_BYTES + 10));
+        let sources = [
+            LogSource::available(&old),
+            LogSource::unavailable(),
+            LogSource::available(long.as_bytes()),
+            LogSource::available(&short),
+            LogSource::available(&mixed),
+            LogSource::available(b"last\nunfinished"),
+        ];
+        for include_paths in [false, true] {
+            let mut request = request(&sources);
+            request.include_paths = include_paths;
+            for cap in [8_192, 16_384, 32_768] {
+                let PreparedLogs { mut reversed_bytes, stats } = prepare_logs(&request, cap);
+                let mut actual = render_prefix(&request, stats);
+                reversed_bytes.reverse();
+                actual.extend(reversed_bytes);
+                let expected = reference_suffix(&request, cap);
+                assert_eq!((actual, stats), expected, "cap={cap} paths={include_paths}");
+            }
+        }
+    }
+
+    #[test]
     fn log_source_debug_exposes_only_availability_and_length() {
         let source = LogSource::available(b"token=private");
         let debug = format!("{source:?}");
@@ -811,14 +1049,12 @@ mod tests {
         ];
         let mut request = request(&sources);
         request.aggregates = AggregateMetrics {
-            scan_generations: 2,
-            completed_scans: 1,
-            failed_scans: 1,
-            cancelled_scans: 0,
-            items_observed: 42,
-            bytes_observed: 1_024,
-            scan_omissions: 3,
-            total_scan_duration_millis: 250,
+            generation: Some(2),
+            outcome: Some(ScanOutcome::Failed),
+            items_observed: Some(42),
+            bytes_observed: Some(1_024),
+            scan_omissions: Some(3),
+            scan_duration_millis: Some(250),
         };
         request.counters =
             DiagnosticCounters { dropped_events: 4, write_failures: 2, sink_truncated_lines: 1 };
@@ -827,7 +1063,7 @@ mod tests {
         let export = build_export(&request);
         let expected = concat!(
             "DISKPIE_DIAGNOSTIC_EXPORT\n",
-            "schema_version=1\n",
+            "schema_version=2\n",
             "diagnostics_policy_version=1\n",
             "encoding=utf-8\n",
             "paths_included_by_consent=false\n",
@@ -847,15 +1083,13 @@ mod tests {
             "scan_workers=0\n",
             "diagnostic_level=info\n",
             "explorer_integration=false\n",
-            "\n[aggregates]\n",
-            "scan_generations=2\n",
-            "completed_scans=1\n",
-            "failed_scans=1\n",
-            "cancelled_scans=0\n",
+            "\n[last_scan]\n",
+            "outcome=failed\n",
+            "generation=2\n",
             "items_observed=42\n",
             "bytes_observed=1024\n",
             "scan_omissions=3\n",
-            "total_scan_duration_ms=250\n",
+            "scan_duration_ms=250\n",
             "\n[statistics]\n",
             "source_files=3\n",
             "unreadable_source_files=1\n",

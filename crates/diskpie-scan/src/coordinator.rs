@@ -11,8 +11,9 @@ use crate::{
 use diskpie_core::{EntryKind, VolumeKey};
 use std::{
     collections::{HashMap, VecDeque},
+    ffi::OsString,
     panic::{AssertUnwindSafe, catch_unwind},
-    path::{Component, Path, PathBuf},
+    path::{Component, Path},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -170,9 +171,37 @@ pub fn start_scan_with_cancel(
 struct WorkItem {
     generation: ScanGeneration,
     directory: ScanNodeId,
-    path: PathBuf,
+    path: Arc<Path>,
     volume: VolumeKey,
     storage_class: StorageClass,
+}
+
+/// Siblings share one flat parent path; no recursively owned parent chain.
+/// Only dispatched work materializes its complete child path.
+#[derive(Clone, Debug)]
+struct PendingDirectory {
+    generation: ScanGeneration,
+    directory: ScanNodeId,
+    parent: Arc<Path>,
+    name: OsString,
+    volume: VolumeKey,
+    storage_class: StorageClass,
+}
+
+impl PendingDirectory {
+    fn materialize(&self) -> WorkItem {
+        WorkItem {
+            generation: self.generation,
+            directory: self.directory,
+            path: if self.name.is_empty() {
+                Arc::clone(&self.parent)
+            } else {
+                Arc::from(self.parent.join(&self.name))
+            },
+            volume: self.volume,
+            storage_class: self.storage_class,
+        }
+    }
 }
 
 /// Pending directories kept as one FIFO per volume with round-robin rotation.
@@ -184,7 +213,7 @@ struct WorkItem {
 /// rotational or removable cap was reached.
 #[derive(Debug, Default)]
 struct PendingQueue {
-    queues: HashMap<VolumeKey, VecDeque<WorkItem>>,
+    queues: HashMap<VolumeKey, VecDeque<PendingDirectory>>,
     rotation: VecDeque<VolumeKey>,
     len: usize,
 }
@@ -204,7 +233,7 @@ impl PendingQueue {
         self.len = 0;
     }
 
-    fn push_back(&mut self, work: WorkItem) {
+    fn push_back(&mut self, work: PendingDirectory) {
         let queue = self.queues.entry(work.volume).or_default();
         if queue.is_empty() {
             self.rotation.push_back(work.volume);
@@ -215,7 +244,7 @@ impl PendingQueue {
 
     /// Returns an item to the head of its volume queue after a full worker
     /// channel rejected it, keeping that volume next in rotation.
-    fn push_front(&mut self, work: WorkItem) {
+    fn push_front(&mut self, work: PendingDirectory) {
         let queue = self.queues.entry(work.volume).or_default();
         if queue.is_empty() {
             self.rotation.push_front(work.volume);
@@ -230,7 +259,10 @@ impl PendingQueue {
     /// Pops the oldest directory of the first volume in rotation that
     /// `eligible` accepts and moves that volume to the back of the rotation so
     /// every volume with available permits gets a turn.
-    fn pop_eligible(&mut self, mut eligible: impl FnMut(VolumeKey) -> bool) -> Option<WorkItem> {
+    fn pop_eligible(
+        &mut self,
+        mut eligible: impl FnMut(VolumeKey) -> bool,
+    ) -> Option<PendingDirectory> {
         for _ in 0..self.rotation.len() {
             let volume = self.rotation.pop_front()?;
             if !eligible(volume) {
@@ -474,10 +506,11 @@ fn run_coordinator(
             .entry(root.volume)
             .and_modify(|existing| *existing = (*existing).min(cap))
             .or_insert(cap);
-        state.pending.push_back(WorkItem {
+        state.pending.push_back(PendingDirectory {
             generation,
             directory: id,
-            path: root.path.clone(),
+            parent: Arc::from(root.path.clone()),
+            name: OsString::new(),
             volume: root.volume,
             storage_class: root.storage_class,
         });
@@ -647,13 +680,14 @@ fn dispatch_available(
             continue;
         }
         let CoordinatorState { pending, active_by_volume, volume_caps, .. } = &mut *state;
-        let Some(work) = pending.pop_eligible(|volume| {
+        let Some(pending_work) = pending.pop_eligible(|volume| {
             let active = active_by_volume.get(&volume).copied().unwrap_or(0);
             let cap = volume_caps.get(&volume).copied().unwrap_or(1);
             active < cap
         }) else {
             continue;
         };
+        let work = pending_work.materialize();
         let sender = slot.sender.as_ref().ok_or(ScanFailure::WorkerDisconnected {
             worker: slot.id,
             directory: Some(work.directory),
@@ -666,7 +700,7 @@ fn dispatch_available(
                     .ok_or(ScanFailure::CounterOverflow { field: CounterField::Directories })?;
                 slot.busy = Some(BusyWork { work, received: ScanCounters::default() });
             }
-            Err(TrySendError::Full(work)) => state.pending.push_front(work),
+            Err(TrySendError::Full(_)) => state.pending.push_front(pending_work),
             Err(TrySendError::Disconnected(work)) => {
                 return Err(ScanFailure::WorkerDisconnected {
                     worker: slot.id,
@@ -730,12 +764,12 @@ fn process_batch(
         validate_fs_entry(&entry)?;
         recomputed.observe_entry(entry.kind)?;
         let id = state.allocate_id()?;
-        let child_path = work.path.join(&entry.name);
         if !cancel.is_cancelled() && entry.kind.can_have_children() {
-            state.pending.push_back(WorkItem {
+            state.pending.push_back(PendingDirectory {
                 generation,
                 directory: id,
-                path: child_path,
+                parent: Arc::clone(&work.path),
+                name: entry.name.clone(),
                 volume: work.volume,
                 storage_class: work.storage_class,
             });
@@ -1249,12 +1283,14 @@ fn send_worker_message(
 #[cfg(test)]
 mod pending_queue_tests {
     use super::*;
+    use std::path::PathBuf;
 
-    fn item(volume: u128, directory: u64) -> WorkItem {
-        WorkItem {
+    fn item(volume: u128, directory: u64) -> PendingDirectory {
+        PendingDirectory {
             generation: ScanGeneration::new(1),
             directory: ScanNodeId::from_raw(directory),
-            path: PathBuf::from(format!("v{volume}/d{directory}")),
+            parent: Arc::from(PathBuf::from(format!("v{volume}"))),
+            name: OsString::from(format!("d{directory}")),
             volume: VolumeKey::new(volume),
             storage_class: StorageClass::Unknown,
         }
@@ -1323,5 +1359,21 @@ mod pending_queue_tests {
         queue.clear();
         assert!(queue.is_empty());
         assert!(queue.pop_eligible(|_| true).is_none());
+    }
+
+    #[test]
+    fn wide_frontier_shares_native_parent_and_materializes_only_selected_child() {
+        let parent: Arc<Path> = Arc::from(PathBuf::from("root").join("長い親😀".repeat(512)));
+        let mut queue = PendingQueue::default();
+        for directory in 0..10_000 {
+            let mut pending = item(1, directory);
+            pending.parent = Arc::clone(&parent);
+            queue.push_back(pending);
+        }
+        assert_eq!(Arc::strong_count(&parent), 10_001);
+        let selected = queue.pop_eligible(|_| true).expect("pending directory");
+        assert_eq!(selected.materialize().path.as_ref(), parent.join("d0"));
+        queue.clear();
+        assert_eq!(Arc::strong_count(&parent), 2);
     }
 }

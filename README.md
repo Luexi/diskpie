@@ -10,17 +10,25 @@ DiskPie is a free, open-source disk space analyzer for **Windows 10 and 11
 x86-64**. Windows is the only product platform. It uses Rust and egui/eframe,
 with a portable executable as the first distribution format.
 
-Development is in progress; there is no published release yet. Scan and radial
-exploration work, while file-action controls and the broader feature set below
-are still being integrated. See [feature status and evidence](docs/requirements-traceability.md).
+Development is in progress; there is no published release yet. Scanning, the
+map-first exploration, contextual Open/Reveal and single-item recycling work,
+while the broader feature set below is still being built. See
+[feature status and evidence](docs/requirements-traceability.md).
 
 ## Available in the current implementation
 
 - Select a folder, drive or all drives; start from the native dialog or CLI.
-- Watch the sunburst and synchronized largest-items list update while scanning;
-  inspect paths, logical/allocated sizes, counts and omissions.
-- Select, zoom, go back/parent, hide/restore branches, change size basis,
-  perform a full rescan and cancel while retaining available results.
+- Watch the sunburst grow while scanning. The center names the current folder
+  and its size; click a folder to enter it or the center to go up.
+- Open Show list for a searchable, keyboard-operable table of every child
+  with name/size ordering and collapsible details (paths, logical/allocated
+  sizes, counts, omissions and share of the view).
+- Zoom, go back/parent, hide/restore branches, change size basis, rescan the
+  selection or one branch, and cancel while retaining available results.
+- Open or reveal an item in Explorer, and recycle a supported fixed local NTFS
+  item after reviewing its exact path.
+- Use Tools to open Windows Installed Apps, manage the optional per-user
+  Explorer context-menu verb, and save a redacted diagnostics report.
 - Use English/Spanish, system/light/dark themes and persistent preferences.
 - Keep scans and bounded diagnostics local; there is no scan-upload service.
 
@@ -45,13 +53,15 @@ inform the scope; implementation, artwork and text are original. See the
 
 ## Current limitations
 
-- Open/reveal/recycle controls are not connected yet. Native adapters exist,
-  but the new recycle-only guarantee needs end-to-end Windows verification.
-  Legacy permanent-delete/empty-bin code is dormant and outside product scope.
-- Branch-only rescan, the Explorer-integration settings control and diagnostic
-  export from the interface are pending.
-- Most additional views, duplicates, cleanup suggestions, app footprints,
-  snapshots/comparisons, previews and monitoring are planned.
+- Recycling is enabled only for proven fixed local NTFS. The recycle-only
+  guarantee (no permanent-delete fallback for oversized items, disabled bins or
+  unsupported volumes) still needs end-to-end Windows verification.
+- A permanent-delete control and an Empty Recycle Bin control were connected
+  before the recycle-only decision; they are scheduled for removal from the
+  interface and are outside product scope.
+- Treemap and the other additional views, the multi-item cleanup basket,
+  duplicates, cleanup suggestions, app footprints, snapshots/comparisons,
+  previews and monitoring are planned.
 - Clean-machine Windows 10/11 checks, performance measurements and accessibility
   verification remain pending. Command-line help is English only.
 

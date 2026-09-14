@@ -12,7 +12,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel},
+        mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -65,10 +65,15 @@ impl std::fmt::Debug for ResolvedRoot {
 pub struct ResolvedLaunch {
     pub fs: Arc<dyn ScanFs>,
     pub roots: Vec<ScanRoot>,
+    /// Exact normalized selection, including paths whose resolution failed.
+    /// Kept independently from observed roots so a full rescan retries them.
+    pub requested_paths: Vec<PathBuf>,
     pub cancel: CancelToken,
     /// Display strings for the status surfaces; never used as action paths.
     pub displays: Vec<String>,
     pub issues: Vec<String>,
+    /// Roots that could not be resolved. Successful roots still get scanned.
+    pub failures: Vec<ResolveFailure>,
 }
 
 impl std::fmt::Debug for ResolvedLaunch {
@@ -77,6 +82,7 @@ impl std::fmt::Debug for ResolvedLaunch {
             .debug_struct("ResolvedLaunch")
             .field("roots", &self.roots.len())
             .field("issues", &self.issues.len())
+            .field("failed_roots", &self.failures.len())
             .finish_non_exhaustive()
     }
 }
@@ -191,6 +197,7 @@ pub struct ResolverClient {
     stop: Arc<AtomicBool>,
     next_id: u64,
     outstanding: usize,
+    retirement: SyncSender<Box<dyn Send>>,
 }
 
 impl std::fmt::Debug for ResolverClient {
@@ -243,6 +250,17 @@ impl ResolverClient {
     pub fn request_stop(&self) {
         self.stop.store(true, Ordering::Release);
     }
+
+    /// Moves rejected providers and snapshot intents off the frame thread.
+    /// Backpressure returns ownership without dropping the resource.
+    pub fn retire(&self, resource: Box<dyn Send>) -> Result<(), Box<dyn Send>> {
+        match self.retirement.try_send(resource) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(resource) | TrySendError::Disconnected(resource)) => {
+                Err(resource)
+            }
+        }
+    }
 }
 
 /// Root-side handle owning the worker thread.
@@ -277,13 +295,21 @@ impl ResolverWorker {
 pub fn start(backend: impl ResolveBackend) -> std::io::Result<(ResolverClient, ResolverWorker)> {
     let (jobs, job_rx) = sync_channel::<QueuedJob>(JOB_QUEUE_CAPACITY);
     let (result_tx, results) = sync_channel::<ResolveResult>(RESULT_QUEUE_CAPACITY);
+    let (retirement, retired) = sync_channel::<Box<dyn Send>>(JOB_QUEUE_CAPACITY);
     let stop = Arc::new(AtomicBool::new(false));
     let worker_stop = Arc::clone(&stop);
     let handle = thread::Builder::new()
         .name("diskpie-resolver".to_owned())
-        .spawn(move || worker_loop(&backend, &job_rx, &result_tx, &worker_stop))?;
+        .spawn(move || worker_loop(&backend, &job_rx, &result_tx, &retired, &worker_stop))?;
     Ok((
-        ResolverClient { jobs, results, stop: Arc::clone(&stop), next_id: 1, outstanding: 0 },
+        ResolverClient {
+            jobs,
+            results,
+            stop: Arc::clone(&stop),
+            next_id: 1,
+            outstanding: 0,
+            retirement,
+        },
         ResolverWorker { stop, handle: Some(handle) },
     ))
 }
@@ -292,16 +318,36 @@ fn worker_loop(
     backend: &dyn ResolveBackend,
     jobs: &Receiver<QueuedJob>,
     results: &SyncSender<ResolveResult>,
+    retired: &Receiver<Box<dyn Send>>,
     stop: &AtomicBool,
 ) {
-    while let Ok(QueuedJob { id, job }) = jobs.recv() {
+    loop {
+        while let Ok(resource) = retired.try_recv() {
+            drop(resource);
+        }
+        let QueuedJob { id, job } = match jobs.recv_timeout(Duration::from_millis(20)) {
+            Ok(job) => job,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         let outcome = if stop.load(Ordering::Acquire) {
             ResolveOutcome::Abandoned
         } else {
             run_job(backend, job, stop)
         };
-        if results.send(ResolveResult { id, outcome }).is_err() {
-            return;
+        let mut result = ResolveResult { id, outcome };
+        loop {
+            match results.try_send(result) {
+                Ok(()) => break,
+                Err(TrySendError::Disconnected(_)) => return,
+                Err(TrySendError::Full(pending)) => {
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    result = pending;
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
         }
     }
 }
@@ -319,23 +365,40 @@ fn run_job(backend: &dyn ResolveBackend, job: ResolveJob, stop: &AtomicBool) -> 
             let mut roots = Vec::with_capacity(paths.len());
             let mut displays = Vec::with_capacity(paths.len());
             let mut issues = Vec::new();
+            let mut failures = Vec::new();
+            let mut requested_paths = Vec::with_capacity(paths.len());
             for path in &paths {
                 if stop.load(Ordering::Acquire) {
                     return ResolveOutcome::Abandoned;
                 }
                 let normalized = normalize_for_resolution(path);
+                requested_paths.push(normalized.clone());
                 match backend.resolve_root(&normalized) {
                     Ok(resolved) => {
                         displays.push(format_path_for_display(&resolved.root.path));
                         issues.extend(resolved.issues);
                         roots.push(resolved.root);
                     }
-                    Err(failure) => return ResolveOutcome::Failed(failure),
+                    Err(failure) => failures.push(failure),
                 }
+            }
+            if roots.is_empty() {
+                let class = failures.first().map_or(FailureClass::PathUnavailable, |f| f.class);
+                let detail =
+                    failures.iter().map(|f| f.detail.as_str()).collect::<Vec<_>>().join("\n");
+                return ResolveOutcome::Failed(ResolveFailure { class, detail });
             }
             let cancel = CancelToken::new();
             let fs = backend.filesystem(cancel.clone());
-            ResolveOutcome::Launch(ResolvedLaunch { fs, roots, cancel, displays, issues })
+            ResolveOutcome::Launch(ResolvedLaunch {
+                fs,
+                roots,
+                requested_paths,
+                cancel,
+                displays,
+                issues,
+                failures,
+            })
         }
     }
 }
@@ -618,6 +681,16 @@ mod tests {
             .unwrap();
         let result = wait_result(&mut client);
         assert_eq!(result.id, failed_id);
+        match result.outcome {
+            ResolveOutcome::Launch(launch) => {
+                assert_eq!(launch.roots.len(), 1);
+                assert_eq!(launch.failures.len(), 1);
+                assert_eq!(launch.failures[0].class, FailureClass::PathUnavailable);
+            }
+            other => panic!("expected the available root to survive: {other:?}"),
+        }
+        client.submit(ResolveJob::Paths(vec![PathBuf::from(r"C:\missing")])).unwrap();
+        let result = wait_result(&mut client);
         assert!(matches!(
             result.outcome,
             ResolveOutcome::Failed(ResolveFailure { class: FailureClass::PathUnavailable, .. })

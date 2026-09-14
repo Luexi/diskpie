@@ -1,0 +1,12 @@
+﻿[
+    {
+        "Variant":  "before",
+        "Path":  "C:\\Users\\Luis\\Desktop\\scan\\diskpie\\target\\bench-build-current\\release\\diskpie-bench.exe",
+        "SHA256":  "0FE04ABED2E94350EC73CD340E429616DAB8AC2169B64209A3F411EB229260A0"
+    },
+    {
+        "Variant":  "after",
+        "Path":  "C:\\Users\\Luis\\Desktop\\scan\\diskpie\\target\\review-ui-perf-after-20260907-v2\\build\\release\\diskpie-bench.exe",
+        "SHA256":  "38C71CA24381CB5E25DA740E14F7ACD8F2A144E3AA8F3DECFE335DF04DC2960B"
+    }
+]

@@ -1,0 +1,16 @@
+[package]
+name = "diskpie-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+diskpie-core = { path = "../../crates/diskpie-core" }
+diskpie-scan = { path = "../../crates/diskpie-scan" }
+diskpie-app = { path = "../../crates/diskpie-app" }
+
+[target.'cfg(windows)'.dependencies]
+diskpie-platform = { path = "../../crates/diskpie-platform" }
+windows = { version = "=0.62.2", default-features = false, features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }

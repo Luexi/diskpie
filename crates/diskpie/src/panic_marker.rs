@@ -1075,13 +1075,9 @@ impl ShutdownQuiescenceProof {
 
 /// Receipt for the scan, layout, and Shell runtime workers.
 ///
-/// The scan runtime, layout worker, and Shell service are not yet composed by
-/// the executable: today the shell spawns no thread, so the only owned worker
-/// is the diagnostics writer. This receipt is therefore a placeholder that
-/// proves nothing beyond "no runtime was composed". The UI wiring that starts
-/// those services MUST replace [`Self::no_runtime_composed`] with a
-/// constructor that consumes the joined receipts of every runtime worker;
-/// keeping the placeholder after that point would forge quiescence.
+/// Minted only from the composition root's complete shutdown evidence. Missing
+/// exit receipts, including failures partway through service startup, do not
+/// prove that no workers were composed and cannot produce this capability.
 #[cfg(windows)]
 #[derive(Debug)]
 pub(crate) struct RuntimeQuiescenceReceipt {
@@ -1109,17 +1105,12 @@ pub(crate) struct RuntimeShutdownEvidence {
     pub(crate) resolver_joined: bool,
     /// The diagnostic bridge thread was joined within its deadline.
     pub(crate) bridge_joined: bool,
+    pub(crate) item_list_joined: bool,
+    pub(crate) support_joined: bool,
 }
 
 #[cfg(windows)]
 impl RuntimeQuiescenceReceipt {
-    /// Evidence that no scan/layout/Shell runtime was ever started in this
-    /// process. Valid only when startup failed before the composition root
-    /// created any of them.
-    pub(crate) const fn no_runtime_composed() -> Self {
-        Self { _private: () }
-    }
-
     /// Mints the receipt only when every UI-owned worker family provably
     /// stopped. Any timed-out join, handed-off worker, or retiring scan
     /// session yields `None`, and the caller then preserves the marker.
@@ -1129,6 +1120,8 @@ impl RuntimeQuiescenceReceipt {
             && evidence.shell_stopped
             && evidence.resolver_joined
             && evidence.bridge_joined
+            && evidence.item_list_joined
+            && evidence.support_joined
         {
             Some(Self { _private: () })
         } else {

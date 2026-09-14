@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 use crate::{
+    branch_rescan::{BranchMergeError, BranchRescanIntent, merge_branch_snapshot_cancellable},
     layout_service::{LayoutRequestId, LayoutService, LayoutSubmitError, LayoutTaskError},
     navigation::{
         CommandOutcome, HiddenBranchesPlan, NavigationChange, NavigationCommand, NavigationError,
@@ -25,7 +26,7 @@ use crate::{
     },
 };
 use diskpie_core::{
-    GenerationId, TreeSnapshot,
+    EntryKind, GenerationId, NodeId, TreeSnapshot,
     sunburst::{LayoutOptions, SizeBasis, SunburstLayout},
 };
 use diskpie_scan::{
@@ -169,6 +170,62 @@ impl ScanLaunchRejected {
     }
 }
 
+/// Rejected branch launch retaining the exact intent and all caller resources.
+pub struct BranchScanLaunchRejected {
+    error: RuntimeError,
+    inputs: Box<BranchLaunchInputs>,
+}
+
+struct BranchLaunchInputs {
+    intent: BranchRescanIntent,
+    fs: Arc<dyn ScanFs>,
+    root: ScanRoot,
+    cancel: CancelToken,
+}
+
+impl BranchScanLaunchRejected {
+    fn new(
+        error: RuntimeError,
+        intent: BranchRescanIntent,
+        fs: Arc<dyn ScanFs>,
+        root: ScanRoot,
+        cancel: CancelToken,
+    ) -> Self {
+        Self { error, inputs: Box::new(BranchLaunchInputs { intent, fs, root, cancel }) }
+    }
+
+    #[must_use]
+    pub const fn error(&self) -> &RuntimeError {
+        &self.error
+    }
+
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (RuntimeError, BranchRescanIntent, Arc<dyn ScanFs>, ScanRoot, CancelToken) {
+        let BranchLaunchInputs { intent, fs, root, cancel } = *self.inputs;
+        (self.error, intent, fs, root, cancel)
+    }
+}
+
+impl fmt::Debug for BranchScanLaunchRejected {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BranchScanLaunchRejected")
+            .field("error", &self.error)
+            .field("intent", &self.inputs.intent)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for BranchScanLaunchRejected {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl Error for BranchScanLaunchRejected {}
+
 /// Plain-data summary of one nonblocking runtime poll.
 #[derive(Clone, Debug)]
 pub struct TickReport {
@@ -229,6 +286,9 @@ pub enum RuntimeError {
     RetirementWorkerStopped,
     NoNavigation,
     FrameTransitionPending,
+    ScanNotSettled,
+    StaleBranchIntent,
+    BranchMerge(BranchMergeError),
     InvalidConfig { field: &'static str },
     InvalidRoot { index: usize },
     ClockWentBackwards { previous: Duration, current: Duration },
@@ -259,6 +319,13 @@ impl fmt::Display for RuntimeError {
             Self::FrameTransitionPending => {
                 formatter.write_str("a newer generation is waiting for an atomic frame commit")
             }
+            Self::ScanNotSettled => {
+                formatter.write_str("branch rescan requires a settled revision")
+            }
+            Self::StaleBranchIntent => {
+                formatter.write_str("branch intent no longer matches the committed revision")
+            }
+            Self::BranchMerge(error) => write!(formatter, "branch replacement failed: {error}"),
             Self::InvalidConfig { field } => {
                 write!(formatter, "invalid runtime config field {field}")
             }
@@ -294,6 +361,7 @@ impl Error for RuntimeError {
             Self::Presentation(error) => Some(error),
             Self::LayoutSubmit(error) => Some(error),
             Self::LayoutTask(error) => Some(error),
+            Self::BranchMerge(error) => Some(error),
             Self::GenerationExhausted
             | Self::ShuttingDown
             | Self::SupervisorStopped
@@ -301,6 +369,8 @@ impl Error for RuntimeError {
             | Self::RetirementWorkerStopped
             | Self::NoNavigation
             | Self::FrameTransitionPending
+            | Self::ScanNotSettled
+            | Self::StaleBranchIntent
             | Self::InvalidConfig { .. }
             | Self::InvalidRoot { .. }
             | Self::ClockWentBackwards { .. }
@@ -374,6 +444,8 @@ struct PendingLaunch {
     fs: Arc<dyn ScanFs>,
     roots: Vec<ScanRoot>,
     cancel: CancelToken,
+    branch: Option<BranchRescanIntent>,
+    initial_omissions: u64,
 }
 
 struct PendingLaunchRejected {
@@ -441,6 +513,57 @@ struct SupervisorSharedState {
     control_epoch: u64,
     #[cfg(test)]
     supervisor_waiting: bool,
+    #[cfg(test)]
+    branch_publication_hook: Option<Arc<dyn Fn(BranchPublicationStage) + Send + Sync>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BranchPublicationStage {
+    Merge,
+    Presentation,
+    Publish,
+}
+
+#[cfg(test)]
+fn branch_publication_checkpoint(shared: &SupervisorShared, stage: BranchPublicationStage) {
+    let hook = lock_supervisor(shared).branch_publication_hook.clone();
+    if let Some(hook) = hook {
+        hook(stage);
+    }
+}
+
+impl SupervisorSharedState {
+    fn has_output(&self) -> bool {
+        self.output.publication.is_some()
+            || self.output.error.is_some()
+            || self.output.drain.is_some()
+            || self.output.scan_started.is_some()
+            || self.output.scan_finished.is_some()
+            || self.inbox.navigation.is_some()
+            || self.inbox.remap.is_some()
+    }
+
+    /// Inspect this only while holding the shared-state lock. Launch ownership
+    /// moves from the inbox to `reserved` under that same lock, so combining
+    /// separately sampled status/inbox/output can incorrectly observe a gap.
+    fn branch_scan_readiness(&self) -> Result<(), RuntimeError> {
+        if self.status.stopped {
+            return Err(RuntimeError::SupervisorStopped);
+        }
+        if self.inbox.shutdown {
+            return Err(RuntimeError::ShuttingDown);
+        }
+        if self.status.active.is_some()
+            || self.status.reserved.is_some()
+            || self.status.pending.is_some()
+            || self.inbox.launch.is_some()
+            || self.has_output()
+        {
+            return Err(RuntimeError::ScanNotSettled);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -736,14 +859,7 @@ impl SupervisorHandle {
     }
 
     fn has_output(&self) -> bool {
-        let shared = lock_supervisor(&self.shared);
-        shared.output.publication.is_some()
-            || shared.output.error.is_some()
-            || shared.output.drain.is_some()
-            || shared.output.scan_started.is_some()
-            || shared.output.scan_finished.is_some()
-            || shared.inbox.navigation.is_some()
-            || shared.inbox.remap.is_some()
+        lock_supervisor(&self.shared).has_output()
     }
 
     #[cfg(test)]
@@ -758,6 +874,8 @@ impl SupervisorHandle {
 
 struct WorkerScan {
     generation: ScanGeneration,
+    /// Remains live after joining the coordinator and throughout publication preparation.
+    cancel: CancelToken,
     session: Option<ScanSession>,
     reducer: Option<SessionReducer>,
     terminal_summary: Option<ScanSummary>,
@@ -767,6 +885,8 @@ struct WorkerScan {
     reduction_error: Option<SessionError>,
     discard_events: bool,
     terminal_event_seen: bool,
+    branch: Option<BranchRescanIntent>,
+    branch_publication: Option<SnapshotPublication>,
     #[cfg(test)]
     retirement_probe: Option<WorkerScanRetirementProbe>,
 }
@@ -786,6 +906,7 @@ impl WorkerScan {
         let generation = session.generation();
         Self {
             generation,
+            cancel: session.cancel_token(),
             session: Some(session),
             reducer: Some(SessionReducer::new(generation)),
             terminal_summary: None,
@@ -795,15 +916,15 @@ impl WorkerScan {
             reduction_error: None,
             discard_events: false,
             terminal_event_seen: false,
+            branch: None,
+            branch_publication: None,
             #[cfg(test)]
             retirement_probe: None,
         }
     }
 
     fn cancel(&mut self, superseded: bool) {
-        if let Some(session) = &self.session {
-            session.cancel();
-        }
+        self.cancel.cancel();
         self.cancel_requested = true;
         self.superseded |= superseded;
     }
@@ -1165,7 +1286,13 @@ impl SupervisorCore {
         match start_scan_with_cancel(launch.fs, request, launch.cancel) {
             Ok(session) => {
                 self.store_started(generation);
-                Some(WorkerScan::new(session))
+                let mut scan = WorkerScan::new(session);
+                scan.branch = launch.branch;
+                scan.reducer = Some(
+                    SessionReducer::new(generation)
+                        .with_initial_omissions(launch.initial_omissions),
+                );
+                Some(scan)
             }
             Err(error) => {
                 self.store_error(RuntimeError::Scan(error.clone()));
@@ -1320,15 +1447,65 @@ impl SupervisorCore {
 
     fn finish_scan(&mut self, scan: WorkerScan) {
         let generation = scan.generation;
-        let finalized = finalize_scan(scan, self.now, self.navigation.as_ref());
-        if let Some(publication) = finalized.publication {
-            self.store_publication(publication);
+        let is_branch = scan.branch.is_some();
+        let cancel = scan.cancel.clone();
+        let mut finalized = finalize_scan(scan, self.now, self.navigation.as_ref(), &self.shared);
+        #[cfg(test)]
+        if is_branch {
+            branch_publication_checkpoint(&self.shared, BranchPublicationStage::Publish);
         }
-        if let Some(error) = finalized.error {
-            self.store_error(error);
+        let Some(mut retired) = self.reserve_supervisor_retirement() else {
+            return;
+        };
+        let shared_owner = Arc::clone(&self.shared);
+        let discarded = {
+            // This is the branch publication linearization point. Cancellation
+            // takes the same lock. Clear the live generation here so a later
+            // cancel cannot claim it was accepted for an already published scan.
+            // All tree construction and disposal remains outside the guard.
+            let mut shared = lock_supervisor(&shared_owner);
+            let cancelled = cancel.is_cancelled()
+                || shared.inbox.shutdown
+                || shared.inbox.cancel_generation == Some(generation)
+                || shared.status.active.as_ref().is_some_and(|active| {
+                    active.generation == generation && active.cancel_requested
+                });
+            let discarded = if is_branch && cancelled {
+                if !matches!(finalized.summary.phase, SessionPhase::Failed(_)) {
+                    finalized.summary.phase = SessionPhase::Cancelled;
+                }
+                finalized.publication.take()
+            } else if let Some(publication) = finalized.publication.take() {
+                if shared
+                    .output
+                    .publication
+                    .as_ref()
+                    .is_some_and(|current| current.revision >= publication.revision)
+                {
+                    Some(publication)
+                } else {
+                    shared.output.publication.replace(publication)
+                }
+            } else {
+                None
+            };
+            if let Some(error) = finalized.error {
+                shared.output.error = Some(error);
+            }
+            self.store_settled(finalized.summary);
+            shared.status.settled = self.settled.clone();
+            if shared.status.active.as_ref().map(|active| active.generation) == Some(generation) {
+                shared.status.active = None;
+            }
+            if shared.inbox.cancel_generation == Some(generation) {
+                shared.inbox.cancel_generation = None;
+            }
+            shared.output.scan_finished = Some(generation);
+            discarded
+        };
+        if let Some(publication) = discarded {
+            retired.push(publication);
         }
-        self.store_settled(finalized.summary);
-        lock_supervisor(&self.shared).output.scan_finished = Some(generation);
     }
 
     fn store_started(&self, generation: ScanGeneration) {
@@ -1506,6 +1683,11 @@ fn drive_scan(
         && scan.observed_cancelled.is_none()
         && publication_generation_is_current(scan.generation, navigation)
         && (allow_progress || terminal)
+        && (scan.branch.is_none()
+            || (terminal
+                && !scan.cancel_requested
+                && !scan.superseded
+                && matches!(scan.phase(), SessionPhase::Complete | SessionPhase::Partial)))
         && (!scan.superseded || terminal)
     {
         let reducer = scan.reducer.as_mut().expect("nonterminal scan owns a reducer");
@@ -1522,13 +1704,18 @@ fn drive_scan(
                                 now,
                             );
                         }
-                        match prepare_publication_with_navigation(
-                            snapshot_publication,
-                            terminal,
-                            navigation,
-                        ) {
-                            Ok(prepared) => publication = Some(prepared),
-                            Err(preparation_error) => error = Some(preparation_error),
+                        if scan.branch.is_some() {
+                            // Commit only after the coordinator's successful join.
+                            scan.branch_publication = Some(snapshot_publication);
+                        } else {
+                            match prepare_publication_with_navigation(
+                                snapshot_publication,
+                                terminal,
+                                navigation,
+                            ) {
+                                Ok(prepared) => publication = Some(prepared),
+                                Err(preparation_error) => error = Some(preparation_error),
+                            }
                         }
                     }
                     Err(reduction_error) => {
@@ -1634,6 +1821,14 @@ fn freeze_observed_cancelled(
     {
         return FreezeResult::default();
     }
+    if scan.branch.is_some() {
+        scan.observed_cancelled = Some(ScanSummary {
+            generation: scan.generation,
+            phase: SessionPhase::Cancelled,
+            progress: scan.progress(),
+        });
+        return FreezeResult::default();
+    }
     if let Some(session) = &scan.session {
         session.cancel();
         if scan.reduction_error.is_none() && !scan.discard_events {
@@ -1728,15 +1923,55 @@ fn finalize_scan(
     mut scan: WorkerScan,
     now: Duration,
     navigation: Option<&NavigationSeed>,
+    shared: &SupervisorShared,
 ) -> FinalizedScan {
     debug_assert!(scan.is_finished());
     let session = scan.session.take().expect("a live scan owns a session");
     let joined = session.join();
     let mut error = scan.reduction_error.clone().map(RuntimeError::Session);
 
-    if let Some(summary) = scan.terminal_summary.take() {
+    if let Some(mut summary) = scan.terminal_summary.take() {
+        if scan.branch.is_some()
+            && (scan.cancel_requested || scan.superseded || scan.cancel.is_cancelled())
+            && !matches!(summary.phase, SessionPhase::Failed(_))
+        {
+            summary.phase = SessionPhase::Cancelled;
+        }
         return match joined {
-            Ok(_) => FinalizedScan { summary, publication: None, error },
+            Ok(_) => {
+                let publication =
+                    if !scan.cancel_requested && !scan.superseded && !scan.cancel.is_cancelled() {
+                        match (scan.branch.as_ref(), scan.branch_publication.take()) {
+                            (Some(branch), Some(publication)) => {
+                                match prepare_branch_publication(
+                                    branch,
+                                    publication,
+                                    navigation,
+                                    &scan.cancel,
+                                    shared,
+                                ) {
+                                    Ok(publication) => Some(publication),
+                                    Err(RuntimeError::BranchMerge(BranchMergeError::Cancelled)) => {
+                                        summary.phase = SessionPhase::Cancelled;
+                                        None
+                                    }
+                                    Err(failure) => {
+                                        summary.phase =
+                                            SessionPhase::Failed(ScanFailure::ProtocolViolation {
+                                                detail: "branch snapshot merge failed".into(),
+                                            });
+                                        error = Some(failure);
+                                        None
+                                    }
+                                }
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                FinalizedScan { summary, publication, error }
+            }
             Err(scan_error) => FinalizedScan {
                 summary: ScanSummary {
                     generation: scan.generation,
@@ -1777,8 +2012,39 @@ fn finalize_scan(
     {
         match reducer.maybe_publish_snapshot(now, SnapshotPolicy::IMMEDIATE) {
             Ok(Some(publication)) => {
-                match prepare_publication_with_navigation(publication, true, navigation) {
+                let prepared = match scan.branch.as_ref() {
+                    Some(branch)
+                        if !scan.cancel_requested
+                            && !scan.superseded
+                            && matches!(
+                                reducer.phase(),
+                                SessionPhase::Complete | SessionPhase::Partial
+                            ) =>
+                    {
+                        prepare_branch_publication(
+                            branch,
+                            publication,
+                            navigation,
+                            &scan.cancel,
+                            shared,
+                        )
+                    }
+                    Some(_) => {
+                        return FinalizedScan {
+                            summary: ScanSummary {
+                                generation: scan.generation,
+                                phase: reducer.phase().clone(),
+                                progress: reducer.progress(),
+                            },
+                            publication: None,
+                            error,
+                        };
+                    }
+                    None => prepare_publication_with_navigation(publication, true, navigation),
+                };
+                match prepared {
                     Ok(prepared) => Some(prepared),
+                    Err(RuntimeError::BranchMerge(BranchMergeError::Cancelled)) => None,
                     Err(preparation_error) => {
                         error = Some(preparation_error);
                         None
@@ -1794,10 +2060,49 @@ fn finalize_scan(
     } else {
         None
     };
-    let phase =
-        if scan.cancel_requested { SessionPhase::Cancelled } else { reducer.phase().clone() };
+    let phase = if (scan.cancel_requested || scan.cancel.is_cancelled())
+        && !matches!(reducer.phase(), SessionPhase::Failed(_))
+    {
+        SessionPhase::Cancelled
+    } else if scan.branch.is_some()
+        && error.is_some()
+        && matches!(reducer.phase(), SessionPhase::Complete | SessionPhase::Partial)
+    {
+        SessionPhase::Failed(ScanFailure::ProtocolViolation {
+            detail: "branch snapshot merge failed".into(),
+        })
+    } else {
+        reducer.phase().clone()
+    };
     let summary = ScanSummary { generation: scan.generation, phase, progress: reducer.progress() };
     FinalizedScan { summary, publication, error }
+}
+
+fn prepare_branch_publication(
+    branch: &BranchRescanIntent,
+    publication: SnapshotPublication,
+    navigation: Option<&NavigationSeed>,
+    cancel: &CancelToken,
+    _shared: &SupervisorShared,
+) -> Result<PreparedPublication, RuntimeError> {
+    #[cfg(test)]
+    branch_publication_checkpoint(_shared, BranchPublicationStage::Merge);
+    let snapshot = merge_branch_snapshot_cancellable(
+        &branch.snapshot,
+        branch.target,
+        &publication.snapshot,
+        || cancel.is_cancelled(),
+    )
+    .map_err(RuntimeError::BranchMerge)?;
+    #[cfg(test)]
+    branch_publication_checkpoint(_shared, BranchPublicationStage::Presentation);
+    prepare_publication_with_navigation_cancellable(
+        SnapshotPublication { snapshot: Arc::new(snapshot), ..publication },
+        true,
+        navigation,
+        || cancel.is_cancelled(),
+    )
+    .and_then(|prepared| prepared.ok_or(RuntimeError::BranchMerge(BranchMergeError::Cancelled)))
 }
 
 #[cfg(test)]
@@ -1813,7 +2118,22 @@ fn prepare_publication_with_navigation(
     terminal: bool,
     seed: Option<&NavigationSeed>,
 ) -> Result<PreparedPublication, RuntimeError> {
-    let presentation = Arc::new(SnapshotPresentation::new(&publication.snapshot)?);
+    Ok(prepare_publication_with_navigation_cancellable(publication, terminal, seed, || false)?
+        .expect("an uncancelled publication produces a frame"))
+}
+
+fn prepare_publication_with_navigation_cancellable(
+    publication: SnapshotPublication,
+    terminal: bool,
+    seed: Option<&NavigationSeed>,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<Option<PreparedPublication>, RuntimeError> {
+    let Some(presentation) =
+        SnapshotPresentation::new_cancellable(&publication.snapshot, &mut cancelled)?
+    else {
+        return Ok(None);
+    };
+    let presentation = Arc::new(presentation);
     let (navigation, navigation_epoch) = match seed {
         Some(seed) if seed.navigation.generation() <= publication.snapshot.generation() => {
             let mut navigation = seed.navigation.as_ref().clone();
@@ -1822,8 +2142,11 @@ fn prepare_publication_with_navigation(
         }
         Some(_) | None => (Arc::new(NavigationState::new(Arc::clone(&publication.snapshot))?), 0),
     };
+    if cancelled() {
+        return Ok(None);
+    }
     let hidden = navigation.hidden_branches_plan();
-    Ok(PreparedPublication {
+    Ok(Some(PreparedPublication {
         revision: DisplayedRevision {
             generation: publication.snapshot.generation(),
             revision: publication.revision,
@@ -1834,7 +2157,7 @@ fn prepare_publication_with_navigation(
         hidden,
         navigation_epoch,
         presentation,
-    })
+    }))
 }
 
 fn lock_supervisor(shared: &SupervisorShared) -> MutexGuard<'_, SupervisorSharedState> {
@@ -2264,6 +2587,18 @@ impl RuntimeController {
         roots: Vec<ScanRoot>,
         cancel: CancelToken,
     ) -> Result<LaunchReceipt, ScanLaunchRejected> {
+        self.request_scan_with_omissions(fs, roots, cancel, 0)
+    }
+
+    /// Launches valid roots while retaining a count of roots the resolver omitted.
+    /// Omitted-root details belong to the resolver; scan protocol counters remain exact.
+    pub fn request_scan_with_omissions(
+        &mut self,
+        fs: Arc<dyn ScanFs>,
+        roots: Vec<ScanRoot>,
+        cancel: CancelToken,
+        initial_omissions: u64,
+    ) -> Result<LaunchReceipt, ScanLaunchRejected> {
         if self.shutting_down {
             return Err(ScanLaunchRejected {
                 error: RuntimeError::ShuttingDown,
@@ -2284,21 +2619,120 @@ impl RuntimeController {
             });
         };
         let generation = ScanGeneration::new(sequence);
-        let disposition =
-            match self.supervisor.enqueue_launch(PendingLaunch { generation, fs, roots, cancel }) {
-                Ok(disposition) => disposition,
-                Err(PendingLaunchRejected { error, launch }) => {
-                    let launch = *launch;
-                    return Err(ScanLaunchRejected {
-                        error,
-                        fs: launch.fs,
-                        roots: launch.roots,
-                        cancel: launch.cancel,
-                    });
-                }
-            };
+        let disposition = match self.supervisor.enqueue_launch(PendingLaunch {
+            generation,
+            fs,
+            roots,
+            cancel,
+            branch: None,
+            initial_omissions,
+        }) {
+            Ok(disposition) => disposition,
+            Err(PendingLaunchRejected { error, launch }) => {
+                let launch = *launch;
+                return Err(ScanLaunchRejected {
+                    error,
+                    fs: launch.fs,
+                    roots: launch.roots,
+                    cancel: launch.cancel,
+                });
+            }
+        };
         self.last_generation = sequence;
         Ok(LaunchReceipt { generation, disposition })
+    }
+
+    /// Captures a branch target only after a terminal revision has committed.
+    pub fn branch_rescan_intent(&self, target: NodeId) -> Result<BranchRescanIntent, RuntimeError> {
+        self.ensure_branch_settled()?;
+        let frame = self.committed.as_ref().ok_or(RuntimeError::NoNavigation)?;
+        if !frame
+            .data
+            .snapshot
+            .node(target)
+            .is_some_and(|record| matches!(record.kind(), EntryKind::Root | EntryKind::Directory))
+        {
+            return Err(RuntimeError::BranchMerge(BranchMergeError::InvalidTarget));
+        }
+        Ok(BranchRescanIntent {
+            snapshot: Arc::clone(&frame.data.snapshot),
+            revision: frame.data.revision.revision,
+            target,
+        })
+    }
+
+    /// Launches one native branch, retaining the displayed tree until a complete
+    /// or recoverably partial replacement and its layout can commit together.
+    pub fn request_branch_scan(
+        &mut self,
+        intent: BranchRescanIntent,
+        fs: Arc<dyn ScanFs>,
+        root: ScanRoot,
+        cancel: CancelToken,
+    ) -> Result<LaunchReceipt, BranchScanLaunchRejected> {
+        let validation = self.ensure_branch_settled().and_then(|()| {
+            let frame = self.committed.as_ref().ok_or(RuntimeError::NoNavigation)?;
+            if !Arc::ptr_eq(&intent.snapshot, &frame.data.snapshot)
+                || intent.revision != frame.data.revision.revision
+            {
+                return Err(RuntimeError::StaleBranchIntent);
+            }
+            if intent.native_path().ok().as_ref() != Some(&root.path) {
+                return Err(RuntimeError::StaleBranchIntent);
+            }
+            validate_roots(std::slice::from_ref(&root))
+        });
+        if let Err(error) = validation {
+            return Err(BranchScanLaunchRejected::new(error, intent, fs, root, cancel));
+        }
+        let Some(sequence) = self.last_generation.checked_add(1) else {
+            return Err(BranchScanLaunchRejected::new(
+                RuntimeError::GenerationExhausted,
+                intent,
+                fs,
+                root,
+                cancel,
+            ));
+        };
+        let generation = ScanGeneration::new(sequence);
+        match self.supervisor.enqueue_launch(PendingLaunch {
+            generation,
+            fs,
+            roots: vec![root],
+            cancel,
+            branch: Some(intent),
+            initial_omissions: 0,
+        }) {
+            Ok(disposition) => {
+                self.last_generation = sequence;
+                Ok(LaunchReceipt { generation, disposition })
+            }
+            Err(PendingLaunchRejected { error, launch }) => {
+                let PendingLaunch { fs, mut roots, cancel, branch, .. } = *launch;
+                Err(BranchScanLaunchRejected::new(
+                    error,
+                    branch.expect("branch launch"),
+                    fs,
+                    roots.pop().expect("one branch root"),
+                    cancel,
+                ))
+            }
+        }
+    }
+
+    fn ensure_branch_settled(&self) -> Result<(), RuntimeError> {
+        if self.shutting_down {
+            return Err(RuntimeError::ShuttingDown);
+        }
+        let shared = lock_supervisor(&self.supervisor.shared);
+        shared.branch_scan_readiness()?;
+        if self.staged.is_some()
+            || self.queued.is_some()
+            || !self.committed.as_ref().is_some_and(|frame| frame.data.revision.terminal)
+        {
+            return Err(RuntimeError::ScanNotSettled);
+        }
+        Ok(())
     }
 
     /// Requests cancellation without waiting for a filesystem provider.
@@ -2663,6 +3097,10 @@ impl RuntimeController {
         report: &mut TickReport,
         retired: &mut ReservedReapBatch,
     ) -> Result<(), RuntimeError> {
+        if publication.revision.generation < GenerationId::new(self.last_generation) {
+            retired.push(publication);
+            return Ok(());
+        }
         if let Some(committed) = &self.committed {
             if publication.revision.generation < committed.data.revision.generation {
                 retired.push(publication);
@@ -2820,6 +3258,15 @@ impl RuntimeController {
             retired.push(completion);
             report.discarded_layout_completion = true;
             report.layout_submitted = Some(self.submit_frame(queued, retired)?);
+            return Ok(());
+        }
+        if staged.snapshot_changed
+            && staged.data.revision.generation < GenerationId::new(self.last_generation)
+        {
+            retired.push(staged);
+            retired.push(completion);
+            self.restore_committed_navigation(retired);
+            report.discarded_layout_completion = true;
             return Ok(());
         }
         let layout = match completion.result {
@@ -3335,6 +3782,263 @@ mod tests {
             .unwrap_or_else(|| panic!("node {name:?} was not found"))
     }
 
+    fn branch_fixture() -> (Arc<FakeFs>, RuntimeController, Duration, NodeId) {
+        let fake = Arc::new(FakeFs::default());
+        fake.set("root", items(vec![directory("branch"), file("outside", 9)]));
+        fake.set(PathBuf::from("root").join("branch"), items(vec![file("before", 3)]));
+        let mut runtime = RuntimeController::new(config(32, 2)).unwrap();
+        runtime
+            .request_scan(
+                Arc::clone(&fake) as Arc<dyn ScanFs>,
+                vec![root("root", 1)],
+                CancelToken::new(),
+            )
+            .unwrap();
+        let mut clock = Duration::ZERO;
+        pump_until(&mut runtime, &mut clock, |runtime| runtime.ensure_branch_settled().is_ok());
+        let branch = node_named(runtime.snapshot().unwrap(), "branch");
+        (fake, runtime, clock, branch)
+    }
+
+    #[test]
+    fn accepted_cancel_during_branch_preparation_never_publishes_replacement() {
+        for stage in [
+            BranchPublicationStage::Merge,
+            BranchPublicationStage::Presentation,
+            BranchPublicationStage::Publish,
+        ] {
+            let (fake, mut runtime, mut clock, branch) = branch_fixture();
+            let baseline = runtime.snapshot_handle().unwrap();
+            let intent = runtime.branch_rescan_intent(branch).unwrap();
+            let path = intent.native_path().unwrap();
+            fake.set(&path, items(vec![file("after", 25)]));
+            let gate = Arc::new(Gate::default());
+            let _release = ReleaseGates(vec![Arc::clone(&gate)]);
+            let worker_gate = Arc::clone(&gate);
+            lock_supervisor(&runtime.supervisor.shared).branch_publication_hook =
+                Some(Arc::new(move |at| {
+                    if at == stage {
+                        worker_gate.enter_and_wait();
+                    }
+                }));
+            let token = CancelToken::new();
+            runtime.request_branch_scan(intent, fake, root(path, 1), token.clone()).unwrap();
+            pump_until(&mut runtime, &mut clock, |_| gate.state.lock().unwrap().entered);
+            assert!(runtime.cancel_active(), "cancel must be admitted before {stage:?}");
+            assert!(token.is_cancelled());
+            gate.release();
+            pump_until(&mut runtime, &mut clock, |runtime| runtime.ensure_branch_settled().is_ok());
+            assert!(
+                Arc::ptr_eq(&baseline, &runtime.snapshot_handle().unwrap()),
+                "cancelled at {stage:?}"
+            );
+            assert_eq!(runtime.phase(), Some(SessionPhase::Cancelled));
+            assert!(runtime.last_error().is_none());
+            assert!(!runtime.cancel_active(), "a finished generation cannot accept cancellation");
+        }
+    }
+
+    #[test]
+    fn branch_scan_preserves_baseline_until_atomic_replacement_and_rejects_stale_intents() {
+        let (fake, mut runtime, mut clock, branch) = branch_fixture();
+        let intent = runtime.branch_rescan_intent(branch).unwrap();
+        let stale = intent.clone();
+        let baseline = runtime.snapshot_handle().unwrap();
+        let path = intent.native_path().unwrap();
+        let gate = Arc::new(Gate::default());
+        let _release = ReleaseGates(vec![Arc::clone(&gate)]);
+        fake.set(
+            &path,
+            FakePlan::Gated { gate: Arc::clone(&gate), items: vec![file("after", 25)] },
+        );
+        runtime
+            .request_branch_scan(
+                intent,
+                Arc::clone(&fake) as Arc<dyn ScanFs>,
+                root(&path, 1),
+                CancelToken::new(),
+            )
+            .unwrap();
+        gate.wait_until_entered();
+        for _ in 0..8 {
+            tick(&mut runtime, &mut clock).unwrap();
+        }
+        assert!(Arc::ptr_eq(&runtime.snapshot_handle().unwrap(), &baseline));
+        runtime
+            .execute_navigation(
+                runtime.navigation_command(NavigationAction::Activate(branch)).unwrap(),
+            )
+            .unwrap();
+        gate.release();
+        pump_until(&mut runtime, &mut clock, |runtime| {
+            runtime.snapshot().is_some_and(|snapshot| snapshot.generation() == GenerationId::new(2))
+                && runtime.ensure_branch_settled().is_ok()
+        });
+        assert_eq!(
+            runtime.navigation().unwrap().view_root(),
+            node_named(runtime.snapshot().unwrap(), "branch")
+        );
+        assert!(runtime.snapshot().unwrap().nodes().iter().any(|record| record.name() == "after"));
+        assert!(
+            runtime.snapshot().unwrap().nodes().iter().any(|record| record.name() == "outside")
+        );
+        assert!(
+            !runtime.snapshot().unwrap().nodes().iter().any(|record| record.name() == "before")
+        );
+        let token = CancelToken::new();
+        let rejection = runtime
+            .request_branch_scan(
+                stale,
+                Arc::clone(&fake) as Arc<dyn ScanFs>,
+                root(&path, 1),
+                token.clone(),
+            )
+            .unwrap_err();
+        assert_eq!(rejection.error(), &RuntimeError::StaleBranchIntent);
+        let (_, intent, returned_fs, returned_root, returned_cancel) = rejection.into_parts();
+        assert!(Arc::ptr_eq(intent.snapshot(), &baseline));
+        assert_eq!(returned_root.path, path);
+        assert!(Arc::ptr_eq(&returned_fs, &(fake as Arc<dyn ScanFs>)));
+        assert!(!returned_cancel.is_cancelled());
+        assert!(!token.is_cancelled());
+        assert_eq!(runtime.last_generation, 2);
+    }
+
+    #[test]
+    fn cancelled_branch_keeps_baseline_and_a_later_generation_wins() {
+        let (fake, mut runtime, mut clock, branch) = branch_fixture();
+        let baseline = runtime.snapshot_handle().unwrap();
+        let intent = runtime.branch_rescan_intent(branch).unwrap();
+        let path = intent.native_path().unwrap();
+        let gate = Arc::new(Gate::default());
+        let _release = ReleaseGates(vec![Arc::clone(&gate)]);
+        fake.set(&path, FakePlan::Gated { gate: Arc::clone(&gate), items: vec![file("late", 99)] });
+        runtime
+            .request_branch_scan(
+                intent,
+                Arc::clone(&fake) as Arc<dyn ScanFs>,
+                root(path, 1),
+                CancelToken::new(),
+            )
+            .unwrap();
+        gate.wait_until_entered();
+        assert!(runtime.cancel_active());
+        pump_until(&mut runtime, &mut clock, |runtime| runtime.retiring_scans() > 0);
+        assert!(Arc::ptr_eq(&runtime.snapshot_handle().unwrap(), &baseline));
+        fake.set("other", items(vec![file("winner", 10)]));
+        runtime.request_scan(fake, vec![root("other", 2)], CancelToken::new()).unwrap();
+        gate.release();
+        pump_until(&mut runtime, &mut clock, |runtime| {
+            runtime.snapshot().is_some_and(|snapshot| snapshot.generation() == GenerationId::new(3))
+                && runtime.ensure_branch_settled().is_ok()
+        });
+        assert!(runtime.snapshot().unwrap().nodes().iter().any(|record| record.name() == "winner"));
+        assert!(!runtime.snapshot().unwrap().nodes().iter().any(|record| record.name() == "late"));
+    }
+
+    #[test]
+    fn branch_fatal_failure_keeps_baseline_and_recoverable_failure_commits_partial() {
+        let (fake, mut runtime, mut clock, branch) = branch_fixture();
+        let baseline = runtime.snapshot_handle().unwrap();
+        let intent = runtime.branch_rescan_intent(branch).unwrap();
+        let path = intent.native_path().unwrap();
+        fake.set(
+            &path,
+            FakePlan::Error(FsError::new(
+                &path,
+                FsOperation::EnumerateDirectory,
+                FsErrorKind::ProviderFailure,
+            )),
+        );
+        let receipt = runtime
+            .request_branch_scan(
+                intent,
+                Arc::clone(&fake) as Arc<dyn ScanFs>,
+                root(&path, 1),
+                CancelToken::new(),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !runtime
+            .settled_summary()
+            .is_some_and(|summary| summary.generation == receipt.generation)
+            || runtime.ensure_branch_settled().is_err()
+        {
+            let _ = tick(&mut runtime, &mut clock);
+            assert!(Instant::now() < deadline, "branch failure did not settle: {runtime:?}");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(matches!(runtime.phase(), Some(SessionPhase::Failed(_))));
+        assert!(Arc::ptr_eq(&runtime.snapshot_handle().unwrap(), &baseline));
+        let intent = runtime.branch_rescan_intent(branch).unwrap();
+        fake.set(
+            &path,
+            FakePlan::Error(FsError::new(
+                &path,
+                FsOperation::EnumerateDirectory,
+                FsErrorKind::AccessDenied,
+            )),
+        );
+        runtime.request_branch_scan(intent, fake, root(path, 1), CancelToken::new()).unwrap();
+        pump_until(&mut runtime, &mut clock, |runtime| {
+            runtime.snapshot().is_some_and(|snapshot| snapshot.generation() == GenerationId::new(3))
+                && runtime.ensure_branch_settled().is_ok()
+        });
+        assert_eq!(runtime.snapshot().unwrap().state(), ScanState::Partial);
+        assert!(
+            runtime.snapshot().unwrap().nodes().iter().any(|record| record.name() == "outside")
+        );
+    }
+
+    #[test]
+    fn branch_readiness_observes_inbox_to_reserved_handoff_atomically() {
+        let supervisor = SupervisorShared::default();
+        let generation = ScanGeneration::new(2);
+        let prior_status = {
+            let mut shared = lock_supervisor(&supervisor);
+            shared.inbox.launch = Some(PendingLaunch {
+                generation,
+                fs: Arc::new(FakeFs::default()),
+                roots: vec![root("pending-branch", 1)],
+                cancel: CancelToken::new(),
+                branch: None,
+                initial_omissions: 0,
+            });
+            assert_eq!(shared.branch_scan_readiness(), Err(RuntimeError::ScanNotSettled));
+            shared.status.clone()
+        };
+
+        // This is the exact ownership transfer performed by promote_pending.
+        // Force it between the old implementation's status and inbox samples,
+        // without relying on thread scheduling to hit the short launch window.
+        let launch = {
+            let mut shared = lock_supervisor(&supervisor);
+            let launch = shared.inbox.launch.take().unwrap();
+            shared.status.reserved = Some(ReservedLaunchStatus {
+                generation: launch.generation,
+                cancel: launch.cancel.clone(),
+            });
+            launch
+        };
+        {
+            let shared = lock_supervisor(&supervisor);
+            assert!(prior_status.active.is_none() && prior_status.reserved.is_none());
+            assert!(shared.inbox.launch.is_none() && shared.status.pending.is_none());
+            assert!(!shared.has_output(), "no Started event exists during reservation");
+            // The mixed observations above all look idle; the single locked
+            // observation must still reject the owned generation in reserved.
+            assert_eq!(shared.branch_scan_readiness(), Err(RuntimeError::ScanNotSettled));
+        }
+        let mut shared = lock_supervisor(&supervisor);
+        shared.status.reserved = None;
+        shared.output.scan_finished = Some(generation);
+        assert_eq!(shared.branch_scan_readiness(), Err(RuntimeError::ScanNotSettled));
+        assert_eq!(shared.output.scan_finished.take(), Some(generation));
+        assert_eq!(shared.branch_scan_readiness(), Ok(()));
+        drop(shared);
+        assert_eq!(launch.generation, generation, "reservation retains the original request");
+    }
+
     #[test]
     fn bounded_reaper_runs_large_destruction_on_its_worker() {
         let observed = Arc::new(Mutex::new(None));
@@ -3433,6 +4137,8 @@ mod tests {
         let supervisor_shared = Arc::clone(&runtime.supervisor.shared);
         let mut held_shared = lock_supervisor(&supervisor_shared);
         held_shared.inbox.launch = Some(PendingLaunch {
+            branch: None,
+            initial_omissions: 0,
             generation: pending_generation,
             fs: Arc::clone(&pending_fs) as Arc<dyn ScanFs>,
             roots: vec![root("pending", 77)],
@@ -3654,12 +4360,17 @@ mod tests {
             if let Some(drain) = report.drain {
                 assert!(drain.consumed <= 2);
             }
-            if report.layout_submitted.is_some()
-                && runtime
+            // A submitted frame is still staged unless its layout already
+            // completed within this same tick, in which case the committed
+            // snapshot is the frame that was just submitted.
+            let submitted_state = report.layout_submitted.and_then(|_| {
+                runtime
                     .staged
                     .as_ref()
-                    .is_some_and(|staged| staged.data.snapshot.state() == ScanState::Partial)
-            {
+                    .map(|staged| staged.data.snapshot.state())
+                    .or_else(|| runtime.snapshot().map(TreeSnapshot::state))
+            });
+            if submitted_state == Some(ScanState::Partial) {
                 partial_layout_times.push(clock);
             }
             if report.snapshot_published
@@ -3911,7 +4622,7 @@ mod tests {
         assert!(saw_fault);
         assert!(scan.discard_events);
         assert!(scan.terminal_event_seen || scan.is_finished());
-        let finalized = finalize_scan(scan, now, None);
+        let finalized = finalize_scan(scan, now, None, &shared);
         assert_eq!(finalized.summary.generation, generation);
     }
 
@@ -4494,6 +5205,8 @@ mod tests {
         {
             let mut shared = lock_supervisor(&runtime.supervisor.shared);
             shared.inbox.launch = Some(PendingLaunch {
+                branch: None,
+                initial_omissions: 0,
                 generation: ScanGeneration::new(121),
                 fs: Arc::new(DropFs(Arc::clone(&pending_drops))) as Arc<dyn ScanFs>,
                 roots: vec![root("pending", 121)],
