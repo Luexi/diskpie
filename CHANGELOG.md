@@ -34,7 +34,7 @@ Versioning after its first stable release.
   Installed Apps. Every destructive attempt creates a result and a refresh
   obligation; unexpected permanent deletion blocks later destructive actions.
   The permanent-delete and empty-bin controls predate the 2026-09-11
-  recycle-only decision and are scheduled for removal from the interface.
+  recycle-only decision and have since been removed from the interface.
 - Optional per-user Explorer verb adapter with staged, ownership-aware
   install, repair, and removal, plus the `--scan-path` startup argument and a
   settings surface that inspects the actual registry state asynchronously.
@@ -53,6 +53,11 @@ Versioning after its first stable release.
 
 ### Changed
 
+- Removed permanent-delete and Empty Recycle Bin controls, confirmations and
+  translations from the interface. Recycling retains exact-path review and
+  Cancel as the default action; unexpected legacy confirmation flows are
+  cancelled without rendering. Dormant adapters remain, and the native
+  no-fallback recycling matrix is still pending.
 - Documentation direction updated on 2026-09-11: permanent Windows-only scope,
   free/open-source distribution, Rust/egui, portable staged deliveries and the
   expanded visual disk-management feature plan. Planned features are not

@@ -10,7 +10,7 @@ use diskpie_app::{
         ActionKind, ActionOutcome, ActionPurpose, ActionReport, ConfirmationFlow,
         ConfirmationPresentation, DestructiveOutcome, EmptyBinOutcome, FailureStage,
         FilesystemTarget, FlowStatus, OpenItem, PendingObligation, PostActionObligation,
-        RecycleBinEstimate, RecycleBinScope, RevealItem, SizeSummary,
+        RevealItem, SizeSummary,
     },
     diagnostics::{DiagnosticCode, DiagnosticEvent, DiagnosticField},
     format::format_iec_bytes,
@@ -19,30 +19,29 @@ use diskpie_app::{
     session::SessionPhase,
 };
 use diskpie_core::{GenerationId, NodeId};
-use diskpie_platform::{
-    DialogRequestId, DispatchOutcome, RecycleBinQueryOutcome, ShellEvent, ShellRequest, SubmitError,
-};
+use diskpie_platform::{DialogRequestId, DispatchOutcome, ShellEvent, ShellRequest, SubmitError};
 use eframe::egui::{self, RichText};
 
 const MAX_DISPATCHES: usize = 4;
 
+/// Item actions reachable from the interface. Cleanup is recycle-only: the
+/// interface offers no permanent deletion and no Recycle Bin emptying.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileAction {
     Open,
     Reveal,
     Recycle,
-    Delete,
 }
 
 impl FileAction {
     const fn destructive(self) -> bool {
-        matches!(self, Self::Recycle | Self::Delete)
+        matches!(self, Self::Recycle)
     }
     const fn purpose(self) -> ActionPurpose {
         match self {
             Self::Open => ActionPurpose::Open,
             Self::Reveal => ActionPurpose::Reveal,
-            Self::Recycle | Self::Delete => ActionPurpose::Destructive,
+            Self::Recycle => ActionPurpose::Destructive,
         }
     }
 }
@@ -76,12 +75,6 @@ impl PendingAction {
     }
 }
 
-struct BinQuery {
-    id: DialogRequestId,
-    scope: RecycleBinScope,
-    reconciliation: bool,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RefreshKind {
     Branch,
@@ -101,11 +94,6 @@ pub(super) struct ActionUi {
     pending: Option<PendingAction>,
     mutation_cancel: Option<DialogRequestId>,
     dispatches: Vec<DialogRequestId>,
-    bin_query: Option<BinQuery>,
-    bin_visible: bool,
-    bin_scope: RecycleBinScope,
-    bin_estimate: Option<RecycleBinEstimate>,
-    bin_generation: GenerationId,
     focus_cancel: bool,
     reconciliation: Option<Reconciliation>,
     stale: Option<GenerationId>,
@@ -123,11 +111,6 @@ impl Default for ActionUi {
             pending: None,
             mutation_cancel: None,
             dispatches: Vec::new(),
-            bin_query: None,
-            bin_visible: false,
-            bin_scope: RecycleBinScope::AllDrives,
-            bin_estimate: None,
-            bin_generation: GenerationId::new(0),
             focus_cancel: false,
             reconciliation: None,
             stale: None,
@@ -143,7 +126,6 @@ impl ActionUi {
         self.preparing.is_some()
             || self.pending.is_some()
             || !self.dispatches.is_empty()
-            || self.bin_query.is_some()
             || self.reconciliation.is_some()
     }
 
@@ -191,7 +173,6 @@ impl DiskPieShell {
             || self.actions.flow.status() != FlowStatus::Idle
             || self.actions.pending.is_some()
             || self.actions.reconciliation.is_some()
-            || self.actions.bin_query.as_ref().is_some_and(|query| query.reconciliation)
     }
 
     fn action_scan_settled(&self) -> bool {
@@ -317,14 +298,9 @@ impl DiskPieShell {
                 FileAction::Reveal => {
                     self.submit_dispatch(ShellRequest::reveal(&RevealItem::new(target)))
                 }
-                FileAction::Recycle | FileAction::Delete => {
+                FileAction::Recycle => {
                     self.actions.subject = Some(target.clone());
-                    let started = if preparing.action == FileAction::Recycle {
-                        self.actions.flow.begin_recycle(target)
-                    } else {
-                        self.actions.flow.begin_delete(target)
-                    };
-                    if started.is_ok() {
+                    if self.actions.flow.begin_recycle(target).is_ok() {
                         self.actions.focus_cancel = true;
                     } else {
                         self.notice = Notice::Message(MessageId::ActionRejected);
@@ -345,10 +321,6 @@ impl DiskPieShell {
             FileAction::Recycle => self.actions.flow.take_recycle().ok().and_then(|capability| {
                 capability.binding().verify_target(&target).ok()?;
                 Some(ShellRequest::recycle(owner, capability))
-            }),
-            FileAction::Delete => self.actions.flow.take_delete().ok().and_then(|capability| {
-                capability.binding().verify_target(&target).ok()?;
-                Some(ShellRequest::delete_permanently(owner, capability))
             }),
             FileAction::Open | FileAction::Reveal => None,
         };
@@ -426,31 +398,6 @@ impl DiskPieShell {
         }
     }
 
-    pub(super) fn open_bin(&mut self) {
-        self.actions.bin_visible = true;
-        if self.actions.bin_query.is_none() {
-            self.query_bin(self.actions.bin_scope.clone(), false);
-        }
-    }
-
-    fn query_bin(&mut self, scope: RecycleBinScope, reconciliation: bool) {
-        match self
-            .picker
-            .as_ref()
-            .ok_or(SubmitError::ServiceUnavailable)
-            .and_then(|picker| picker.submit(ShellRequest::query_recycle_bin(scope.clone())))
-        {
-            Ok(id) => {
-                self.actions.bin_query = Some(BinQuery { id, scope, reconciliation });
-                self.action_requested(id);
-            }
-            Err(_) => {
-                self.actions.bin_estimate = None;
-                self.notice = Notice::Message(MessageId::ActionRejected);
-            }
-        }
-    }
-
     pub(super) fn handle_action_shell(&mut self, event: ShellEvent) -> Option<ShellEvent> {
         let id = event.request_id();
         if self.actions.pending.as_ref().is_some_and(|pending| pending.request_id == id.get()) {
@@ -463,28 +410,6 @@ impl DiskPieShell {
             } else {
                 message
             });
-            return None;
-        }
-        if self.actions.bin_query.as_ref().is_some_and(|query| query.id == id) {
-            let query = self.actions.bin_query.take().expect("matching bin query");
-            let estimate = match event {
-                ShellEvent::RecycleBinQuery {
-                    outcome: RecycleBinQueryOutcome::Estimated(estimate),
-                    ..
-                } => Some(estimate),
-                _ => None,
-            };
-            if self.actions.bin_scope == query.scope {
-                self.actions.bin_estimate = estimate;
-            }
-            let refreshes_failed_bin = self.actions.report.as_ref().is_some_and(|report|
-                matches!(&report.obligation, PostActionObligation::RescanRecycleBin { scope } if *scope == query.scope));
-            if (query.reconciliation || refreshes_failed_bin) && estimate.is_some() {
-                self.actions.stale = None;
-                self.actions.reconciliation = None;
-            } else if estimate.is_none() {
-                self.notice = Notice::Message(MessageId::ActionUnknown);
-            }
             return None;
         }
         if let Some(index) = self.actions.dispatches.iter().position(|request| *request == id) {
@@ -523,7 +448,6 @@ impl DiskPieShell {
                 });
         }
         self.render_confirmation(&ctx);
-        self.render_bin(&ctx);
     }
 
     /// Native screenshot fixture for the real post-mutation pending-refresh UI.
@@ -556,32 +480,15 @@ impl DiskPieShell {
             ui.label(self.strings.get(MessageId::ResultsStale));
             if !self.destructive_busy() && ui.button(self.strings.get(MessageId::Rescan)).clicked()
             {
-                let bin =
-                    self.actions.report.as_ref().and_then(|report| match &report.obligation {
-                        PostActionObligation::RescanRecycleBin { scope } => Some(scope.clone()),
-                        _ => None,
-                    });
-                if let Some(scope) = bin {
-                    self.query_bin(scope, true);
-                } else {
-                    self.start_action_full_refresh(self.runtime_scan_sequence());
-                }
+                self.start_action_full_refresh(self.runtime_scan_sequence());
             }
         }
         if self.actions.pending.is_some() {
             ui.label(self.strings.get(MessageId::ActionWorking));
-            let can_cancel =
-                self.actions.pending.as_ref().is_some_and(|pending| {
-                    pending.obligation.kind() != ActionKind::EmptyRecycleBin
-                });
-            if can_cancel
-                && ui.button(self.strings.get(MessageId::Cancel)).clicked()
+            if ui.button(self.strings.get(MessageId::Cancel)).clicked()
                 && let (Some(picker), Some(id)) = (&self.picker, self.actions.mutation_cancel)
             {
                 picker.cancel(id);
-            }
-            if !can_cancel {
-                ui.label(self.strings.get(MessageId::BinNoCancel));
             }
         } else if self.actions.preparing.is_some() {
             ui.label(self.strings.get(MessageId::ActionPreparing));
@@ -601,8 +508,6 @@ impl DiskPieShell {
         }
         self.actions.cancel_confirmation();
         self.actions.dispatches.clear();
-        self.actions.bin_query = None;
-        self.actions.bin_estimate = None;
     }
 
     pub(super) fn action_support_stopped(&mut self) {
@@ -632,82 +537,58 @@ impl DiskPieShell {
         let Some(presentation) = self.actions.flow.presentation().cloned() else {
             return;
         };
-        let status = self.actions.flow.status();
+        // Only recycling is offered. A flow in any other kind cannot come from
+        // this interface; drop it rather than render a permanent-delete or
+        // empty-bin confirmation.
+        let ConfirmationPresentation::Filesystem { target, .. } = &presentation else {
+            self.actions.cancel_confirmation();
+            return;
+        };
+        if presentation.kind() != ActionKind::Recycle {
+            self.actions.cancel_confirmation();
+            return;
+        }
         let mut cancel = false;
         let mut accept = false;
-        let mut typed = self.actions.flow.typed_word().unwrap_or_default().to_owned();
-        let needs_word = matches!(status, FlowStatus::AwaitingWord { .. });
-        let title = match presentation.kind() {
-            ActionKind::Recycle => MessageId::ConfirmRecycleTitle,
-            ActionKind::DeletePermanently => MessageId::ConfirmDeleteTitle,
-            _ => MessageId::ConfirmEmptyRecycleBinTitle,
-        };
         let response =
             egui::Modal::new(egui::Id::new("diskpie-action-confirmation")).show(ctx, |ui| {
                 ui.set_max_width(560.0_f32.min(ctx.content_rect().width() - 32.0).max(220.0));
                 egui::ScrollArea::vertical()
                     .max_height((ctx.content_rect().height() - 120.0).max(160.0))
                     .show(ui, |ui| {
-                        ui.heading(self.strings.get(title));
+                        ui.heading(self.strings.get(MessageId::ConfirmRecycleTitle));
                         ui.label(self.strings.get(MessageId::ReviewTarget));
-                        match &presentation {
-                            ConfirmationPresentation::Filesystem { target, .. } => {
-                                if self
-                                    .actions
-                                    .subject
-                                    .as_ref()
-                                    .is_some_and(|subject| subject.identity().is_none())
-                                {
-                                    ui.label(self.strings.get(MessageId::IdentityUnavailable));
-                                }
-                                ui.add(
-                                    egui::Label::new(RichText::new(&target.display).monospace())
-                                        .wrap(),
-                                );
-                                if let Some(escaped) = &target.escaped_utf16 {
-                                    ui.add(
-                                        egui::Label::new(RichText::new(escaped).monospace()).wrap(),
-                                    );
-                                }
-                                if ui.button(self.strings.get(MessageId::CopyPath)).clicked() {
-                                    ctx.copy_text(target.escaped_utf16.clone().unwrap_or_else(
-                                        || target.exact_path.to_string_lossy().into_owned(),
-                                    ));
-                                }
-                                ui.label(format!(
-                                    "{}: {}",
-                                    self.strings.get(MessageId::LogicalSize),
-                                    self.action_size(target.logical)
-                                ));
-                                ui.label(format!(
-                                    "{}: {}",
-                                    self.strings.get(MessageId::AllocatedData),
-                                    self.action_size(target.allocated)
-                                ));
-                                if target.reparse_note {
-                                    ui.label(self.strings.get(MessageId::ReparseAction));
-                                }
-                            }
-                            ConfirmationPresentation::RecycleBin(bin) => {
-                                self.bin_details(ui, &bin.scope, bin.estimate);
-                                ui.label(self.strings.get(MessageId::BinNoCancel));
-                            }
+                        if self
+                            .actions
+                            .subject
+                            .as_ref()
+                            .is_some_and(|subject| subject.identity().is_none())
+                        {
+                            ui.label(self.strings.get(MessageId::IdentityUnavailable));
                         }
-                        if presentation.kind().required_word().is_some() {
-                            ui.label(
-                                RichText::new(self.strings.get(MessageId::Irreversible)).strong(),
-                            );
+                        ui.add(egui::Label::new(RichText::new(&target.display).monospace()).wrap());
+                        if let Some(escaped) = &target.escaped_utf16 {
+                            ui.add(egui::Label::new(RichText::new(escaped).monospace()).wrap());
                         }
-                        if needs_word {
-                            ui.label(self.strings.get(
-                                if presentation.kind() == ActionKind::EmptyRecycleBin {
-                                    MessageId::ConfirmEmptyPhrase
-                                } else {
-                                    MessageId::ConfirmDeletePhrase
-                                },
-                            ));
-                            ui.add(egui::TextEdit::singleline(&mut typed).char_limit(16));
+                        if ui.button(self.strings.get(MessageId::CopyPath)).clicked() {
+                            ctx.copy_text(target.escaped_utf16.clone().unwrap_or_else(|| {
+                                target.exact_path.to_string_lossy().into_owned()
+                            }));
                         }
+                        ui.label(format!(
+                            "{}: {}",
+                            self.strings.get(MessageId::LogicalSize),
+                            self.action_size(target.logical)
+                        ));
+                        ui.label(format!(
+                            "{}: {}",
+                            self.strings.get(MessageId::AllocatedData),
+                            self.action_size(target.allocated)
+                        ));
+                        if target.reparse_note {
+                            ui.label(self.strings.get(MessageId::ReparseAction));
+                        }
+                        ui.label(self.strings.get(MessageId::RecycleOnlyNote));
                         ui.separator();
                         ui.horizontal(|ui| {
                             let response = ui.button(self.strings.get(MessageId::Cancel));
@@ -716,21 +597,7 @@ impl DiskPieShell {
                                 self.actions.focus_cancel = false;
                             }
                             cancel = response.clicked();
-                            let enabled = !needs_word
-                                || presentation.kind().required_word() == Some(typed.as_str());
-                            let label = if needs_word {
-                                match presentation.kind() {
-                                    ActionKind::DeletePermanently => MessageId::DeletePermanently,
-                                    _ => MessageId::EmptyRecycleBin,
-                                }
-                            } else if presentation.kind() == ActionKind::Recycle {
-                                MessageId::Recycle
-                            } else {
-                                MessageId::Continue
-                            };
-                            accept = ui
-                                .add_enabled(enabled, egui::Button::new(self.strings.get(label)))
-                                .clicked();
+                            accept = ui.button(self.strings.get(MessageId::Recycle)).clicked();
                         });
                     });
             });
@@ -738,35 +605,11 @@ impl DiskPieShell {
             self.actions.cancel_confirmation();
             return;
         }
-        if needs_word {
-            let _ = self.actions.flow.set_typed_word(&typed);
-        }
-        if accept {
-            let transition = if needs_word {
-                self.actions.flow.confirm_word()
-            } else {
-                self.actions.flow.accept_review()
-            };
-            if let Ok(status) = transition {
-                if matches!(status, FlowStatus::AwaitingWord { .. }) {
-                    self.actions.focus_cancel = true;
-                }
-                if matches!(
-                    status,
-                    FlowStatus::Confirmed { .. } | FlowStatus::StronglyConfirmed { .. }
-                ) {
-                    if let Some(subject) = &self.actions.subject {
-                        let action = if presentation.kind() == ActionKind::Recycle {
-                            FileAction::Recycle
-                        } else {
-                            FileAction::Delete
-                        };
-                        self.prepare_file_action(subject.node(), action, true);
-                    } else {
-                        self.dispatch_confirmed_bin();
-                    }
-                }
-            }
+        if accept
+            && let Ok(FlowStatus::Confirmed { .. }) = self.actions.flow.accept_review()
+            && let Some(subject) = &self.actions.subject
+        {
+            self.prepare_file_action(subject.node(), FileAction::Recycle, true);
         }
     }
 
@@ -784,108 +627,6 @@ impl DiskPieShell {
         }
     }
 
-    fn bin_details(
-        &self,
-        ui: &mut egui::Ui,
-        scope: &RecycleBinScope,
-        estimate: Option<RecycleBinEstimate>,
-    ) {
-        let scope = match scope {
-            RecycleBinScope::AllDrives => self.strings.get(MessageId::AllDrives).to_owned(),
-            RecycleBinScope::Drive(drive) => format!("{}:\\", drive.letter()),
-        };
-        ui.label(format!("{}: {scope}", self.strings.get(MessageId::BinScope)));
-        ui.label(self.strings.get(MessageId::BinEstimate));
-        if let Some(estimate) = estimate {
-            ui.label(format!(
-                "{} · {}",
-                self.i18n.item_count(estimate.items).unwrap_or_default(),
-                format_iec_bytes(u128::from(estimate.bytes), self.locale)
-            ));
-        } else {
-            ui.label(self.strings.get(MessageId::UnknownSize));
-        }
-    }
-
-    fn render_bin(&mut self, ctx: &egui::Context) {
-        if !self.actions.bin_visible || self.actions.flow.status() != FlowStatus::Idle {
-            return;
-        }
-        let mut open = self.actions.bin_visible;
-        let mut empty = false;
-        let mut refresh = false;
-        egui::Window::new(self.strings.get(MessageId::EmptyRecycleBin))
-            .id(egui::Id::new("diskpie-bin"))
-            .open(&mut open)
-            .resizable(false)
-            .show(ctx, |ui| {
-                self.bin_details(ui, &self.actions.bin_scope, self.actions.bin_estimate);
-                ui.horizontal(|ui| {
-                    refresh = ui
-                        .add_enabled(
-                            self.actions.bin_query.is_none(),
-                            egui::Button::new(self.strings.get(MessageId::Refresh)),
-                        )
-                        .clicked();
-                    let enabled = self.action_scan_settled()
-                        && !self.destructive_busy()
-                        && !self.actions.halted
-                        && self.actions.stale.is_none()
-                        && self.actions.bin_query.is_none();
-                    empty = ui
-                        .add_enabled(
-                            enabled,
-                            egui::Button::new(self.strings.get(MessageId::EmptyRecycleBin)),
-                        )
-                        .clicked();
-                });
-            });
-        self.actions.bin_visible = open;
-        if refresh {
-            self.query_bin(self.actions.bin_scope.clone(), false);
-        }
-        if empty {
-            self.actions.bin_generation = self.action_generation();
-            if self
-                .actions
-                .flow
-                .begin_empty_recycle_bin(
-                    self.actions.bin_scope.clone(),
-                    self.actions.bin_generation,
-                    self.actions.bin_estimate,
-                )
-                .is_ok()
-            {
-                self.actions.subject = None;
-                self.actions.focus_cancel = true;
-            }
-        }
-    }
-
-    fn dispatch_confirmed_bin(&mut self) {
-        if !self.action_scan_settled() || self.actions.halted {
-            self.actions.cancel_confirmation();
-            return;
-        }
-        let Some(owner) = self.owner else {
-            self.actions.cancel_confirmation();
-            return;
-        };
-        let Ok(capability) = self.actions.flow.take_empty_recycle_bin() else {
-            return;
-        };
-        if capability
-            .binding()
-            .verify_scope(&self.actions.bin_scope, self.action_generation())
-            .is_err()
-        {
-            self.notice = Notice::Message(MessageId::ActionTargetChanged);
-            return;
-        }
-        let (request, obligation) = ShellRequest::empty_recycle_bin(owner, capability);
-        self.submit_mutation(request, obligation);
-    }
-
     pub(super) fn drive_reconciliation(&mut self) {
         if self.shutdown_requested {
             return;
@@ -894,15 +635,10 @@ impl DiskPieShell {
             return;
         };
         match refresh {
-            Reconciliation::Needed(PostActionObligation::RescanRecycleBin { scope }) => {
-                if self.actions.bin_query.is_some() {
-                    self.actions.reconciliation =
-                        Some(Reconciliation::Needed(PostActionObligation::RescanRecycleBin {
-                            scope,
-                        }));
-                } else {
-                    self.query_bin(scope, true);
-                }
+            Reconciliation::Needed(PostActionObligation::RescanRecycleBin { .. }) => {
+                // No interface flow mutates the Recycle Bin, so nothing scanned
+                // by DiskPie is stale because of it.
+                self.actions.stale = None;
             }
             Reconciliation::Needed(obligation) => {
                 if !self.action_scan_settled() {
@@ -1201,41 +937,57 @@ mod tests {
     }
 
     #[test]
-    fn exact_target_and_word_render_in_both_locales_and_cancel_has_default_keyboard_focus() {
+    fn exact_target_renders_in_both_locales_and_cancel_has_default_keyboard_focus() {
         use diskpie_app::i18n::{I18n, Locale};
         for locale in Locale::ALL {
             for width in [420.0, 1100.0] {
-                for strong in [false, true] {
-                    let (mut shell, ctx) = super::super::tests::headless_shell(None);
-                    shell.locale = locale;
-                    shell.i18n = I18n::new(locale).unwrap();
-                    shell.strings = super::super::UiStrings::new(&shell.i18n);
-                    let target = target();
-                    shell.actions.subject = Some(target.clone());
-                    shell.actions.flow.begin_delete(target).unwrap();
-                    if strong {
-                        shell.actions.flow.accept_review().unwrap();
-                        shell.actions.flow.set_typed_word("DELETE").unwrap();
-                    }
-                    shell.actions.focus_cancel = true;
-                    let _ = frame(&mut shell, &ctx, width, false);
-                    let output = frame(&mut shell, &ctx, width, false);
-                    let text = painted_text(&output);
-                    assert!(text.contains("C:\\fixture\\item"), "exact target missing: {text}");
-                    assert!(text.contains(shell.strings.get(MessageId::IdentityUnavailable)));
-                    if strong {
-                        assert!(text.contains(shell.strings.get(MessageId::ConfirmDeletePhrase)));
-                    }
-                    let _ = frame(&mut shell, &ctx, width, true);
-                    assert_eq!(
-                        shell.actions.flow.status(),
-                        FlowStatus::Idle,
-                        "Enter must activate Cancel by default"
-                    );
-                    assert!(shell.actions.pending.is_none());
-                }
+                let (mut shell, ctx) = super::super::tests::headless_shell(None);
+                shell.locale = locale;
+                shell.i18n = I18n::new(locale).unwrap();
+                shell.strings = super::super::UiStrings::new(&shell.i18n);
+                let target = target();
+                shell.actions.subject = Some(target.clone());
+                shell.actions.flow.begin_recycle(target).unwrap();
+                shell.actions.focus_cancel = true;
+                let _ = frame(&mut shell, &ctx, width, false);
+                let output = frame(&mut shell, &ctx, width, false);
+                let text = painted_text(&output);
+                assert!(text.contains("C:\\fixture\\item"), "exact target missing: {text}");
+                assert!(text.contains(shell.strings.get(MessageId::IdentityUnavailable)));
+                assert!(text.contains(shell.strings.get(MessageId::ConfirmRecycleTitle)));
+                assert!(text.contains(shell.strings.get(MessageId::RecycleOnlyNote)));
+                let _ = frame(&mut shell, &ctx, width, true);
+                assert_eq!(
+                    shell.actions.flow.status(),
+                    FlowStatus::Idle,
+                    "Enter must activate Cancel by default"
+                );
+                assert!(shell.actions.pending.is_none());
             }
         }
+    }
+
+    #[test]
+    fn permanent_delete_and_empty_bin_flows_are_never_rendered() {
+        let (mut shell, ctx) = super::super::tests::headless_shell(None);
+        let target = target();
+        shell.actions.subject = Some(target.clone());
+        shell.actions.flow.begin_delete(target).unwrap();
+        let _ = frame(&mut shell, &ctx, 800.0, false);
+        assert_eq!(shell.actions.flow.status(), FlowStatus::Idle);
+        assert!(shell.actions.subject.is_none());
+        shell
+            .actions
+            .flow
+            .begin_empty_recycle_bin(
+                diskpie_app::actions::RecycleBinScope::AllDrives,
+                GenerationId::new(1),
+                None,
+            )
+            .unwrap();
+        let output = frame(&mut shell, &ctx, 800.0, false);
+        assert_eq!(shell.actions.flow.status(), FlowStatus::Idle);
+        assert!(!painted_text(&output).contains(shell.strings.get(MessageId::ReviewTarget)));
     }
 
     #[test]

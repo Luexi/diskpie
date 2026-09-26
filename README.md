@@ -56,9 +56,9 @@ inform the scope; implementation, artwork and text are original. See the
 - Recycling is enabled only for proven fixed local NTFS. The recycle-only
   guarantee (no permanent-delete fallback for oversized items, disabled bins or
   unsupported volumes) still needs end-to-end Windows verification.
-- A permanent-delete control and an Empty Recycle Bin control were connected
-  before the recycle-only decision; they are scheduled for removal from the
-  interface and are outside product scope.
+- Permanent-delete and Empty Recycle Bin controls have been removed from the
+  interface. Dormant legacy APIs remain outside product scope; this removal
+  does not establish the no-fallback recycling guarantee above.
 - Treemap and the other additional views, the multi-item cleanup basket,
   duplicates, cleanup suggestions, app footprints, snapshots/comparisons,
   previews and monitoring are planned.

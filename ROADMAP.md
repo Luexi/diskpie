@@ -46,12 +46,14 @@ Reveal are connected, as is single-item recycling for proven fixed local NTFS
 with exact-path review. Tools offers the Installed Apps handoff, Explorer
 verb install/repair/remove with real registry inspection, and a redacted
 diagnostics preview with a native Save As flow. English and Spanish strings
-(188 messages) and themes exist. See [architecture](docs/architecture.md) and
+(175 messages) and themes exist. See [architecture](docs/architecture.md) and
 the validation records under `docs/research/` for the evidence.
 
-Two connected controls predate the 2026-09-11 decision and contradict it: a
-typed permanent-delete flow on items and an Empty Recycle Bin flow in Tools.
-Removing them from the interface is the first task of delivery 2.
+The permanent-delete item flow and Empty Recycle Bin control that predated the
+2026-09-11 decision have been removed from the interface. The first task of
+delivery 2 is implemented; dormant legacy adapters remain outside the UI.
+Local Windows checks for this removal are recorded in
+[traceability](docs/requirements-traceability.md#interface-removal-verification-2026-09-26).
 
 Recorded on 2026-09-13: format, Clippy, rustdoc and 589 workspace tests pass
 locally and in every CI job; the security workflow passes. A reproducible
@@ -140,8 +142,8 @@ harness). The clean Windows 10/11 walkthrough and the analysis release remain.
 
 ### 2. Clear exploration and recycle-only cleanup
 
-First remove the connected permanent-delete and empty-bin controls so the
-interface matches the recycle-only contract. Then polish folders, sunburst
+The permanent-delete and empty-bin interface controls have been removed.
+Next polish folders, sunburst
 and top items; add treemap. Connect the shared inspector
 and selection to a cleanup basket with exact-path review, duplicate selection
 normalization, per-item results, and refresh after attempts. Complete branch
@@ -193,8 +195,7 @@ checks not run without implying they passed. Update traceability only when new
 evidence supports the claim. No feature is complete merely because a backend
 adapter exists. Compare footprint when adding significant dependencies or work.
 
-**Next assignment (delivery 2):** remove the permanent-delete and empty-bin
-controls from the interface, then add the treemap view and the multi-item
+**Next assignment (delivery 2):** add the treemap view and the multi-item
 cleanup basket on the shared snapshot, selection and inspector. Verify the
 no-fallback recycling policy with disposable fixtures before widening provider
 support. Routine implementation decisions are autonomous; changes of product

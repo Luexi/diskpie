@@ -119,16 +119,6 @@ impl DiskPieShell {
             if ui
                 .add_enabled(
                     self.picker.is_some(),
-                    egui::Button::new(self.strings.get(MessageId::RecycleBin)),
-                )
-                .clicked()
-            {
-                self.open_bin();
-                ui.close();
-            }
-            if ui
-                .add_enabled(
-                    self.picker.is_some(),
                     egui::Button::new(self.strings.get(MessageId::InstalledApps)),
                 )
                 .clicked()

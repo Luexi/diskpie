@@ -3389,7 +3389,6 @@ fn file_action_buttons(
             (MessageId::Open, FileAction::Open),
             (MessageId::Reveal, FileAction::Reveal),
             (MessageId::Recycle, FileAction::Recycle),
-            (MessageId::DeletePermanently, FileAction::Delete),
         ] {
             let mut response =
                 ui.add_enabled(unavailable.is_none(), egui::Button::new(strings.get(label)));

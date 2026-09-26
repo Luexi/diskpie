@@ -40,6 +40,20 @@ recycle and (legacy) permanent file/link deletion, each on a test-created
 temporary fixture; no real bin-empty operation ran. Clean Windows 10/11 VM
 checks remain pending and are called out per row.
 
+## Interface removal verification (2026-09-26)
+
+The local Windows tree passed `cargo fmt --all -- --check`, Clippy for all
+workspace targets/features with warnings denied, workspace tests for all
+targets/features, documentation tests, rustdoc with warnings denied, and
+`cargo build --release -p diskpie --locked`. Every Cargo command that resolves
+dependencies used `--locked`.
+
+The headless egui checks verify the recycle confirmation in both languages and
+at 420/1100 px, Cancel keyboard focus, and refusal to render permanent-delete
+or empty-bin confirmation flows. No new native manual action or gated
+destructive-fixture run was performed. The no-fallback/provider matrix in F-12
+and clean-machine/accessibility checks remain unverified.
+
 ## Functional requirements
 
 | ID | Requirement | Evidence | Status |
@@ -56,8 +70,8 @@ checks remain pending and are called out per row.
 | F-10 | Cancel promptly without freezing the UI | Cancel command and Esc call `cancel_active`; `repeated_cancel_and_rescan_neither_leaks_nor_drifts` and the scan-crate cancellation tests; cancellation latency benchmark pending (Q-03). | Wired |
 | F-11 | Open files and folders with the platform shell | Item context/inspector actions submit snapshot validation off-thread then typed Open/Reveal to the STA. Native marshalling tests and action UI routing tests; new native interaction check pending. | Wired (partial: native UI check) |
 | F-12 | Recycle confirmed items; never fall back to permanent deletion | Connected exact-path review with Cancel focused, support-worker revalidation, single-use `Confirmed<RecycleRequest>`, STA late identity validation, recycle evidence, per-attempt result and refresh obligations, and shutdown receipts. Enabled only for a proven fixed local NTFS provider; gated native fixtures (`DISKPIE_DESTRUCTIVE_FIXTURES=1`) and UI policy tests. Existing tests do **not** establish the new no-fallback policy: oversized, disabled/full-bin, unsupported-provider and uncertain-recoverability cases must skip/stop while preserving the item, and the disposable-VM provider/directory matrix remains. | Wired (partial: no-fallback policy and provider matrix unverified) |
-| F-13 | Permanent deletion — excluded by current policy | The 2026-09-04..07 integration connected a typed `DELETE` flow, `StronglyConfirmed<DeleteRequest>` and post-action refresh to item actions before the 2026-09-11 decision. That control must be removed from the interface as the next bounded task; the dormant adapter may stay until a separate maintenance change removes it. Never use it as a recycle fallback. | Out of scope; legacy UI control pending removal |
-| F-14 | Empty Recycle Bin — excluded by current policy | The same integration connected a Tools bin query and typed `EMPTY` flow; it never ran against a real bin. The empty-bin control must be removed from the interface as the next bounded task. Read-only bin information may still support recycle eligibility; it does not authorize emptying the bin. | Out of scope; legacy UI control pending removal |
+| F-13 | Permanent deletion — excluded by current policy | The historical typed `DELETE` flow and dispatch are no longer reachable from item actions. The 2026-09-26 headless UI test cancels an injected legacy flow without rendering its confirmation. The dormant adapter remains; never use it as a recycle fallback. | Out of scope; legacy adapter unwired |
+| F-14 | Empty Recycle Bin — excluded by current policy | The Tools bin control, query UI and empty-bin dispatch have been removed. The 2026-09-26 headless UI test cancels an injected legacy flow without rendering its confirmation. Dormant APIs remain; no real bin-empty operation was performed. | Out of scope; legacy adapter unwired |
 | F-15 | Explicit handoff to Windows Installed Apps | Tools submits the fixed `ms-settings:appsfeatures` request on the STA; marshalling/routing tests, no `appwiz.cpl` fallback. This is separate from DiskPie file cleanup: the external uninstall flow governs its own removal and must not be described as recyclable. Native UI check pending. | Wired (partial: native UI check) |
 | F-16 | Accept an initial path through the CLI | `diskpie [--scan-path PATH \| [--] PATH]`; parser tests in `cli.rs`; startup path resolved off-thread and scanned; release exe prints `--help`, `--version`, and usage errors through the attached parent console (verified with redirected handles, exit codes 0/0/2). | Wired |
 | F-17 | Write logs and export local diagnostics | Tools builds exact paginated preview with per-export path consent, native UTC-dated Save As, retained real-transport preflight and single-use create-only commit. Platform tests cover existing/late targets, final-interval hard-link alias, source guards, bounded log tails; support token/preview and UI pagination tests. ADR 0020 refines ADR 0016 overwrite behavior. | Wired (partial: native UI check) |
