@@ -91,6 +91,9 @@ as defined in .github/workflows/ci.yml. Windows behavior requires Windows
 evidence; portable tests alone cannot prove it. Recycling needs disposable
 fixtures that verify refusal without permanent deletion. Commands and release
 checks are in [CONTRIBUTING.md](CONTRIBUTING.md).
+Before testing a piece in isolation, first write down the concrete ways it
+could fail; each test must catch at least one. Do not write tests after the
+code that merely restate the implementation.
 
 For documentation-only edits, check consistency, relative links, factual status
 and mirrored-skill equality. A local Rust rebuild is not required for docs;
